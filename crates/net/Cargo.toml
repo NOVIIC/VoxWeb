@@ -1,0 +1,21 @@
+[package]
+name = "voxweb-net"
+version.workspace = true
+edition.workspace = true
+description = "VoxWeb P2P 网络层：信令客户端、WebRTC Peer、房间状态机"
+
+[dependencies]
+voxweb-core.workspace = true
+
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+js-sys.workspace = true
+
+serde.workspace = true
+bincode.workspace = true
+futures-channel.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

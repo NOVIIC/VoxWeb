@@ -1,0 +1,18 @@
+[package]
+name = "voxweb-server"
+version.workspace = true
+edition.workspace = true
+description = "VoxWeb 世界逻辑：地形生成、物理仲裁、持久化（lib only）"
+
+[dependencies]
+voxweb-core.workspace = true
+
+glam.workspace = true
+noise.workspace = true
+serde.workspace = true
+bincode.workspace = true
+getrandom.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

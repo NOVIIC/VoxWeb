@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="signaling-url" content="wss://signal.voxweb.example.com" />
+  <title>VoxWeb</title>
+
+  <!-- Google Fonts：衬线英文 + 衬线中文 + 无衬线副字体 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400&family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=Inter:wght@200;300;400&family=Noto+Serif+SC:wght@300;400;500&display=swap" rel="stylesheet">
+
+  <!-- trunk 入口：编译期注入 wasm-bindgen 生成的 JS 胶水 + WASM 二进制 -->
+  <!-- href 指向 client crate 的 Cargo.toml；workspace 根没有 [package]，必须显式指定 -->
+  <!-- data-wasm-opt-params 启用 Rust 1.82+ 默认开启的 wasm 特性，否则 wasm-opt 校验失败 -->
+  <link data-trunk rel="rust" href="crates/client/Cargo.toml" data-type="main"
+        data-wasm-opt="z"
+        data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue"
+        data-no-import="false" />
+
+  <style>
+    /* ============================================================
+     *  色板与缓动函数：印象派色调，所有过渡共用统一的曲线
+     * ============================================================ */
+    :root {
+      --cream: #f8f3e9;
+      --blush: #e8c4b8;
+      --lavender: #c4c0d8;
+      --dusty-rose: #d4a9a0;
+      --pale-gold: #e0d5c1;
+      --mist-blue: #bcc8d6;
+      --sage: #c5cec0;
+      --text-primary: #3a3533;
+      --text-secondary: #6b615c;
+      --text-tertiary: #9a8e88;
+      --shadow-soft: 0 2px 40px rgba(60, 50, 45, 0.06);
+      --shadow-glow: 0 0 80px rgba(180, 160, 200, 0.25);
+      --transition-slow: 0.8s cubic-bezier(0.25, 0.1, 0.25, 1);
+      --transition-medium: 0.5s cubic-bezier(0.25, 0.1, 0.25, 1);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html {
+      font-size: 16px;
+      scroll-behavior: smooth;
+      height: 100%;
+    }
+
+    body {
+      font-family: 'Cormorant Garamond', 'Noto Serif SC', 'Songti SC', 'EB Garamond', Georgia, serif;
+      background: linear-gradient(
+        165deg,
+        #f6efe6 0%, #f2e8dd 8%, #efe4d8 16%, #f1e6df 24%,
+        #eee0d9 32%, #f3e9e2 40%, #ece0db 48%, #f0e5e0 56%,
+        #ede2d8 64%, #f4ebe2 72%, #efe3da 80%, #f2e9e1 88%,
+        #f5ede5 100%
+      );
+      background-attachment: fixed;
+      min-height: 100vh;
+      color: var(--text-primary);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* ============================================================
+     *  游戏画布：始终铺满全屏，z-index=0 处于最底层
+     *  WASM 加载后通过 wasm-bindgen 把渲染绑定到这里
+     * ============================================================ */
+    #game {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      z-index: 0;
+      background: #1a1a1a;
+    }
+
+    /* ============================================================
+     *  开始页遮罩层：z-index=50 覆盖在画布之上
+     *  点击 Start 按钮后整体淡出，露出底层画布
+     * ============================================================ */
+    .landing-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      user-select: none;
+      -webkit-user-select: none;
+      transition: opacity 1s cubic-bezier(0.25, 0.1, 0.25, 1),
+                  visibility 1s linear;
+    }
+    .landing-overlay.dismissed {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+
+    /* ============================================================
+     *  环境光晕（Ambient orbs）：高斯模糊后的彩色圆，模拟印象派光斑
+     * ============================================================ */
+    .ambient-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(90px);
+      opacity: 0;
+      animation: orbBreathe var(--duration) ease-in-out infinite;
+      animation-delay: var(--delay);
+      will-change: transform, opacity;
+    }
+
+    .orb--lavender {
+      width: 420px; height: 420px;
+      background: radial-gradient(circle, rgba(190, 175, 210, 0.35) 0%, rgba(190, 175, 210, 0) 70%);
+      top: -8%; left: 10%;
+      --duration: 14s; --delay: 0s;
+    }
+    .orb--rose {
+      width: 380px; height: 380px;
+      background: radial-gradient(circle, rgba(215, 170, 155, 0.3) 0%, rgba(215, 170, 155, 0) 70%);
+      top: 35%; right: -5%;
+      --duration: 16s; --delay: 3s;
+    }
+    .orb--gold {
+      width: 350px; height: 350px;
+      background: radial-gradient(circle, rgba(225, 205, 175, 0.32) 0%, rgba(225, 205, 175, 0) 70%);
+      bottom: -6%; left: 25%;
+      --duration: 18s; --delay: 6s;
+    }
+    .orb--mist {
+      width: 300px; height: 300px;
+      background: radial-gradient(circle, rgba(185, 198, 210, 0.28) 0%, rgba(185, 198, 210, 0) 70%);
+      top: 10%; right: 20%;
+      --duration: 15s; --delay: 1s;
+    }
+    .orb--blush {
+      width: 280px; height: 280px;
+      background: radial-gradient(circle, rgba(232, 196, 184, 0.28) 0%, rgba(232, 196, 184, 0) 70%);
+      bottom: 20%; left: 55%;
+      --duration: 17s; --delay: 8s;
+    }
+
+    /* 光晕"呼吸"动画：透明度与位置/缩放都随时间脉动 */
+    @keyframes orbBreathe {
+      0%, 100% { opacity: 0.55; transform: translate(0, 0) scale(1); }
+      25%      { opacity: 0.80; transform: translate(30px, -25px) scale(1.12); }
+      50%      { opacity: 0.50; transform: translate(-15px, 20px) scale(0.94); }
+      75%      { opacity: 0.75; transform: translate(20px, 10px) scale(1.08); }
+    }
+
+    /* ============================================================
+     *  漂浮粒子：自下而上随机漂移的小光点（JS 动态生成）
+     * ============================================================ */
+    .particles-container {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .particle {
+      position: absolute;
+      border-radius: 50%;
+      background: var(--particle-color);
+      opacity: 0;
+      animation: floatUp var(--float-duration) linear infinite;
+      animation-delay: var(--float-delay);
+      width: var(--size);
+      height: var(--size);
+      left: var(--x);
+      bottom: -20px;
+      filter: blur(var(--blur));
+      will-change: transform, opacity;
+    }
+
+    @keyframes floatUp {
+      0%   { opacity: 0; transform: translateY(0) translateX(0) scale(0.4); }
+      8%   { opacity: var(--peak-opacity); }
+      35%  { opacity: var(--peak-opacity); transform: translateY(-35vh) translateX(var(--drift)) scale(1); }
+      70%  { opacity: calc(var(--peak-opacity) * 0.5); }
+      100% { opacity: 0; transform: translateY(-105vh) translateX(calc(var(--drift) * 1.8)) scale(0.2); }
+    }
+
+    /* ============================================================
+     *  主卡片容器：磨砂玻璃 + 入场动画
+     * ============================================================ */
+    .main-container {
+      position: relative;
+      z-index: 10;
+      width: min(720px, 92vw);
+      padding: clamp(40px, 8vw, 80px) clamp(28px, 6vw, 64px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      background: rgba(252, 249, 244, 0.55);
+      backdrop-filter: blur(18px) saturate(1.3);
+      -webkit-backdrop-filter: blur(18px) saturate(1.3);
+      border-radius: 2px;
+      box-shadow:
+        var(--shadow-soft),
+        var(--shadow-glow),
+        inset 0 1px 0 rgba(255, 255, 255, 0.5),
+        inset 0 -1px 0 rgba(180, 160, 150, 0.08);
+      border: 1px solid rgba(210, 195, 180, 0.2);
+      animation: cardEnter 1.6s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+
+    @keyframes cardEnter {
+      0%   { opacity: 0; transform: translateY(36px) scale(0.96); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    /* —— 装饰横线 —— */
+    .ornament-rule {
+      display: flex; align-items: center; gap: 16px;
+      margin: 0 auto 36px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 0.4s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+    .ornament-rule .line {
+      flex: 1; height: 1px;
+      background: linear-gradient(to right, transparent, rgba(160, 140, 130, 0.35), transparent);
+      min-width: 50px;
+    }
+    .ornament-rule .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: rgba(170, 145, 130, 0.5);
+      flex-shrink: 0;
+      box-shadow: 0 0 12px rgba(170, 145, 130, 0.3);
+    }
+
+    @keyframes fadeSlideIn {
+      0%   { opacity: 0; transform: translateY(12px); }
+      100% { opacity: 1; transform: translateY(0); }
+    }
+
+    /* —— 标题层级排版 —— */
+    .supratitle {
+      font-family: 'Inter', sans-serif;
+      font-weight: 200;
+      font-size: clamp(0.65rem, 1.2vw, 0.75rem);
+      letter-spacing: 0.6em;
+      text-transform: uppercase;
+      color: var(--text-tertiary);
+      margin-bottom: 22px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 0.55s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+
+    .title {
+      font-family: 'Cormorant Garamond', 'EB Garamond', serif;
+      font-weight: 400;
+      font-size: clamp(2.8rem, 6.5vw, 4.6rem);
+      line-height: 1.08;
+      letter-spacing: 0.015em;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 0.7s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+      text-shadow: 0 1px 2px rgba(255, 255, 255, 0.3);
+    }
+    .title .italic {
+      font-style: italic;
+      font-weight: 300;
+      color: #5a4e48;
+      letter-spacing: 0.03em;
+    }
+
+    .subtitle {
+      font-family: 'Noto Serif SC', 'Cormorant Garamond', serif;
+      font-weight: 300;
+      font-style: italic;
+      font-size: clamp(1rem, 2.2vw, 1.35rem);
+      letter-spacing: 0.06em;
+      color: var(--text-secondary);
+      margin-bottom: 36px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 0.85s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+
+    .verse-block {
+      margin: 8px 0 36px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 1s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+    .verse-block p {
+      font-family: 'Noto Serif SC', 'Cormorant Garamond', serif;
+      font-weight: 300;
+      font-size: clamp(1rem, 2vw, 1.2rem);
+      line-height: 1.95;
+      letter-spacing: 0.04em;
+      color: #5c524c;
+      margin: 0;
+      text-shadow: 0 1px 1px rgba(255, 255, 255, 0.4);
+    }
+    .verse-block p + p { margin-top: 6px; }
+    .verse-block .em-dash {
+      color: #b8a89a;
+      margin: 0 4px;
+      font-weight: 200;
+    }
+
+    /* ============================================================
+     *  Start 按钮：磨砂质感 + 字间距悬停动画 + 下方细线滑出
+     * ============================================================ */
+    .start-button {
+      position: relative;
+      display: inline-block;
+      margin: 4px 0 32px;
+      padding: 14px 52px;
+      background: rgba(252, 249, 244, 0.45);
+      border: 1px solid rgba(170, 145, 130, 0.3);
+      border-radius: 1px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 300;
+      font-size: 0.78rem;
+      letter-spacing: 0.4em;
+      text-transform: uppercase;
+      color: var(--text-primary);
+      cursor: pointer;
+      backdrop-filter: blur(10px) saturate(1.2);
+      -webkit-backdrop-filter: blur(10px) saturate(1.2);
+      transition: background var(--transition-medium),
+                  border-color var(--transition-medium),
+                  letter-spacing var(--transition-medium),
+                  box-shadow var(--transition-medium),
+                  transform 0.2s ease;
+      opacity: 0;
+      animation: fadeSlideIn 1s 1.15s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+      overflow: hidden;
+    }
+    /* 悬停时下方滑出一条细线，作为微交互反馈 */
+    .start-button::after {
+      content: '';
+      position: absolute;
+      bottom: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 0;
+      height: 1px;
+      background: rgba(170, 145, 130, 0.55);
+      transition: width 0.6s cubic-bezier(0.25, 0.1, 0.25, 1);
+    }
+    .start-button:hover {
+      background: rgba(252, 249, 244, 0.7);
+      border-color: rgba(170, 145, 130, 0.55);
+      letter-spacing: 0.5em;
+      box-shadow: 0 8px 36px rgba(180, 160, 200, 0.22);
+    }
+    .start-button:hover::after { width: 56%; }
+    .start-button:active { transform: translateY(1px); }
+    .start-button:focus-visible {
+      outline: 1px solid rgba(170, 145, 130, 0.8);
+      outline-offset: 4px;
+    }
+
+    /* —— 底部装饰 —— */
+    .bottom-accent {
+      display: flex; align-items: center; gap: 10px;
+      margin-top: 12px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 1.3s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+    .bottom-accent .mini-dot {
+      width: 3px; height: 3px; border-radius: 50%;
+      background: rgba(160, 140, 125, 0.45);
+      flex-shrink: 0;
+    }
+    .bottom-accent .thin-line {
+      width: 32px; height: 1px;
+      background: rgba(160, 140, 125, 0.3);
+      flex-shrink: 0;
+    }
+
+    .attribution {
+      font-family: 'Inter', sans-serif;
+      font-weight: 200;
+      font-size: 0.68rem;
+      letter-spacing: 0.3em;
+      text-transform: uppercase;
+      color: #b0a39a;
+      margin-top: 36px;
+      opacity: 0;
+      animation: fadeSlideIn 1s 1.45s cubic-bezier(0.22, 0.1, 0.12, 1) forwards;
+    }
+
+    /* ============================================================
+     *  鼠标光晕：跟随光标的柔光圆斑（仅桌面端可见）
+     * ============================================================ */
+    .cursor-glow {
+      position: fixed;
+      pointer-events: none;
+      z-index: 100;
+      width: 180px; height: 180px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(220, 200, 180, 0.18) 0%, rgba(220, 200, 180, 0) 70%);
+      transform: translate(-50%, -50%);
+      transition: opacity 0.4s ease;
+      opacity: 0;
+      will-change: left, top, opacity;
+    }
+
+    /* —— 移动端响应式 —— */
+    @media (max-width: 600px) {
+      .main-container {
+        width: 94vw; padding: 36px 24px; border-radius: 1px;
+      }
+      .orb { filter: blur(60px); }
+      .orb--lavender { width: 240px; height: 240px; top: -10%; left: -15%; }
+      .orb--rose    { width: 200px; height: 200px; top: 40%; right: -20%; }
+      .orb--gold    { width: 180px; height: 180px; bottom: -10%; left: 15%; }
+      .orb--mist    { width: 160px; height: 160px; top: 5%; right: 10%; }
+      .orb--blush   { width: 140px; height: 140px; bottom: 15%; left: 60%; }
+      .cursor-glow  { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 游戏画布：trunk 编译的 WASM 加载后会绑定到这里 -->
+  <canvas id="game"></canvas>
+
+  <!-- 开始页遮罩 -->
+  <div class="landing-overlay" id="landing">
+    <!-- 环境光晕 -->
+    <div class="ambient-layer" aria-hidden="true">
+      <div class="orb orb--lavender"></div>
+      <div class="orb orb--rose"></div>
+      <div class="orb orb--gold"></div>
+      <div class="orb orb--mist"></div>
+      <div class="orb orb--blush"></div>
+    </div>
+
+    <!-- 漂浮粒子（JS 动态生成） -->
+    <div class="particles-container" id="particlesContainer" aria-hidden="true"></div>
+
+    <!-- 鼠标光晕 -->
+    <div class="cursor-glow" id="cursorGlow" aria-hidden="true"></div>
+
+    <!-- 主卡片 -->
+    <main class="main-container">
+      <div class="ornament-rule">
+        <span class="line"></span>
+        <span class="dot"></span>
+        <span class="line"></span>
+      </div>
+
+      <p class="supratitle">V O X W E B</p>
+
+      <h1 class="title">
+        Worlds&nbsp;<span class="italic">Within</span>&nbsp;a&nbsp;Window
+      </h1>
+
+      <p class="subtitle">一座方块世界，藏在浏览器里</p>
+
+      <div class="verse-block">
+        <p>
+          打开网址，世界便在眼前<span class="em-dash">&mdash;</span><br>
+          方块、光影、风的形状，<br>
+          皆由你亲手雕琢。
+        </p>
+        <p>
+          共享一串六位房号<span class="em-dash">&mdash;</span><br>
+          朋友便从光的另一端走来。
+        </p>
+      </div>
+
+      <button class="start-button" id="startButton" aria-label="进入游戏">
+        Enter the World
+      </button>
+
+      <div class="bottom-accent">
+        <span class="thin-line"></span>
+        <span class="mini-dot"></span>
+        <span class="thin-line"></span>
+      </div>
+
+      <p class="attribution">WebAssembly · WebRTC · WebGPU</p>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      // ── 漂浮粒子生成 ─────────────────────────────────
+      // 在 #particlesContainer 内随机生成 28 个粒子
+      // 每个粒子的尺寸/颜色/起始位置/动画时长都是随机化的
+      const particlesContainer = document.getElementById('particlesContainer');
+      const particleColors = [
+        'rgba(210,185,165,0.7)',
+        'rgba(195,175,190,0.6)',
+        'rgba(220,200,180,0.65)',
+        'rgba(185,170,155,0.55)',
+        'rgba(200,180,195,0.6)',
+        'rgba(215,195,175,0.6)',
+        'rgba(190,175,200,0.55)',
+      ];
+
+      for (let i = 0; i < 28; i++) {
+        const p = document.createElement('div');
+        p.classList.add('particle');
+        p.style.setProperty('--size',           (Math.random() * 3.5 + 1.5) + 'px');
+        p.style.setProperty('--x',              (Math.random() * 94 + 3) + '%');
+        p.style.setProperty('--float-duration', (Math.random() * 14 + 16) + 's');
+        p.style.setProperty('--float-delay',    (Math.random() * 20) + 's');
+        p.style.setProperty('--drift',          ((Math.random() - 0.5) * 50) + 'px');
+        p.style.setProperty('--peak-opacity',   (Math.random() * 0.35 + 0.3));
+        p.style.setProperty('--blur',           (Math.random() * 1.5 + 0.4) + 'px');
+        p.style.setProperty('--particle-color', particleColors[Math.floor(Math.random() * particleColors.length)]);
+        particlesContainer.appendChild(p);
+      }
+
+      // ── 鼠标光晕跟随 ─────────────────────────────────
+      // 用 lerp（线性插值）让光晕平滑追逐鼠标，避免抖动
+      const cursorGlow = document.getElementById('cursorGlow');
+      let mouseX = -200, mouseY = -200;
+      let currentX = -200, currentY = -200;
+      let isTouchDevice = false;
+
+      document.addEventListener('mousemove', e => {
+        mouseX = e.clientX; mouseY = e.clientY; isTouchDevice = false;
+      });
+      document.addEventListener('touchmove', e => {
+        mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; isTouchDevice = true;
+      }, { passive: true });
+      document.addEventListener('touchstart', e => {
+        mouseX = e.touches[0].clientX; mouseY = e.touches[0].clientY; isTouchDevice = true;
+      }, { passive: true });
+      document.addEventListener('mouseleave', () => {
+        mouseX = -300; mouseY = -300;
+      });
+
+      function animateGlow() {
+        // lerp 系数越小，光晕越"懒"
+        const lerp = 0.08;
+        currentX += (mouseX - currentX) * lerp;
+        currentY += (mouseY - currentY) * lerp;
+
+        if (!isTouchDevice && mouseX > -100 && mouseY > -100) {
+          cursorGlow.style.left = currentX + 'px';
+          cursorGlow.style.top = currentY + 'px';
+          cursorGlow.style.opacity = '1';
+        } else if (isTouchDevice && mouseX > -100) {
+          cursorGlow.style.left = currentX + 'px';
+          cursorGlow.style.top = currentY + 'px';
+          cursorGlow.style.opacity = '0.7';
+        } else {
+          cursorGlow.style.opacity = '0';
+        }
+        requestAnimationFrame(animateGlow);
+      }
+      animateGlow();
+
+      // ── Start 按钮：淡出开始页，进入游戏 ──────────────
+      // 1. 给遮罩层加 .dismissed 触发 CSS 过渡（透明度 + visibility）
+      // 2. 派发 'voxweb:start' 自定义事件，Rust 端收到后可启动主循环
+      //    （目前 WASM 是页面加载即启动，此事件供日后改成"按需启动"使用）
+      const landing  = document.getElementById('landing');
+      const startBtn = document.getElementById('startButton');
+      let started = false;
+
+      startBtn.addEventListener('click', () => {
+        if (started) return;
+        started = true;
+        landing.classList.add('dismissed');
+        window.dispatchEvent(new CustomEvent('voxweb:start'));
+      });
+    })();
+  </script>
+</body>
+</html>
