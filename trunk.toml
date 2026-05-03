@@ -1,5 +1,6 @@
 [build]
-target = "index.html"
+target = "start.html"
+html_output = "start.html"
 dist = "dist"
 
 [serve]

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="signaling-url" content="wss://signal.voxweb.example.com" />
+  <!-- 构建时复制 index.html -->
+  <link data-trunk rel="copy-file" href="index.html" />
+  <title>VoxWeb</title>
+
+  <!-- trunk 入口：编译期注入 wasm-bindgen 生成的 JS 胶水 + WASM 二进制 -->
+  <link data-trunk rel="rust" href="crates/client/Cargo.toml" data-type="main"
+        data-wasm-opt="z"
+        data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue"
+        data-no-import="false" />
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+    }
+
+    /* 游戏画布：始终铺满全屏 */
+    #game {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <!-- 游戏画布：trunk 编译的 WASM 加载后会绑定到这里 -->
+  <canvas id="game"></canvas>
+</body>
+</html>
