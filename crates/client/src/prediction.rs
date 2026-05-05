@@ -19,7 +19,9 @@ struct InputEntry {
 
 impl InputHistory {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// 记录一条输入（发送前调用）。

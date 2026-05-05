@@ -5,8 +5,6 @@ pub mod block;
 pub mod chunk;
 pub mod protocol;
 
-pub use block::{properties, BlockID, BlockProperties};
-pub use chunk::{Chunk, ChunkPos, Position, CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z};
-pub use protocol::{
-    encode, AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage,
-};
+pub use block::{BlockID, BlockProperties, properties};
+pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
+pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};

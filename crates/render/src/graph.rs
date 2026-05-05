@@ -46,12 +46,7 @@ impl RenderGraph {
     }
 
     /// 确保深度纹理尺寸与 surface 匹配。
-    pub fn ensure_depth_texture(
-        &mut self,
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn ensure_depth_texture(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         // 检查是否需要重建
         let needs_rebuild = match &self.depth_texture {
             Some(tex) => tex.width() != width || tex.height() != height,

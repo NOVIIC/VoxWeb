@@ -17,10 +17,10 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use voxweb_render::Renderer;
 use voxweb_render::device::{configure_surface, init_device};
 use voxweb_render::graph::RenderGraph;
 use voxweb_render::passes::opaque::OpaquePass;
-use voxweb_render::Renderer;
 // Phase 1: use wgpu dependency for rendering
 
 /// 客户端全局状态（AppState 状态机 + 渲染器 + 输入等）。
@@ -64,7 +64,9 @@ pub async fn start() -> Result<(), JsValue> {
         .expect("#game 不是 canvas");
 
     // 创建 wgpu 设备 + Surface
-    let ctx = init_device(&canvas).await.map_err(|e| JsValue::from_str(&e))?;
+    let ctx = init_device(&canvas)
+        .await
+        .map_err(|e| JsValue::from_str(&e))?;
 
     // 配置 Surface 初始尺寸
     let width = canvas.client_width() as u32;

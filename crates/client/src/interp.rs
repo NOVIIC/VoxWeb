@@ -19,7 +19,14 @@ impl Default for InterpolationBuffer {
 
 impl InterpolationBuffer {
     /// 接收一条新的远端位置快照。
-    pub fn push_snapshot(&mut self, _entity_id: u32, _tick: u32, _position: Vec3, _yaw: f32, _pitch: f32) {
+    pub fn push_snapshot(
+        &mut self,
+        _entity_id: u32,
+        _tick: u32,
+        _position: Vec3,
+        _yaw: f32,
+        _pitch: f32,
+    ) {
         // Phase 5 实现
     }
 

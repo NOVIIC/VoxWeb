@@ -24,9 +24,7 @@ impl World {
 
     /// 获取或生成指定坐标的 Chunk（如果不存在则触发地形生成）。
     pub fn ensure_chunk(&mut self, pos: ChunkPos) -> &mut Chunk {
-        self.chunks
-            .entry(pos)
-            .or_insert_with(|| Chunk::empty())
+        self.chunks.entry(pos).or_insert_with(|| Chunk::empty())
     }
 
     /// 在世界坐标处放置一个方块（若 Chunk 不存在则自动创建）。

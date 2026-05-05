@@ -18,11 +18,7 @@ pub struct RaycastHit {
 
 /// 从 origin 沿 direction 发射射线，在 max_distance 内查找第一个非空气方块。
 /// 返回命中信息。Phase 3 实现完整 DDA。
-pub fn raycast(
-    _origin: Vec3,
-    _direction: Vec3,
-    _max_distance: f32,
-) -> Option<RaycastHit> {
+pub fn raycast(_origin: Vec3, _direction: Vec3, _max_distance: f32) -> Option<RaycastHit> {
     // Phase 3: DDA 迭代实现
     None
 }

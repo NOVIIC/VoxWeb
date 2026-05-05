@@ -64,8 +64,8 @@ impl InputState {
     /// 处理鼠标按下事件。
     pub fn on_mouse_down(&mut self, button: u16) {
         match button {
-            0 => self.break_action = true,  // 左键 = 挖掘
-            1 => self.place_action = true,   // 右键 = 放置
+            0 => self.break_action = true, // 左键 = 挖掘
+            1 => self.place_action = true, // 右键 = 放置
             _ => {}
         }
     }

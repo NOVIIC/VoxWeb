@@ -140,10 +140,7 @@ mod tests {
             Position::new(15, 64, 15).to_chunk_pos(),
             ChunkPos::new(0, 0)
         );
-        assert_eq!(
-            Position::new(16, 64, 0).to_chunk_pos(),
-            ChunkPos::new(1, 0)
-        );
+        assert_eq!(Position::new(16, 64, 0).to_chunk_pos(), ChunkPos::new(1, 0));
         // 负坐标：-1 应落到 chunk_x=-1
         assert_eq!(
             Position::new(-1, 64, 0).to_chunk_pos(),

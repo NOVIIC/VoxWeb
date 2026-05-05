@@ -22,7 +22,9 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, bincode::error::EncodeEr
 }
 
 /// 从 &[u8] 解码出实现了 Deserialize 的消息。
-pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
+pub fn decode<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, bincode::error::DecodeError> {
     let (msg, _len) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
     Ok(msg)
 }
@@ -46,10 +48,7 @@ pub enum ClientMessage {
         pitch: f32,
     },
     /// 挖掘方块请求
-    Break {
-        pos: Position,
-        request_id: u32,
-    },
+    Break { pos: Position, request_id: u32 },
     /// 放置方块请求
     Place {
         pos: Position,
@@ -57,13 +56,9 @@ pub enum ClientMessage {
         request_id: u32,
     },
     /// 文本聊天
-    Chat {
-        content: String,
-    },
+    Chat { content: String },
     /// 心跳（防止 NAT 映射老化）
-    Ping {
-        client_time_ms: u64,
-    },
+    Ping { client_time_ms: u64 },
 }
 
 /// Server → Client 的消息。
@@ -83,10 +78,7 @@ pub enum ServerMessage {
         payload: Vec<u8>,
     },
     /// 单方块更新（挖放结果广播）
-    BlockUpdate {
-        pos: Position,
-        block: BlockID,
-    },
+    BlockUpdate { pos: Position, block: BlockID },
     /// 挖放请求的仲裁结果
     ActionAck {
         request_id: u32,
@@ -105,14 +97,9 @@ pub enum ServerMessage {
         display_name: String,
     },
     /// 玩家离开房间
-    PeerLeft {
-        entity_id: u32,
-    },
+    PeerLeft { entity_id: u32 },
     /// 聊天消息广播
-    Chat {
-        from: u32,
-        content: String,
-    },
+    Chat { from: u32, content: String },
     /// 心跳响应
     Pong {
         client_time_ms: u64,

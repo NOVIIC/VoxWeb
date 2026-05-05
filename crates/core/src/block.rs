@@ -44,23 +44,77 @@ pub struct BlockProperties {
 /// 编译期常量属性表，按 BlockID.0 索引。
 static PROPERTIES: &[BlockProperties] = &[
     // 0: AIR（不应被查询，占位用）
-    BlockProperties { solid: false, transparent: true, emits_light: false, texture_index: 0, display_name: "空气" },
+    BlockProperties {
+        solid: false,
+        transparent: true,
+        emits_light: false,
+        texture_index: 0,
+        display_name: "空气",
+    },
     // 1: STONE
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 1, display_name: "石头" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 1,
+        display_name: "石头",
+    },
     // 2: GRASS
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 2, display_name: "草" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 2,
+        display_name: "草",
+    },
     // 3: DIRT
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 3, display_name: "泥土" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 3,
+        display_name: "泥土",
+    },
     // 4: WATER
-    BlockProperties { solid: false, transparent: true, emits_light: false, texture_index: 4, display_name: "水" },
+    BlockProperties {
+        solid: false,
+        transparent: true,
+        emits_light: false,
+        texture_index: 4,
+        display_name: "水",
+    },
     // 5: GLASS
-    BlockProperties { solid: true, transparent: true, emits_light: false, texture_index: 5, display_name: "玻璃" },
+    BlockProperties {
+        solid: true,
+        transparent: true,
+        emits_light: false,
+        texture_index: 5,
+        display_name: "玻璃",
+    },
     // 6: SAND
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 6, display_name: "沙子" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 6,
+        display_name: "沙子",
+    },
     // 7: WOOD
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 7, display_name: "木头" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 7,
+        display_name: "木头",
+    },
     // 8: LEAVES
-    BlockProperties { solid: true, transparent: false, emits_light: false, texture_index: 8, display_name: "树叶" },
+    BlockProperties {
+        solid: true,
+        transparent: false,
+        emits_light: false,
+        texture_index: 8,
+        display_name: "树叶",
+    },
 ];
 
 /// 根据 BlockID 查询其属性。越界时返回 AIR 属性（容错）。

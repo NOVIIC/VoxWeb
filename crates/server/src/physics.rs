@@ -17,12 +17,7 @@ pub fn validate_break(world: &World, pos: Position, player_pos: Position) -> boo
 
 /// 验证一次放置操作是否合法。
 /// 返回 true 表示允许放置。
-pub fn validate_place(
-    world: &World,
-    pos: Position,
-    block: BlockID,
-    player_pos: Position,
-) -> bool {
+pub fn validate_place(world: &World, pos: Position, block: BlockID, player_pos: Position) -> bool {
     // Phase 3: 检查射程、目标位置为空、不与玩家碰撞体积重叠
     let _ = (world, pos, block, player_pos);
     true

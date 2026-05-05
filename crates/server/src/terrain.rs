@@ -3,7 +3,7 @@
 use noise::{NoiseFn, Perlin};
 
 use voxweb_core::block::BlockID;
-use voxweb_core::chunk::{Chunk, ChunkPos, CHUNK_X, CHUNK_Y, CHUNK_Z};
+use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos};
 
 /// 地形生成器：封装 Perlin 噪声 + 生物群落参数。
 pub struct TerrainGenerator {
