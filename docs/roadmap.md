@@ -27,7 +27,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ### 任务清单
 - [x] 创建 `Cargo.toml` workspace + 五个 crate 的空骨架
-- [x] `index.html` + `trunk.toml` 跑通 `trunk serve`
+- [x] `start.html` + `trunk.toml` 跑通 `trunk serve`（landing 页 `index.html` 经 `data-trunk rel="copy-file"` 同步复制）
 - [x] `client::start` 创建一个空 wgpu Surface 并清屏纯色
 - [x] 集成 egui，绘制"Hello VoxWeb"在屏幕中央
 - [x] 设置 `console_error_panic_hook` + `tracing-wasm`

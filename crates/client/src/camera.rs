@@ -55,9 +55,11 @@ impl Camera {
     }
 
     /// 右向单位向量（不依赖 pitch，沿水平面）。
+    /// 在 wgpu 右手系下：right = forward × up；up × forward 会得到反向。
     pub fn right(&self) -> Vec3 {
-        // 水平面 forward = (cos yaw, 0, sin yaw)；右 = forward × +Y
-        Vec3::new(self.yaw.sin(), 0.0, -self.yaw.cos())
+        // forward = (cos yaw, 0, sin yaw)，up = +Y
+        // forward × up = (-sin yaw, 0, cos yaw)
+        Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos())
     }
 
     pub fn view_matrix(&self) -> Mat4 {

@@ -443,14 +443,14 @@ fn draw_hud(
             );
         });
 
-    // 底部：操作提示（指针未锁定时显示"点击进入"）
+    // 底部：操作提示（egui 默认字体不含 CJK，Phase 1 用 ASCII；Phase 6 接入字体后切回中文）
     egui::Area::new(egui::Id::new("hud_bottom"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
         .show(&ctx, |ui| {
             let msg = if pointer_locked {
-                "WASD 移动 · 空格上 · Shift 下 · 鼠标视角 · ESC 释放指针"
+                "WASD move | Space up | Shift down | Mouse look | ESC release"
             } else {
-                "点击画面进入相机控制"
+                "Click to enter camera control"
             };
             egui::Frame::default()
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110))

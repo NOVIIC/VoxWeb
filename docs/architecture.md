@@ -12,7 +12,10 @@
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          Caddy 静态站点 (HTTPS)                            │
-│             dist/index.html + dist/pkg/*.{wasm,js} + dist/assets/*         │
+│   /        → dist/index.html       (Monet 风格 landing；纯 HTML/CSS)       │
+│   /start   → dist/start.html       (canvas + wasm-bindgen 胶水)            │
+│   /*.wasm  → dist/voxweb-client-<hash>_bg.wasm                            │
+│   /*.js    → dist/voxweb-client-<hash>.js                                 │
 └──────────────────────────────────────────────────────────────────────────┘
                             ↓ HTTP GET（首屏）
         ┌────────────────┐         ┌────────────────┐         ┌────────────────┐
@@ -138,10 +141,11 @@ VoxWeb/
 ├── Cargo.toml                  # workspace 根
 ├── README.md                   # 项目主入口文档
 ├── CLAUDE.md                   # AI agent 工作纪律（沿用）
-├── web/                        # 本文档体系所在目录
-├── index.html                  # canvas + WASM 引导（trunk 模板入口）
-├── Caddyfile                   # 静态站点配置
-├── trunk.toml                  # 构建配置
+├── docs/                       # 本文档体系所在目录
+├── index.html                  # landing 页（Monet 风格，纯 HTML/CSS/JS；trunk copy-file 复制）
+├── start.html                  # 游戏页 = trunk 模板入口（canvas + wasm-bindgen 胶水）
+├── Caddyfile                   # 静态站点配置（含 /start → /start.html 重写）
+├── trunk.toml                  # 构建配置（target = "start.html"）
 ├── crates/
 │   ├── core/                   # 数据结构 + 协议（无浏览器依赖）
 │   │   ├── Cargo.toml
@@ -277,7 +281,7 @@ VoxWeb/
 ```
 开发期：
    trunk serve --port 8080
-       └→ 监视 crates/* 变化 → cargo build wasm32 → wasm-bindgen → 注入 index.html
+       └→ 监视 crates/* 变化 → cargo build wasm32 → wasm-bindgen → 注入 start.html
    wrangler dev signaling/
        └→ 本地启动 Workers + Durable Objects 模拟器
 

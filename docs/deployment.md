@@ -8,13 +8,14 @@
 ## 一、部署拓扑回顾
 
 ```
-┌──────────────────────────────────────────┐
-│  Caddy（静态站，HTTPS）                    │
-│  https://voxweb.example.com               │
-│  └── /  → dist/index.html                  │
-│  └── /pkg/  → dist/pkg/*.wasm + *.js       │
-│  └── /assets/  → dist/assets/*             │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Caddy（静态站，HTTPS）                            │
+│  https://voxweb.example.com                       │
+│  ├── /        → dist/index.html  Monet 风格 landing │
+│  ├── /start   → dist/start.html  游戏画布 + WASM    │
+│  ├── /*.wasm  → dist/*.wasm      （Caddy 标 MIME）  │
+│  └── /*.js    → dist/*.js                          │
+└──────────────────────────────────────────────────┘
        ↓ HTTP GET（首屏，用户访问）
 
 ┌──────────────────────────────────────────┐
@@ -26,6 +27,8 @@
 ```
 
 **严格分离**：游戏代码部署到 Caddy；信令服务部署到 CF Workers。两者都是无状态 / 边缘 / 独立可替换。
+
+> **页面拆分**：项目根有两个 HTML —— `index.html`（Monet 风格 landing，纯 HTML/CSS/JS，不依赖 wasm）和 `start.html`（trunk 入口，注入 wasm-bindgen 胶水 + canvas）。Landing 页的 Start 按钮链接到 `/start`，由 Caddy 的 `try_files` 把 `/start` 内部重写到 `/start.html`。
 
 ---
 
@@ -49,10 +52,11 @@
 ```
 VoxWeb/
 ├── crates/                    Rust workspace
-├── web/                       本项目文档
+├── docs/                      本项目文档
 ├── signaling/                 TS Workers 项目（独立 npm 项目）
-├── index.html                 trunk 入口
-├── trunk.toml
+├── index.html                 landing 页（Monet 风格，非 trunk 入口）
+├── start.html                 游戏页（trunk 入口；构建时复制 index.html 进 dist）
+├── trunk.toml                 target = "start.html"
 ├── Cargo.toml
 ├── Caddyfile                  本地预览用
 └── README.md
@@ -61,17 +65,21 @@ VoxWeb/
 ### 2.3 开发命令
 
 ```bash
-# 终端 1：游戏前端开发
+# 终端 1：游戏前端开发（trunk 监听 start.html + crates/）
 trunk serve --port 8080
-# → 监视 crates/* + index.html，热重载浏览器
+# → 监视 crates/* + start.html，热重载浏览器
 
 # 终端 2：信令服务（本地）
 cd signaling && wrangler dev --local --port 8787
 
-# 浏览器访问 http://localhost:8080
+# 浏览器访问：
+#   http://localhost:8080/         → landing 页（index.html）
+#   http://localhost:8080/start.html → 游戏页（trunk 默认输出名）
 # 客户端代码用 query string 切换信令地址：
-# http://localhost:8080?signaling=ws://localhost:8787
+# http://localhost:8080/start.html?signaling=ws://localhost:8787
 ```
+
+> ⚠️ 在 `trunk serve` 下访问"干净 URL" `/start` 不会自动重写到 `/start.html`（trunk 的内置 server 没有 try_files）。本地开发请用 `/start.html`；生产 Caddy 配置了 `try_files`，`/start` 可直接命中。
 
 ### 2.4 增量检查
 
@@ -103,64 +111,64 @@ wasm-pack test --headless --chrome -p voxweb-client
 
 ---
 
-## 三、`trunk.toml` 与 `index.html`
+## 三、`trunk.toml` 与 HTML 入口
 
-### `trunk.toml`
+### `trunk.toml`（项目实际配置）
 
 ```toml
 [build]
-target = "index.html"
+target = "start.html"
+html_output = "start.html"
 dist = "dist"
-release = false
 
 [serve]
 address = "0.0.0.0"
 port = 8080
 open = false
 
-[[hooks]]
-stage = "post_build"
-command = "wasm-opt"
-command_arguments = ["-Oz", "-o", "dist/pkg/voxweb-client_bg.wasm", "dist/pkg/voxweb-client_bg.wasm"]
-# 仅 release：trunk 默认非 release 不跑此 hook（若想区分，使用条件）
+[watch]
+ignore = ["signaling", "docs", ".git"]
 ```
 
-### `index.html`
+> trunk 把 `start.html` 当作 HTML 模板，扫描 `<link data-trunk rel="...">` 注入 wasm-bindgen 胶水 + WASM；并通过 `<link data-trunk rel="copy-file" href="index.html" />` 把 landing 页一并复制到 `dist/`。
+
+### `start.html`（游戏页 / trunk 入口）
 
 ```html
 <!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>VoxWeb</title>
-  <link data-trunk rel="rust" data-bin="voxweb-client" data-type="main"
-        data-wasm-opt="z" data-no-import="false" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="signaling-url" content="wss://signal.voxweb.example.com" />
+
+  <!-- 把 landing 页一并复制到 dist -->
+  <link data-trunk rel="copy-file" href="index.html" />
+
+  <!-- 编译期注入 wasm-bindgen 胶水 + WASM -->
+  <link data-trunk rel="rust" href="crates/client/Cargo.toml" data-type="main"
+        data-wasm-opt="z" />
+
   <style>
-    html, body { margin: 0; padding: 0; height: 100%; background: #1a1a1a; overflow: hidden; }
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1a1a2e; }
     #game { width: 100vw; height: 100vh; display: block; }
-    #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-               color: #ccc; font-family: sans-serif; font-size: 18px; }
   </style>
 </head>
 <body>
   <canvas id="game"></canvas>
-  <div id="loading">加载中...</div>
-  <script type="module">
-    // wasm-bindgen 入口由 trunk 自动注入
-    // start() 执行后会移除 #loading
-    const observer = new MutationObserver(() => {
-      const canvas = document.getElementById('game');
-      if (canvas && canvas.width > 0) {
-        document.getElementById('loading')?.remove();
-        observer.disconnect();
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true, attributes: true });
-  </script>
 </body>
 </html>
 ```
+
+### `index.html`（landing 页）
+
+纯 HTML/CSS/JS，不被 trunk 处理（仅作 copy-file 拷到 dist）。Start 按钮指向 `/start`：
+
+```html
+<a href="/start" class="start-button">Start</a>
+```
+
+干净 URL `/start` 由 Caddy 的 `try_files` 内部重写到 `/start.html`（见第五节）。
 
 ---
 
@@ -170,12 +178,19 @@ command_arguments = ["-Oz", "-o", "dist/pkg/voxweb-client_bg.wasm", "dist/pkg/vo
 
 ```bash
 trunk build --release
-# 输出：dist/
-#   index.html
-#   pkg/voxweb-client-<hash>.js
-#   pkg/voxweb-client_bg-<hash>.wasm
-#   assets/...（如字体）
+# 输出（hash 由 wasm-bindgen 自动加在文件名）：
+#   dist/
+#     index.html                                 ← landing
+#     start.html                                 ← 游戏页（trunk 默认输出名同源）
+#     voxweb-client-<hash>.js
+#     voxweb-client-<hash>_bg.wasm
 ```
+
+> ⚠️ **`wasm-opt` 当前未在工具链中**：`start.html` 的 `data-wasm-opt="z"` 已配置好，trunk 检测到 `wasm-opt` 在 PATH 时会自动调用；否则跳过并 warn。本机器人当前观察到 `wasm-opt` 缺失，导致 wasm 体积偏大（Phase 0 实测 2.10 MB gz，目标 1.5 MB）。
+> 安装：
+> - Windows：`winget install -e --id WebAssembly.WABT` 或下载 [binaryen release](https://github.com/WebAssembly/binaryen/releases) 解压加 PATH
+> - macOS：`brew install binaryen`
+> - Ubuntu：`apt install binaryen`
 
 ### 4.2 体积优化
 
@@ -221,7 +236,6 @@ voxweb.example.com {
     header {
         Cross-Origin-Opener-Policy "same-origin"
         Cross-Origin-Embedder-Policy "require-corp"
-        # WASM MIME（Caddy 默认已支持，显式声明保险）
         ?Content-Type-Options "nosniff"
     }
 
@@ -233,11 +247,13 @@ voxweb.example.com {
     @hashed path *.wasm *.js
     header @hashed Cache-Control "public, max-age=31536000, immutable"
 
-    # index.html 短缓存（保证用户能看到新版）
-    @html path /index.html /
+    # HTML 短缓存（包含干净 URL "/start"）
+    @html path /index.html / /start.html /start
     header @html Cache-Control "public, max-age=300"
 
-    # SPA fallback（不必要，因为只有一个页面）
+    # 干净 URL：/start → /start.html
+    try_files {path} {path}.html
+
     file_server
 }
 ```
@@ -390,7 +406,7 @@ deploy-static:
 游戏需要知道信令地址。三种方式（按优先级）：
 
 1. URL query string：`?signaling=wss://signal.example.com`（开发/测试用）
-2. `index.html` 内 `<meta name="signaling-url" content="...">`（生产推荐）
+2. `start.html` 内 `<meta name="signaling-url" content="...">`（生产推荐）
 3. 默认值：编译期常量
 
 ```rust

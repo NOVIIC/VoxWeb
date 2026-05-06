@@ -92,8 +92,18 @@
 
 1. **`prediction.rs` 仍有 dead-code 警告** — 字段属 Phase 5 占位，沿用 Phase 0 的处理。
 2. **wgpu native test 未跑** — render crate 在 wasm32 之外不编译（`SurfaceTarget::Canvas` 仅 web feature 提供）。Phase 1 的逻辑单测通过 `cargo test -p voxweb-core` + clippy 全量覆盖；纯逻辑测试（vertex pack / chunk_mesh）已写在 `#[cfg(test)] mod tests`，等 Phase 7 引入 native 跑通路径时一起激活。
-3. **浏览器侧未人工验证** — Phase 0 即如此；下次会话请运行 `trunk serve` 并在浏览器内测试 WASD/鼠标/HUD。
-4. **chunk_origin Y 永远是 0** — 当前世界只有一层 chunk；Phase 2 引入垂直分区前不需要管。
+3. **HUD 暂用 ASCII 文案** — egui 默认字体（Hack）不含 CJK 字形，中文会渲染成方框。Phase 6 完整 UI 时统一接入 CJK 字体（计划走 `egui::FontDefinitions` + 内嵌 Noto Sans SC 子集）。
+4. **`wasm-opt` 未安装** — `start.html` 已配 `data-wasm-opt="z"`，trunk 检测到才会跑；当前本地缺失导致 release 包偏大。安装命令见 [docs/deployment.md §四](docs/deployment.md#41-命令)。
+5. **chunk_origin Y 永远是 0** — 当前世界只有一层 chunk；Phase 2 引入垂直分区前不需要管。
+
+---
+
+## 修订（首次验收回归）
+
+- **A/D 反向修复**：`Camera::right()` 在 wgpu 右手系下应当用 `forward × up`（之前误用 `up × forward`，结果是反向）。改为 `(-sin yaw, 0, cos yaw)`。详见 [crates/client/src/camera.rs:57-65](crates/client/src/camera.rs#L57-L65)。
+- **HUD 中文方框**：把底部操作提示改为 ASCII（理由：egui 默认字体无 CJK 字形）。
+- **干净 URL `/start`**：landing 页 `index.html` 的 Start 按钮已链接 `/start`，但 `Caddyfile` 缺 `try_files`，会 404。已补 `try_files {path} {path}.html`，并把 `/start` 加进 HTML 短缓存匹配。
+- **文档同步**：[docs/deployment.md](docs/deployment.md)、[docs/architecture.md](docs/architecture.md)、[docs/roadmap.md](docs/roadmap.md) 全部按 `index.html`（landing）/ `start.html`（trunk 入口）双页结构改写。
 
 ---
 

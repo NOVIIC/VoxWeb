@@ -16,9 +16,12 @@ voxweb.example.com {
     @hashed path *.wasm *.js
     header @hashed Cache-Control "public, max-age=31536000, immutable"
 
-    # index.html 短缓存
-    @html path /index.html / /start.html
+    # index.html / start.html 短缓存（保证用户能看到新版）
+    @html path /index.html / /start.html /start
     header @html Cache-Control "public, max-age=300"
+
+    # 干净 URL：/start → /start.html（landing 页 index.html 的 Start 按钮指向 /start）
+    try_files {path} {path}.html
 
     file_server
 }
