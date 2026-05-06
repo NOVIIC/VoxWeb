@@ -45,7 +45,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 1 · 渲染骨架
+## Phase 1 · 渲染骨架 ✅
 
 ### 目标
 让一个 chunk（手工填充的几个方块）出现在屏幕上，相机能用 WASD + 鼠标控制视角。
@@ -56,14 +56,14 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`modules/core.md`](modules/core.md)（BlockID / Chunk / Position）
 
 ### 任务清单
-- [ ] `core::block` + `core::chunk` 完整定义
-- [ ] `render::vertex` 实现 u32 压缩顶点（先实现编码 + WGSL 解码）
-- [ ] `render::passes::opaque` 单 Pass：纯色 + 顶点 packed
-- [ ] `client::camera` 第一人称相机（Fly 模式）
-- [ ] `client::input` 键盘 + 鼠标 movement
-- [ ] 指针锁集成（点击 canvas 进入；ESC 退出）
-- [ ] 手工填充一个 16×16×4 的方块阵列，渲染显示
-- [ ] HUD：FPS + 坐标显示
+- [x] `core::block` + `core::chunk` 完整定义
+- [x] `render::vertex` 实现 u32 压缩顶点（先实现编码 + WGSL 解码）
+- [x] `render::passes::opaque` 单 Pass：纯色 + 顶点 packed
+- [x] `client::camera` 第一人称相机（Fly 模式）
+- [x] `client::input` 键盘 + 鼠标 movement
+- [x] 指针锁集成（点击 canvas 进入；ESC 退出）
+- [x] 手工填充一个 16×16×4 的方块阵列，渲染显示
+- [x] HUD：FPS + 坐标显示
 
 ### 验证
 - 在浏览器内可以用 WASD + 鼠标自由飞行
