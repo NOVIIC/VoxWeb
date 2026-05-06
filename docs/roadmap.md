@@ -16,7 +16,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 0 · 脚手架
+## Phase 0 · 脚手架 ✅
 
 ### 目标
 创建项目骨架，让一个空 canvas + Hello World UI 在浏览器跑起来。
@@ -26,13 +26,13 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`deployment.md`](deployment.md)（trunk 配置、本地命令、Caddyfile）
 
 ### 任务清单
-- [ ] 创建 `Cargo.toml` workspace + 五个 crate 的空骨架
-- [ ] `index.html` + `trunk.toml` 跑通 `trunk serve`
-- [ ] `client::start` 创建一个空 wgpu Surface 并清屏纯色
-- [ ] 集成 egui，绘制"Hello VoxWeb"在屏幕中央
-- [ ] 设置 `console_error_panic_hook` + `tracing-wasm`
-- [ ] CI：`cargo check --target wasm32-unknown-unknown` + `cargo fmt --check`
-- [ ] `signaling/` TS 项目初始化（空 worker，仅返回 200）
+- [x] 创建 `Cargo.toml` workspace + 五个 crate 的空骨架
+- [x] `index.html` + `trunk.toml` 跑通 `trunk serve`
+- [x] `client::start` 创建一个空 wgpu Surface 并清屏纯色
+- [x] 集成 egui，绘制"Hello VoxWeb"在屏幕中央
+- [x] 设置 `console_error_panic_hook` + `tracing-wasm`
+- [x] CI：`cargo check --target wasm32-unknown-unknown` + `cargo fmt --check`
+- [x] `signaling/` TS 项目初始化（空 worker，仅返回 200）
 
 ### 验证
 - `trunk serve` → 浏览器打开 http://localhost:8080 → 看到纯色背景 + 居中文字
