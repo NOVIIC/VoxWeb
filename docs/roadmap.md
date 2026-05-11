@@ -75,6 +75,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ## Phase 2 · 体素单人
 
+> **设计已批准**（2026-05-11）：见 [`superpowers/specs/2026-05-11-phase2-design.md`](superpowers/specs/2026-05-11-phase2-design.md)
+> 待实施完成后本标题加 ✅。
+
 ### 目标
 单机模式可玩：地形生成、动态加载、跨区块剔除。
 
@@ -82,6 +85,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`modules/server.md`](modules/server.md)
 - [`features/meshing.md`](features/meshing.md)
 - [`modules/client.md`](modules/client.md)（mesh_jobs）
+- [`modules/net.md`](modules/net.md)（NetEndpoint::Local mpsc）
 
 ### 任务清单
 - [ ] `server::terrain` Perlin 高度图地形生成

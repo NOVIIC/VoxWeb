@@ -16,6 +16,17 @@
 
 ---
 
+### 阶段实装范围
+
+| 阶段 | 包含 |
+|---|---|
+| **Phase 2 ✅**（设计已批准） | `NetEndpoint::Local` 走 `futures::channel::mpsc` 双向通道；`new_local_pair` + `send_client_message` + `try_recv_server_message` + `ServerInbox` |
+| Phase 4 | `signaling.rs` / `peer.rs` / `room.rs` / `transport.rs` 完整实装；`NetEndpoint::Host / Remote` |
+
+下面 §3 起 `Host / Remote` 部分为 **Phase 4 前瞻设计**；Phase 2 仅实装 `Local` 分支。
+
+---
+
 ## 二、目录结构
 
 ```
@@ -37,19 +48,19 @@ crates/net/src/
 
 ```rust
 pub enum NetEndpoint {
-    /// 单机模式：直接持有 server 的内存通道
+    /// [Phase 2] 单机模式：基于 futures mpsc 的内存通道
     Local {
-        to_server: VecDeque<ClientMessage>,    // client→server
-        to_client: VecDeque<ServerMessage>,    // server→client
+        tx_client: mpsc::UnboundedSender<ClientMessage>,
+        rx_server: mpsc::UnboundedReceiver<ServerMessage>,
     },
-    /// 房主：自身 Server + 多个 Remote Peer
+    /// [Phase 4] 房主：自身 Server + 多个 Remote Peer
     Host {
         local: Box<NetEndpoint>,               // 自身的 Local 通道（仍走内存）
         peers: HashMap<PeerId, PeerConnection>,
         signaling: SignalingClient,
         room: RoomSession,
     },
-    /// 远程客户端：单条到 Host 的 PeerConnection
+    /// [Phase 4] 远程客户端：单条到 Host 的 PeerConnection
     Remote {
         host: PeerConnection,
         signaling: SignalingClient,
@@ -57,39 +68,40 @@ pub enum NetEndpoint {
     },
 }
 
+/// [Phase 2] Server 侧持有的 mpsc 端，与 NetEndpoint::Local 对偶。
+pub struct ServerInbox {
+    pub rx_client: mpsc::UnboundedReceiver<ClientMessage>,
+    pub tx_server: mpsc::UnboundedSender<ServerMessage>,
+}
+
 pub type PeerId = u32;
 
 impl NetEndpoint {
-    /// 创建单机端点
-    pub fn local() -> Self;
+    /// [Phase 2] 创建 Local 端点 + 对偶 ServerInbox。
+    pub fn new_local_pair() -> (Self, ServerInbox);
 
-    /// 创建房主，并连接信令服务
+    /// [Phase 4] 创建房主，并连接信令服务
     pub async fn host(signaling_url: &str, room_id: &str) -> Result<Self, NetError>;
 
-    /// 加入房间
+    /// [Phase 4] 加入房间
     pub async fn join(signaling_url: &str, room_id: &str) -> Result<Self, NetError>;
 
-    /// 发送一条客户端消息（Local→Server / Remote→Host）
-    pub fn send_to_server(&mut self, msg: ClientMessage);
+    /// [Phase 2+] 发送一条客户端消息（Local 入 tx_client；Remote 序列化走 DataChannel）
+    pub fn send_client_message(&self, msg: ClientMessage);
 
-    /// 发送一条服务端消息（Host 角色用，会自动选择通道与接收方）
+    /// [Phase 2+] 非阻塞拉取一条 ServerMessage
+    pub fn try_recv_server_message(&mut self) -> Option<ServerMessage>;
+
+    /// [Phase 4+] Host 广播 ServerMessage
     pub fn broadcast(&mut self, recipient: Recipient, msg: ServerMessage);
 
-    /// 拉取本端入站消息
-    pub fn poll_inbound(&mut self) -> Vec<InboundEnvelope>;
-
-    /// 房间生命周期事件（连接建立/断开/peer 加入/离开）
+    /// [Phase 4+] 房间生命周期事件
     pub fn poll_events(&mut self) -> Vec<RoomEvent>;
 }
 
-pub struct InboundEnvelope {
-    pub sender: PeerId,            // Host 视角下来源 peer；Remote 视角下固定为 0
-    pub message: NetMessage,
-}
-
-pub enum NetMessage {
-    FromClient(ClientMessage),     // Host 收到 Remote 输入
-    FromServer(ServerMessage),     // Remote 收到 Host 状态
+impl ServerInbox {
+    pub fn try_recv_client_message(&mut self) -> Option<ClientMessage>;
+    pub fn send_server_message(&self, msg: ServerMessage);
 }
 
 pub enum NetError {
@@ -101,11 +113,18 @@ pub enum NetError {
 }
 ```
 
-> **设计意图**：`client` 不需要 `match endpoint { Local => ..., Host => ..., Remote => ... }`。把所有差异封装在 `net` 内，`client` 只调 `send_to_server` / `broadcast` / `poll_inbound` / `poll_events`。
+> **Phase 2 driver 模式**：client 主循环每帧
+> 1. 用 `server_inbox.try_recv_client_message()` 拉客户端消息，喂给 `server.handle_message(...)`；
+> 2. 把 handle_message 返回的 `Vec<ServerMessage>` 通过 `server_inbox.send_server_message(msg)` 推回；
+> 3. 在 client 端 `net.try_recv_server_message()` 消费并应用到 Game。
+
+> **设计意图**：`client` 不需要 `match endpoint { Local => ..., Host => ..., Remote => ... }`。把所有差异封装在 `net` 内，`client` 只调 `send_client_message` / `try_recv_server_message` / `broadcast`（Phase 4+） / `poll_events`（Phase 4+）。
 
 ---
 
 ## 四、`signaling.rs` — WebSocket 信令客户端
+
+> **Phase 4** 引入。Phase 2 仅 Local 模式不走信令。
 
 ### 协议
 完整协议见 [`networking/signaling.md`](../networking/signaling.md)。简要：
@@ -155,6 +174,8 @@ impl SignalingClient {
 ---
 
 ## 五、`peer.rs` — RtcPeerConnection 包装
+
+> **Phase 4** 引入。
 
 ### 设计
 
@@ -259,6 +280,8 @@ impl PeerConnection {
 
 ## 六、`room.rs` — 房间会话状态机
 
+> **Phase 4** 引入。
+
 ```rust
 pub enum RoomSession {
     Idle,
@@ -293,6 +316,8 @@ Disconnected
 ---
 
 ## 七、`transport.rs` — 通道选择与路由
+
+> **Phase 4** 引入。Phase 2 的 Local 通道不区分 reliable/unreliable，单 mpsc 即可。
 
 ### 通道选择规则
 

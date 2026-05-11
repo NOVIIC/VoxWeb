@@ -20,27 +20,42 @@
 
 ---
 
+### 阶段实装范围
+
+| 阶段 | 包含 |
+|---|---|
+| **Phase 2 ✅**（设计已批准） | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
+| Phase 3 | Walk 模式 + `physics.rs` + `raycast.rs`；挖放 hotbar |
+| Phase 4 | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote` |
+| Phase 5 | `prediction.rs` / `interp.rs` 实装；`storage.rs` IndexedDB；远端玩家身体渲染 |
+| Phase 6 | `ui::chat / players / pause` 完整；EscMenu / ChatOpen 状态 |
+
+下面 §4 起的 `App` 完整结构是**Phase 5+ 终态**。Phase 2 实际仅需子集，标注见 §4。
+
+---
+
 ## 二、目录结构
 
 ```
 crates/client/src/
 ├── lib.rs              wasm 入口 + 主循环
-├── app.rs              AppState 状态机 + 全局 App 持有所有子模块
+├── app.rs              AppState 状态机 + App / Game 主结构
 ├── camera.rs           第一人称相机
 ├── input.rs            键盘/鼠标输入管理
-├── physics.rs          玩家本地物理预测（详见 features/physics.md）
-├── raycast.rs          DDA 射线
-├── prediction.rs       客户端预测协调（详见 networking/prediction.md）
-├── interp.rs           远端玩家位置插值
-├── mesh_jobs.rs        网格化任务队列 + 分帧调度
-├── storage.rs          IndexedDB 异步包装（实现 server::ChunkStorage trait）
+├── mesh_jobs.rs        [Phase 2] 网格化任务队列 + 分帧调度
+├── chunk_loader.rs     [Phase 2] 区块滚动加载 / 卸载
+├── physics.rs          [Phase 3] 玩家本地物理预测
+├── raycast.rs          [Phase 3] DDA 射线
+├── prediction.rs       [Phase 5] 客户端预测协调
+├── interp.rs           [Phase 5] 远端玩家位置插值
+├── storage.rs          [Phase 5] IndexedDB 异步包装
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
-    ├── lobby.rs        大厅：昵称 + 房间号 + Host/Join
-    ├── hud.rs          HUD：FPS / 坐标 / 玩家列表 / 准星
-    ├── pause.rs        暂停菜单：FOV / 灵敏度 / 渲染距离 / 退出
-    ├── chat.rs         聊天框 + 消息历史
-    └── players.rs      玩家名牌（3D billboard）+ 玩家列表 widget
+    ├── lobby.rs        [Phase 2] 大厅：单机模式按钮 + 种子（Phase 4 加 Host/Join）
+    ├── hud.rs          [Phase 1+] HUD：FPS / 坐标 / 玩家列表 / 准星
+    ├── pause.rs        [Phase 6] 暂停菜单
+    ├── chat.rs         [Phase 6] 聊天框 + 消息历史
+    └── players.rs      [Phase 6] 玩家名牌（3D billboard）+ 玩家列表 widget
 ```
 
 ---
@@ -81,12 +96,16 @@ async fn run() -> Result<(), AppError> {
 
 ```rust
 pub enum AppState {
-    Lobby,                                // 大厅，未联网
-    Connecting { progress: ConnectingProgress },  // 信令 + ICE 阶段
-    InGame { paused: bool, chat_open: bool },
-    Disconnected { reason: String },      // 显示原因 + "返回大厅"按钮
+    Loading,                              // [Phase 0+]
+    Lobby,                                // [Phase 2+] 大厅，未联网
+    Connecting { progress: ConnectingProgress },  // [Phase 4+] 信令 + ICE 阶段
+    InGame,                               // [Phase 2+]（Phase 6 加 paused / chat_open 状态位）
+    EscMenu,                              // [Phase 6]
+    ChatOpen,                             // [Phase 6]
+    Disconnected { reason: String },      // [Phase 4+]
 }
 
+// [Phase 4+]
 pub struct ConnectingProgress {
     pub stage: ConnectingStage,
     pub error: Option<String>,
@@ -101,73 +120,122 @@ pub enum ConnectingStage {
 }
 ```
 
-### App 主结构
+### App / Game 主结构
+
+Phase 2 起，`App` 容器只持有跨状态资源（renderer / egui / input）。游戏内运行时持有于 `Game` 子结构，仅 `InGame` 时存在：
 
 ```rust
 pub struct App {
-    pub state: AppState,
+    pub canvas: web_sys::HtmlCanvasElement,
     pub renderer: Renderer,
     pub egui_ctx: egui::Context,
-    pub egui_state: egui_winit::State,
-    pub input: InputManager,
-    pub camera: Camera,
-    pub server: Option<Server>,           // Local-Only / Host 角色才持有
-    pub net: NetEndpoint,
-    pub world_view: WorldView,            // 客户端持有的世界视图（远端发来的状态）
-    pub physics: ClientPhysics,
-    pub prediction: Prediction,
-    pub interp: PlayerInterp,
-    pub mesh_jobs: MeshJobQueue,
-    pub storage: IndexedDbStorage,        // 仅 Host/Local-Only 使用
-    pub settings: AppSettings,
-    pub config: ServerConfig,
-    pub frame_clock: FrameClock,
-    pub chat: ChatHistory,
-    pub canvas: web_sys::HtmlCanvasElement,
+    pub egui_renderer: egui_wgpu::Renderer,
+    pub input: Rc<RefCell<InputState>>,
+    pub state: AppState,
+    pub game: Option<Game>,            // [Phase 2] InGame 时存在
+}
+
+pub struct Game {
+    pub server: Rc<RefCell<Server>>,   // [Phase 2] Local-Only 持有完整 Server
+    pub server_inbox: ServerInbox,     // [Phase 2] mpsc 服务端侧
+    pub net: NetEndpoint,              // [Phase 2] ::Local；Phase 4 → Host/Remote
+    pub camera: Camera,                // [Phase 1+]
+    pub mesh_jobs: MeshJobQueue,       // [Phase 2]
+    pub chunk_loader: ChunkLoader,     // [Phase 2]
+    pub frame_clock: FrameClock,       // [Phase 2+]
+    pub settings: GameSettings,        // [Phase 2+]
+
+    // —— 以下为后续 Phase 引入 ——
+    pub physics: ClientPhysics,        // [Phase 3]
+    pub prediction: Prediction,        // [Phase 5]
+    pub interp: PlayerInterp,          // [Phase 5]
+    pub world_view: WorldView,         // [Phase 5] Remote 模式用；Local 直接 borrow server.world
+    pub storage: IndexedDbStorage,     // [Phase 5]
+    pub chat: ChatHistory,             // [Phase 6]
 }
 ```
 
-`WorldView` 是客户端持有的"已知世界"（包括 Local-Only 自身完整世界，或 Remote 端从 Host 收到的部分）。结构与 `server::World` 相似但不持有玩家权威表。
+> Phase 2 不引入 `world_view`：Local 模式下 mesh 回调直接借 `server.world.get_block_world`。Phase 5 加入 Remote 模式时才有 `WorldView` 副本（由 ChunkSnapshot 喂数据）。
 
 ---
 
 ## 五、主循环
 
-主循环运行在 winit 的 `ApplicationHandler::about_to_wait`（每个 RAF 触发一次）：
+### Phase 2 主循环（Lobby / InGame 二态）
+
+```rust
+fn render_frame(app: &mut App) {
+    let dt = app.frame_clock.tick();
+
+    match &mut app.state {
+        AppState::Lobby => render_lobby_frame(app, dt),
+        AppState::InGame => render_game_frame(app, dt),
+        _ => {} // 其它态由后续 Phase 接入
+    }
+}
+
+fn render_game_frame(app: &mut App, dt: f32) {
+    let game = app.game.as_mut().unwrap();
+
+    // 1. drain Local 通道（Client→Server）
+    game.net.drain_inbox_to(&mut game.server.borrow_mut(), &mut game.server_inbox);
+
+    // 2. drain Local 通道（Server→Client）
+    while let Some(msg) = game.net.try_recv_server_message() {
+        game.apply_server_message(msg);
+    }
+
+    // 3. 输入 → 相机（Fly 模式）
+    game.update_input_and_camera(dt);
+
+    // 4. 60Hz 逻辑帧累加器
+    game.frame_clock.accumulate(dt);
+    while game.frame_clock.consume_logic_step() {
+        game.server.borrow_mut().tick();
+    }
+
+    // 5. Chunk 滚动加载
+    game.chunk_loader.update(
+        game.camera.position,
+        &mut game.server.borrow_mut(),
+        &mut game.mesh_jobs,
+        &mut app.renderer,
+    );
+
+    // 6. 网格化任务（4ms budget）
+    game.mesh_jobs.run_until_budget(
+        MESH_BUDGET_MS,
+        &game.server.borrow(),
+        &mut app.renderer,
+    );
+
+    // 7. egui HUD
+    let egui_output = app.build_hud(game);
+
+    // 8. wgpu 渲染 + present
+    app.renderer.render(&game.camera, egui_output);
+}
+```
+
+### Phase 5+ 完整主循环（前瞻）
 
 ```rust
 fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-    let dt = self.frame_clock.tick();   // 真实经过时间，单位秒
+    let dt = self.frame_clock.tick();
 
-    // 1. 处理累积的网络入站消息
-    self.process_inbound();
+    self.process_inbound();              // 网络入站
+    self.update_camera(dt);              // 即时响应
 
-    // 2. 输入 → 相机（即时响应，不等待逻辑帧）
-    self.update_camera(dt);
-
-    // 3. 逻辑帧累加器：固定 60Hz 步长
     self.frame_clock.accumulate(dt);
     while self.frame_clock.consume_logic_step() {
-        self.update_logic(LOGIC_DT);
+        self.update_logic(LOGIC_DT);     // 含 prediction.reconcile
     }
 
-    // 4. 远端玩家插值（用本地时间，非 logic step）
-    self.interp.advance(dt);
-
-    // 5. 网格化任务（frame budget）
+    self.interp.advance(dt);             // 远端玩家插值
     self.mesh_jobs.run_until_budget(MESH_BUDGET_MS, &mut self.renderer);
-
-    // 6. UI 重建
     let egui_output = self.build_ui();
-
-    // 7. 渲染
     self.renderer.render_frame(&self.frame_data(), egui_output);
-
-    // 8. 持久化触发（每 30 秒）
-    self.maybe_flush_persistence();
-
-    // 通知浏览器我们要再来一帧
-    self.canvas.request_animation_frame();   // winit 已自动管理
+    self.maybe_flush_persistence();      // 每 30 秒 IndexedDB 写入
 }
 ```
 
@@ -231,17 +299,68 @@ impl InputManager {
 
 **指针锁**：进入 InGame 时调用 `canvas.request_pointer_lock()`（必须由用户手势触发，故"开始游戏"按钮的点击事件中发起）。ESC 释放。
 
-### 6.3 `physics.rs`（详见 [`features/physics.md`](../features/physics.md)）
+### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`（[Phase 2]）
+
+**MeshJobQueue**：
+
+```rust
+pub enum MeshPriority { Critical, High, Medium, Low }
+
+pub struct MeshJobQueue {
+    queues: [VecDeque<ChunkPos>; 4],   // 按 MeshPriority 索引
+    pending: HashSet<ChunkPos>,        // 防重 / cancel
+}
+
+impl MeshJobQueue {
+    pub fn enqueue(&mut self, pos: ChunkPos, priority: MeshPriority);
+    pub fn cancel(&mut self, pos: ChunkPos);
+    pub fn run_until_budget(&mut self, budget_ms: f32, server: &Server, renderer: &mut Renderer);
+}
+```
+
+`run_until_budget` 每次取最高优先级队列 head，调 `chunk_mesh::generate_with_neighbors`，回调 `|wx,wy,wz| server.world.get_block_world(...)`，结果 `renderer.upload_chunk_mesh`。`performance.now()` 监控耗时超 budget 退出。
+
+**ChunkLoader**：
+
+```rust
+pub struct ChunkLoader {
+    pub render_distance: u32,          // 默认 6
+    pub unload_buffer: u32,            // 默认 3（实际卸载半径 = render_distance + buffer）
+    pub loaded: HashSet<ChunkPos>,
+    last_center: Option<ChunkPos>,
+}
+
+impl ChunkLoader {
+    pub fn update(
+        &mut self,
+        camera_pos: Vec3,
+        server: &mut Server,
+        mesh_jobs: &mut MeshJobQueue,
+        renderer: &mut Renderer,
+    );
+}
+```
+
+`update`：
+1. 算出当前 chunk 中心；若与上次相同则跳过（chunk 内移动不触发）
+2. 计算期望集合（render_distance 半径方形）
+3. 新增 chunk：先 `server.world.ensure_chunk_generated(pos)` → `mesh_jobs.enqueue(pos, prio)`
+4. 对**这一批新 chunk** 的水平邻居（已在 loaded 中且 renderer.has_chunk_mesh）以 `MeshPriority::Low` 重新入队，使跨区块剔除生效
+5. 卸载：超出 `render_distance + unload_buffer` 的 chunk → `server.unload_chunk` + `mesh_jobs.cancel` + `renderer.drop_chunk_mesh`
+
+> **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠。
+
+### 6.8 `physics.rs`（[Phase 3]，详见 [`features/physics.md`](../features/physics.md)）
 本地玩家 AABB 物理预测（重力、跳跃、分轴碰撞）。仅作"乐观更新"，Host 仲裁后通过 prediction 模块协调。
 
-### 6.4 `raycast.rs`（详见 [`features/physics.md`](../features/physics.md)）
+### 6.9 `raycast.rs`（[Phase 3]，详见 [`features/physics.md`](../features/physics.md)）
 DDA 算法，最大射程 6 格。返回命中的方块位置 + 命中面（用于放方块时计算邻居位置）。
 
-### 6.5 `prediction.rs`（详见 [`networking/prediction.md`](../networking/prediction.md)）
+### 6.10 `prediction.rs`（[Phase 5]，详见 [`networking/prediction.md`](../networking/prediction.md)）
 - 玩家位置：本地立即更新 + 收到 PlayerTick 后做软协调（误差小则插补，超过阈值则瞬移）
 - 方块挖放：先发请求 + 本地半透明预览 → 收到 ActionAck 决定 commit 或 rollback
 
-### 6.6 `interp.rs`
+### 6.11 `interp.rs`（[Phase 5]）
 
 远端玩家位置插值缓冲区：
 
@@ -260,35 +379,12 @@ pub struct RemotePlayerBuffer {
 
 impl PlayerInterp {
     pub fn ingest_tick(&mut self, players: &[PlayerSnapshot], server_time_ms: u64);
-    pub fn advance(&mut self, dt: f32);    // 推进所有 buffer 的插值
+    pub fn advance(&mut self, dt: f32);
     pub fn current(&self, entity: EntityId) -> Option<(Vec3, f32, f32)>;
 }
 ```
 
-### 6.7 `mesh_jobs.rs`
-
-```rust
-pub struct MeshJobQueue {
-    pending: PriorityQueue<ChunkPos, MeshPriority>,
-    in_flight: HashSet<ChunkPos>,
-}
-
-impl MeshJobQueue {
-    pub fn enqueue(&mut self, pos: ChunkPos, priority: MeshPriority);
-    pub fn run_until_budget(&mut self, budget_ms: f32, renderer: &mut Renderer);
-}
-```
-
-每次 budget：
-1. 取最高优先级的 ChunkPos（玩家附近优先）
-2. 从 `world_view` 取 chunk + 6 邻居引用
-3. 调 `chunk_mesh::generate_with_neighbors(...)` 得到 CPU 数据
-4. `renderer.upload_chunk_mesh(pos, mesh)` 上传 GPU
-5. 累计耗时超过 budget 退出循环（剩余下一帧再处理）
-
-详见 [`features/meshing.md`](../features/meshing.md)。
-
-### 6.8 `storage.rs`
+### 6.12 `storage.rs`（[Phase 5]）
 
 ```rust
 pub struct IndexedDbStorage {

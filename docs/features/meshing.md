@@ -17,6 +17,18 @@
 
 ---
 
+### 阶段实装范围
+
+| 阶段 | 包含 |
+|---|---|
+| **Phase 1 ✅** | u32 顶点压缩格式（§2）；朴素逐面（`generate_opaque_mesh`） |
+| **Phase 2 ✅**（设计已批准） | `generate_with_neighbors`（§4 跨区块面剔除）；`MeshJobQueue` + `MeshPriority` 4 档枚举（§6） |
+| Phase 7 | 贪婪网格化（§3 替换朴素逐面）；AO（§5）；视锥剔除（§9） |
+
+下面 §3 贪婪算法、§5 AO、§9 视锥剔除均为 **Phase 7 设计**；Phase 2 实装使用朴素逐面 + 跨区块剔除。
+
+---
+
 ## 二、u32 顶点压缩格式
 
 ### 位段布局
@@ -119,6 +131,8 @@ UV 计算：贪婪合并后的大矩形，UV 从 (0,0) 一直平铺到 (w, h) �
 
 ## 三、贪婪网格化算法
 
+> **Phase 7** 引入。Phase 2 实装使用 `generate_with_neighbors` 朴素逐面（每方块 6 面遍历），先把跨区块剔除做对，再在 Phase 7 替换为贪婪算法。下面是 Phase 7 设计。
+
 ### 思路
 对每个面方向（6 个），按层（如 PosY 面就按 Y 层）扫描每一层 16×16 平面，把"需要绘制此面"的格子加入 mask，然后从 mask 中提取最大矩形（贪婪扩展宽高），生成一个大四边形。
 
@@ -205,6 +219,8 @@ for ly in 0..CHUNK_Y {
 
 ## 四、跨区块面剔除
 
+> **Phase 2** 实装。这是 Phase 2 体素单人模式的视觉正确性关键。
+
 ### 问题
 普通"面剔除"只看同一 chunk 内的相邻方块。chunk 边界处的方块永远找不到邻居（其它 chunk 数据），导致边界面被多绘制。
 
@@ -212,26 +228,24 @@ for ly in 0..CHUNK_Y {
 `generate_with_neighbors` 接收一个回调，能查询世界坐标的方块：
 
 ```rust
+/// [Phase 2] 跨区块面剔除版本的网格化。
+/// 朴素逐面遍历 chunk 内每个方块，对每个面查询 get_block_world 决定是否发射。
+/// 同 chunk 内的查询也走这个回调（统一接口，回调内部自行判断 chunk 内/外）。
 pub fn generate_with_neighbors(
     chunk: &Chunk,
     chunk_pos: ChunkPos,
     get_block_world: &dyn Fn(i32, i32, i32) -> BlockID,
-) -> ChunkMeshCpu {
-    // 内部把 "查相邻方块" 的所有调用替换为 get_block_world(world_x, world_y, world_z)
-    // 同 chunk 内的查询也走这个函数（统一接口，回调内部处理 chunk 内/外查询）
-    ...
-}
+) -> ChunkMeshCpu;
 ```
 
-调用方（`client::mesh_jobs`）：
+调用方（`client::mesh_jobs::run_until_budget`）：
 
 ```rust
-let world_view_ref = &self.world_view;  // 只读
-renderer_jobs.spawn(chunk_pos, move |get_world| {
-    chunk_mesh::generate_with_neighbors(&chunk, chunk_pos, &|x, y, z| {
-        world_view_ref.get_block_world(x, y, z)  // 跨 chunk
-    })
-});
+let server_ref = server;  // &Server，从 Rc<RefCell<Server>> 借出
+let mesh = chunk_mesh::generate_with_neighbors(
+    chunk, chunk_pos,
+    &|wx, wy, wz| server_ref.world.get_block_world(wx, wy, wz),
+);
 ```
 
 ### 边界情况
@@ -241,6 +255,8 @@ renderer_jobs.spawn(chunk_pos, move |get_world| {
 ---
 
 ## 五、AO 计算
+
+> **Phase 7** 引入。Phase 2 顶点 AO 一律为 3（最亮，无遮蔽）。
 
 每个顶点的 AO 取决于附近 3 个方块（同面方向的两个邻接边 + 一个对角）：
 
@@ -260,6 +276,8 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
 
 ## 六、网格化任务调度
 
+> **Phase 2** 实装。
+
 ### 优先级
 
 ```rust
@@ -267,7 +285,7 @@ pub enum MeshPriority {
     Critical,   // 玩家正站立的 chunk
     High,       // 玩家附近 1 chunk 范围
     Medium,     // 渲染距离内
-    Low,        // 边界 chunk（玩家走过去前可延迟）
+    Low,        // 边界 chunk / 因邻居加载触发的重网格化
 }
 ```
 
@@ -276,13 +294,17 @@ pub enum MeshPriority {
 每渲染帧最多花 `MESH_BUDGET_MS = 4ms` 跑网格化。超过预算时停下，剩余下一帧继续。
 
 ```rust
-pub fn run_until_budget(&mut self, budget_ms: f32, renderer: &mut Renderer) {
+pub fn run_until_budget(&mut self, budget_ms: f32, server: &Server, renderer: &mut Renderer) {
     let start = performance_now();
     while performance_now() - start < budget_ms as f64 {
-        let Some((pos, _priority)) = self.pending.pop() else { break; };
-        let mesh = chunk_mesh::generate_with_neighbors(...);
-        renderer.upload_chunk_mesh(pos, mesh);
-        self.in_flight.remove(&pos);
+        let Some(pos) = self.pop_highest_priority() else { break; };
+        let Some(chunk) = server.world.chunks.get(&pos) else { continue; };
+        let mesh = chunk_mesh::generate_with_neighbors(
+            chunk, pos,
+            &|wx, wy, wz| server.world.get_block_world(wx, wy, wz),
+        );
+        renderer.upload_chunk_mesh(pos, &mesh);
+        self.pending.remove(&pos);
     }
 }
 ```
@@ -292,23 +314,23 @@ pub fn run_until_budget(&mut self, budget_ms: f32, renderer: &mut Renderer) {
 ### 触发条件
 
 将 chunk 加入网格化队列：
-- 首次加载（远端 ChunkSnapshot 解码完成 / 本地 server 生成完成）
-- 方块更新（自身或相邻 chunk 边界方块）
-- 邻居 chunk 由"未加载"变"已加载"时
-- 玩家走出后再回来
+- 首次加载（Local 模式由 `ChunkLoader.update` 触发；Phase 5 Remote 模式由 ChunkSnapshot 组装完成触发）
+- 方块更新（自身或相邻 chunk 边界方块）— Phase 3
+- 邻居 chunk 由"未加载"变"已加载"时 — Phase 2 由 `ChunkLoader.update` 显式触发（见 `docs/modules/client.md` §6.7）
+- 玩家走出后再回来 — Phase 2 由 `ChunkLoader.update` 触发
 
 ### 防重复
-`in_flight: HashSet<ChunkPos>` 防止同一 chunk 入队两次。需要重新网格化时设 `dirty` 标记，下一帧 dequeue 后再判断是否仍 dirty。
+`pending: HashSet<ChunkPos>` 防止同一 chunk 入队两次。需要重新网格化时设 `dirty` 标记，下一帧 dequeue 后再判断是否仍 dirty。
 
 ---
 
 ## 七、与远程数据流的协同
 
 ### Local-Only / Host
-- 本地 `server.world` 改 → 标记 dirty → 入队
+- 本地 `server.world` 改 → 标记 dirty → 入队（Phase 3 后挖放，Phase 2 仅 ChunkLoader 滚动触发）
 - 同步快
 
-### Remote
+### Remote（[Phase 5]）
 - 收到 `ChunkSnapshot` → assembler 组装完成 → `world_view.insert(pos, chunk)` → 入队
 - 收到 `BlockUpdate` → `world_view.set_block` → 该 chunk + 6 邻居（如果方块在边界）入队
 
@@ -351,6 +373,8 @@ pub struct ChunkMeshGpu {
 ---
 
 ## 九、视锥剔除
+
+> **Phase 7** 引入。Phase 2 渲染距离 6 时 chunk 数 ≈ 169，朴素逐面 + 跨区块剔除下顶点量可控，本期不做视锥剔除。
 
 每帧渲染前根据相机视锥过滤需要 draw 的 chunk：
 
