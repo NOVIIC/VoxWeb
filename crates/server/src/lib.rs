@@ -37,6 +37,14 @@ impl Server {
     /// 处理一条来自 Client 的消息（本地或远程），返回需要广播的响应消息列表。
     pub fn handle_message(&mut self, _entity_id: u32, msg: ClientMessage) -> Vec<ServerMessage> {
         match msg {
+            ClientMessage::Hello { .. } => {
+                // Phase 2：固定 entity_id=1。Phase 5 引入玩家表后由 add_player 分配。
+                vec![ServerMessage::Welcome {
+                    entity_id: 1,
+                    server_tick: self.tick,
+                    world_seed: self.seed,
+                }]
+            }
             ClientMessage::Break { pos, request_id } => {
                 self.world.set_block(pos, voxweb_core::BlockID::AIR);
                 vec![
@@ -68,5 +76,42 @@ impl Server {
             }
             _ => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod handle_message_tests {
+    use super::*;
+    use voxweb_core::protocol::{ClientMessage, ServerMessage};
+
+    #[test]
+    fn hello_returns_welcome_with_seed() {
+        let mut server = Server::new(42);
+        let replies = server.handle_message(
+            1,
+            ClientMessage::Hello {
+                display_name: "Tester".into(),
+                version: 1,
+            },
+        );
+        assert_eq!(replies.len(), 1);
+        match &replies[0] {
+            ServerMessage::Welcome {
+                entity_id,
+                world_seed,
+                ..
+            } => {
+                assert_eq!(*entity_id, 1);
+                assert_eq!(*world_seed, 42);
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_message_returns_empty_vec() {
+        let mut server = Server::new(0);
+        let replies = server.handle_message(1, ClientMessage::Ping { client_time_ms: 0 });
+        assert!(replies.is_empty(), "Phase 2 Ping handler 未实装，应返回空");
     }
 }
