@@ -1,15 +1,16 @@
 //! VoxWeb 客户端入口（cdylib）。
 //!
-//! Phase 1：渲染骨架。
-//! - 渲染一个手工填充的 16×16×4 演示 Chunk（彩色方块）
-//! - 第一人称 Fly 相机，WASD + 空格/Shift + 鼠标视角
-//! - 指针锁：点击 canvas 进入；ESC 退出
-//! - HUD：FPS + 玩家坐标 + 操作提示
+//! Phase 2：
+//! - Lobby UI：单机模式按钮 + 种子输入
+//! - InGame：Local 模式 Server + NetEndpoint::Local + ChunkLoader 滚动 + MeshJobQueue
+//! - 主循环按 AppState 分流：Lobby（仅 egui） / InGame（完整 server tick + 网格化 + 渲染）
 
 pub mod app;
 pub mod camera;
+pub mod chunk_loader;
 pub mod input;
 pub mod interp;
+pub mod mesh_jobs;
 pub mod physics;
 pub mod prediction;
 pub mod raycast;
@@ -23,29 +24,35 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use voxweb_core::{BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
+use voxweb_core::protocol::{ClientMessage, ServerMessage};
 use voxweb_render::Renderer;
-use voxweb_render::chunk_mesh;
 
-use crate::camera::Camera;
+use crate::app::{AppState, Game, GameSettings};
 use crate::input::InputState;
+use crate::ui::lobby::{LobbyAction, LobbyState, draw_lobby};
 
-/// Phase 1 运行时：把渲染、输入、相机、UI 拼起来。
-struct Runtime {
+/// 全局 App：跨 state 持有 renderer / egui / input；InGame 时持有 Game。
+struct App {
     canvas: HtmlCanvasElement,
     renderer: Renderer,
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
 
-    camera: Camera,
     input: Rc<RefCell<InputState>>,
 
-    /// 上一帧 performance.now()（毫秒），用于计算 dt
+    state: AppState,
+    lobby_state: LobbyState,
+    game: Option<Game>,
+
+    /// 上一帧 performance.now()（毫秒）
     last_time_ms: f64,
-    /// FPS 滑动平均（每秒重置）
+    /// FPS 滑动平均
     fps_frames: u32,
     fps_accum: f32,
     fps_display: f32,
+
+    /// 标志：下次 InGame 渲染前请求一次指针锁（点击 Lobby 按钮触发）
+    request_pointer_lock_next: bool,
 }
 
 #[wasm_bindgen(start)]
@@ -53,9 +60,8 @@ pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     tracing_wasm::set_as_global_default();
 
-    log::info!("VoxWeb 启动（Phase 1：渲染骨架）");
+    log::info!("VoxWeb 启动（Phase 2：体素单人）");
 
-    // ── 1. 拿 canvas ───────────────────────────
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("无 window"))?;
     let document = window
         .document()
@@ -67,12 +73,12 @@ pub async fn start() -> Result<(), JsValue> {
         .map_err(|_| JsValue::from_str("#game 不是 <canvas>"))?;
     sync_canvas_size(&canvas);
 
-    // ── 2. 渲染器（创建 wgpu device + Surface + OpaquePass）─
     let mut renderer = Renderer::new(&canvas)
         .await
         .map_err(|e| JsValue::from_str(&format!("Renderer init: {e}")))?;
+    let (cw, ch) = sync_canvas_size(&canvas);
+    renderer.resize(cw, ch);
 
-    // ── 3. egui 上下文 + egui-wgpu 渲染器（共享 device/format）─
     let egui_ctx = egui::Context::default();
     let egui_renderer = egui_wgpu::Renderer::new(
         &renderer.device,
@@ -80,34 +86,26 @@ pub async fn start() -> Result<(), JsValue> {
         egui_wgpu::RendererOptions::default(),
     );
 
-    // ── 4. 演示用 Chunk：16×16 的草地 + 上面摆几列彩色方块 ─
-    let demo_chunk = build_demo_chunk();
-    let mesh = chunk_mesh::generate_opaque_mesh(&demo_chunk);
-    log::info!("演示 chunk 顶点数: {}", mesh.vertex_count());
-    renderer.upload_chunk_mesh(voxweb_core::ChunkPos::new(0, 0), &mesh);
-
-    // ── 5. 相机 + 输入 ─
-    let camera = Camera::default();
     let input = Rc::new(RefCell::new(InputState::default()));
 
-    let runtime = Rc::new(RefCell::new(Runtime {
+    let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
         renderer,
         egui_ctx,
         egui_renderer,
-        camera,
         input: input.clone(),
+        state: AppState::Lobby,
+        lobby_state: LobbyState::default(),
+        game: None,
         last_time_ms: now_ms(),
         fps_frames: 0,
         fps_accum: 0.0,
         fps_display: 0.0,
+        request_pointer_lock_next: false,
     }));
 
-    // ── 6. 注册事件监听 ─
-    install_event_listeners(&canvas, &document, input.clone(), runtime.clone())?;
-
-    // ── 7. RAF 主循环 ─
-    spawn_raf_loop(runtime);
+    install_event_listeners(&canvas, &document, input.clone(), app.clone())?;
+    spawn_raf_loop(app);
 
     Ok(())
 }
@@ -116,12 +114,14 @@ pub async fn start() -> Result<(), JsValue> {
 // 主循环 & 事件
 // ============================================================
 
-fn spawn_raf_loop(runtime: Rc<RefCell<Runtime>>) {
+fn spawn_raf_loop(app: Rc<RefCell<App>>) {
+    // wasm RAF 闭包链需要这种嵌套类型来支持自我引用调度；type_complexity 抑制是惯用做法
+    #[allow(clippy::type_complexity)]
     let cell: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let cell_outer = cell.clone();
 
     *cell.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-        if let Err(e) = render_frame(&runtime) {
+        if let Err(e) = render_frame(&app) {
             log::warn!("帧渲染失败: {e:?}");
         }
         if let Some(c) = cell_outer.borrow().as_ref() {
@@ -144,20 +144,22 @@ fn install_event_listeners(
     canvas: &HtmlCanvasElement,
     document: &web_sys::Document,
     input: Rc<RefCell<InputState>>,
-    runtime: Rc<RefCell<Runtime>>,
+    app: Rc<RefCell<App>>,
 ) -> Result<(), JsValue> {
-    // —— 点击 canvas → 请求指针锁 ——
+    // —— 点击 canvas → 请求指针锁（仅在 InGame 时）——
     {
         let canvas_clone = canvas.clone();
+        let app_clone = app.clone();
         let on_click = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::MouseEvent| {
-            // request_pointer_lock 必须在用户手势中触发
-            canvas_clone.request_pointer_lock();
+            if app_clone.borrow().state == AppState::InGame {
+                canvas_clone.request_pointer_lock();
+            }
         });
         canvas.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;
         on_click.forget();
     }
 
-    // —— pointerlockchange → 同步 InputState.pointer_locked ——
+    // —— pointerlockchange ——
     {
         let input_clone = input.clone();
         let document_clone = document.clone();
@@ -179,11 +181,15 @@ fn install_event_listeners(
     // —— 键盘 ——
     {
         let input_clone = input.clone();
+        let app_clone = app.clone();
         let on_keydown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
+            // Lobby 时让 egui 接管文本输入（不消费 WASD）
+            if app_clone.borrow().state != AppState::InGame {
+                return;
+            }
             if let Some(key) = map_key(&e.code()) {
                 input_clone.borrow_mut().on_key_down(key);
             }
-            // 防止浏览器吞掉空格滚动等默认行为（指针锁住时）
             if input_clone.borrow().pointer_locked {
                 e.prevent_default();
             }
@@ -194,7 +200,11 @@ fn install_event_listeners(
     }
     {
         let input_clone = input.clone();
+        let app_clone = app.clone();
         let on_keyup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
+            if app_clone.borrow().state != AppState::InGame {
+                return;
+            }
             if let Some(key) = map_key(&e.code()) {
                 input_clone.borrow_mut().on_key_up(key);
             }
@@ -228,10 +238,6 @@ fn install_event_listeners(
         on_mousedown.forget();
     }
 
-    // —— ResizeObserver: canvas 尺寸变化 → 同步给 renderer ——
-    // 简化做法：每帧 render_frame 内自己检测尺寸，省一个 ResizeObserver 闭包链
-    let _ = runtime; // 主循环里 own runtime；此处不需要复制
-
     Ok(())
 }
 
@@ -253,165 +259,474 @@ fn map_key(code: &str) -> Option<winit::keyboard::KeyCode> {
 }
 
 // ============================================================
-// 单帧渲染
+// 帧分发
 // ============================================================
 
-fn render_frame(runtime: &Rc<RefCell<Runtime>>) -> Result<(), String> {
-    let mut rt = runtime.borrow_mut();
+fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
+    let _dt = update_clock(app);
 
-    // —— 1. dt + FPS ——
-    let now = now_ms();
-    let dt_ms = (now - rt.last_time_ms).max(0.0);
-    rt.last_time_ms = now;
-    let dt = (dt_ms / 1000.0) as f32;
-    rt.fps_frames += 1;
-    rt.fps_accum += dt;
-    if rt.fps_accum >= 0.5 {
-        rt.fps_display = rt.fps_frames as f32 / rt.fps_accum;
-        rt.fps_frames = 0;
-        rt.fps_accum = 0.0;
-    }
-
-    // —— 2. canvas 尺寸同步 ——
-    let (cw, ch) = sync_canvas_size(&rt.canvas);
-    rt.renderer.resize(cw, ch);
-    rt.camera.aspect = cw as f32 / ch.max(1) as f32;
-
-    // —— 3. 输入 → 相机 ——
-    {
-        let input_rc = rt.input.clone();
-        let mut input = input_rc.borrow_mut();
-        let camera = &mut rt.camera;
-        if input.pointer_locked && (input.mouse_dx != 0.0 || input.mouse_dy != 0.0) {
-            camera.apply_mouse(input.mouse_dx, input.mouse_dy, 0.0025);
-        }
-        camera.apply_fly_input(&input, /*speed=*/ 12.0, dt);
-        input.reset_delta();
-    }
-
-    // —— 4. egui 跑一遍 UI ——
-    let raw_input = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(cw as f32, ch as f32),
-        )),
-        ..Default::default()
+    // 同步 canvas 尺寸
+    let (cw, ch) = {
+        let app_borrow = app.borrow();
+        sync_canvas_size(&app_borrow.canvas)
     };
-    let pos = rt.camera.position;
-    let yaw_deg = rt.camera.yaw.to_degrees();
-    let pitch_deg = rt.camera.pitch.to_degrees();
-    let fps = rt.fps_display;
-    let pointer_locked = rt.input.borrow().pointer_locked;
-    let full_output = rt.egui_ctx.run_ui(raw_input, |ui| {
-        draw_hud(
-            ui,
-            fps,
-            (pos.x, pos.y, pos.z),
-            yaw_deg,
-            pitch_deg,
-            pointer_locked,
-        );
-    });
-    let pixels_per_point = full_output.pixels_per_point;
-    let paint_jobs = rt.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
-
-    // 上传 / 释放 egui 纹理（字形图集等）
     {
-        let device = rt.renderer.device.clone();
-        let queue = rt.renderer.queue.clone();
-        for (id, image_delta) in &full_output.textures_delta.set {
-            rt.egui_renderer
+        let mut a = app.borrow_mut();
+        a.renderer.resize(cw, ch);
+    }
+
+    // 按 state 分流
+    let state = app.borrow().state.clone();
+    match state {
+        AppState::InGame => render_game_frame(app, _dt, cw, ch),
+        // Loading / Lobby / 其它态：渲染大厅 UI（其它态待后续 Phase）
+        _ => render_lobby_frame(app, cw, ch),
+    }
+}
+
+fn update_clock(app: &Rc<RefCell<App>>) -> f32 {
+    let mut a = app.borrow_mut();
+    let now = now_ms();
+    let dt_ms = (now - a.last_time_ms).max(0.0);
+    a.last_time_ms = now;
+    let dt = (dt_ms / 1000.0) as f32;
+    a.fps_frames += 1;
+    a.fps_accum += dt;
+    if a.fps_accum >= 0.5 {
+        a.fps_display = a.fps_frames as f32 / a.fps_accum;
+        a.fps_frames = 0;
+        a.fps_accum = 0.0;
+    }
+    dt
+}
+
+// ============================================================
+// Lobby 帧
+// ============================================================
+
+fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 跑 egui Lobby UI ——
+    let (action, paint_jobs, pixels_per_point, textures_delta) = {
+        let mut a = app.borrow_mut();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cw as f32, ch as f32),
+            )),
+            ..Default::default()
+        };
+        let App {
+            ref egui_ctx,
+            ref mut lobby_state,
+            ..
+        } = *a;
+        let mut act: Option<LobbyAction> = None;
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            act = draw_lobby(ui.ctx(), lobby_state);
+        });
+        let ppp = full_output.pixels_per_point;
+        let jobs = egui_ctx.tessellate(full_output.shapes, ppp);
+        (act, jobs, ppp, full_output.textures_delta)
+    };
+
+    // —— 处理动作（开始游戏）——
+    if let Some(LobbyAction::StartSinglePlayer { seed }) = action {
+        start_single_player(app, seed);
+        // 进入 InGame 后下一帧才走 game 路径；本帧仍渲染 lobby（避免 game 未初始化的纹理上传）
+    }
+
+    // —— 上传 egui 纹理 + 渲染 ——
+    {
+        let mut a = app.borrow_mut();
+        let device = a.renderer.device.clone();
+        let queue = a.renderer.queue.clone();
+        for (id, image_delta) in &textures_delta.set {
+            a.egui_renderer
                 .update_texture(&device, &queue, *id, image_delta);
         }
-        for id in &full_output.textures_delta.free {
-            rt.egui_renderer.free_texture(id);
+        for id in &textures_delta.free {
+            a.egui_renderer.free_texture(id);
+        }
+
+        let Some(surface_texture) = a.renderer.acquire_frame() else {
+            return Ok(());
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("lobby_frame"),
+        });
+
+        // 清屏（暗蓝色背景）
+        {
+            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lobby_clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.07,
+                            b: 0.10,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [cw, ch],
+            pixels_per_point,
+        };
+        let extra_cmds = a.egui_renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lobby_egui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            a.egui_renderer
+                .render(&mut pass, &paint_jobs, &screen_descriptor);
+        }
+
+        queue.submit(
+            extra_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        surface_texture.present();
+    }
+    Ok(())
+}
+
+fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>) {
+    let seed = seed.unwrap_or_else(random_seed);
+    log::info!("启动单机游戏，seed = {seed}");
+
+    let settings = GameSettings::default();
+    let mut game = Game::new_local(seed, settings);
+
+    // 发 Hello，driver 下一帧消费
+    game.net.send_client_message(ClientMessage::Hello {
+        display_name: "Player".into(),
+        version: 1,
+    });
+
+    // 把 spawn 位置塞进相机（先看一眼地形）
+    game.camera.position = glam::Vec3::new(8.0, 100.0, 8.0);
+    game.camera.pitch = -0.4;
+
+    let mut a = app.borrow_mut();
+    a.game = Some(game);
+    a.state = AppState::InGame;
+    a.request_pointer_lock_next = true;
+}
+
+/// 用 getrandom 生成一个 u64 随机种子。失败时退化为 0。
+fn random_seed() -> u64 {
+    let mut buf = [0u8; 8];
+    let _ = getrandom::getrandom(&mut buf);
+    u64::from_le_bytes(buf)
+}
+
+// ============================================================
+// InGame 帧
+// ============================================================
+
+fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 1. drain Local 通道（Client→Server）→ Server::handle_message → 推回 Server→Client ——
+    {
+        let mut a = app.borrow_mut();
+        let Some(game) = a.game.as_mut() else {
+            return Ok(());
+        };
+        let mut pending = Vec::new();
+        while let Some(msg) = game.server_inbox.try_recv_client_message() {
+            pending.push(msg);
+        }
+        let entity_id = if game.entity_id == 0 {
+            1
+        } else {
+            game.entity_id
+        };
+        for msg in pending {
+            let replies = game.server.borrow_mut().handle_message(entity_id, msg);
+            for reply in replies {
+                game.server_inbox.send_server_message(reply);
+            }
         }
     }
 
-    // —— 5. 取得本帧 surface texture ——
-    let Some(surface_texture) = rt.renderer.acquire_frame() else {
-        return Ok(());
-    };
-    let view = surface_texture
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
-
-    // —— 6. 编码命令 ——
-    let device = rt.renderer.device.clone();
-    let queue = rt.renderer.queue.clone();
-
-    let screen_descriptor = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [cw, ch],
-        pixels_per_point,
-    };
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("frame"),
-    });
-
-    // 6a. 世界 Pass：清屏 + 深度 + 绘制方块
-    let view_proj = rt.camera.vp_matrix();
-    rt.renderer
-        .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
-
-    // 6b. egui Pass（叠在世界之上，不写深度）
-    let extra_cmds = rt.egui_renderer.update_buffers(
-        &device,
-        &queue,
-        &mut encoder,
-        &paint_jobs,
-        &screen_descriptor,
-    );
+    // —— 2. drain Server→Client → 应用 ——
     {
-        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("egui_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        let mut pass = pass.forget_lifetime();
-        rt.egui_renderer
-            .render(&mut pass, &paint_jobs, &screen_descriptor);
+        let mut a = app.borrow_mut();
+        let Some(game) = a.game.as_mut() else {
+            return Ok(());
+        };
+        while let Some(msg) = game.net.try_recv_server_message() {
+            apply_server_message(game, msg);
+        }
     }
 
-    queue.submit(
-        extra_cmds
-            .into_iter()
-            .chain(std::iter::once(encoder.finish())),
-    );
-    surface_texture.present();
+    // —— 3. 输入 → 相机 + 4. 逻辑帧 ——
+    let (camera_pos, view_proj, fps_display, mesh_budget) = {
+        let mut a = app.borrow_mut();
+        let fps_display = a.fps_display;
+        // 先克隆 input 的 Rc，再 mut-borrow game，避免对 `a` 的双重借用
+        let input_rc = a.input.clone();
+        let Some(game) = a.game.as_mut() else {
+            return Ok(());
+        };
+        game.camera.aspect = cw as f32 / ch.max(1) as f32;
+
+        let mut input = input_rc.borrow_mut();
+        if input.pointer_locked && (input.mouse_dx != 0.0 || input.mouse_dy != 0.0) {
+            game.camera.apply_mouse(
+                input.mouse_dx,
+                input.mouse_dy,
+                game.settings.mouse_sensitivity,
+            );
+        }
+        game.camera
+            .apply_fly_input(&input, game.settings.fly_speed, dt);
+        input.reset_delta();
+        drop(input);
+
+        game.frame_clock.accumulate(dt);
+        while game.frame_clock.consume_logic_step() {
+            game.server.borrow_mut().tick();
+        }
+
+        (
+            game.camera.position,
+            game.camera.vp_matrix(),
+            fps_display,
+            game.settings.mesh_budget_ms,
+        )
+    };
+
+    // —— 5. ChunkLoader 滚动 ——
+    {
+        let mut a = app.borrow_mut();
+        let App {
+            ref mut renderer,
+            ref mut game,
+            ..
+        } = *a;
+        let Some(game) = game.as_mut() else {
+            return Ok(());
+        };
+        let mut server_mut = game.server.borrow_mut();
+        game.chunk_loader
+            .update(camera_pos, &mut server_mut, &mut game.mesh_jobs, renderer);
+    }
+
+    // —— 6. mesh_jobs run_until_budget ——
+    {
+        let mut a = app.borrow_mut();
+        let App {
+            ref mut renderer,
+            ref mut game,
+            ..
+        } = *a;
+        let Some(game) = game.as_mut() else {
+            return Ok(());
+        };
+        let server_borrow = game.server.borrow();
+        game.mesh_jobs
+            .run_until_budget(mesh_budget, &server_borrow, renderer, &now_ms);
+    }
+
+    // —— 7. egui HUD ——
+    let pointer_locked = app.borrow().input.borrow().pointer_locked;
+    let (paint_jobs, pixels_per_point, textures_delta) = {
+        let a = app.borrow();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cw as f32, ch as f32),
+            )),
+            ..Default::default()
+        };
+        let yaw_deg = a
+            .game
+            .as_ref()
+            .map(|g| g.camera.yaw.to_degrees())
+            .unwrap_or(0.0);
+        let pitch_deg = a
+            .game
+            .as_ref()
+            .map(|g| g.camera.pitch.to_degrees())
+            .unwrap_or(0.0);
+        let pos = a
+            .game
+            .as_ref()
+            .map(|g| g.camera.position)
+            .unwrap_or_default();
+        let loaded_chunks = a
+            .game
+            .as_ref()
+            .map(|g| g.chunk_loader.loaded.len())
+            .unwrap_or(0);
+        let mesh_pending = a.game.as_ref().map(|g| g.mesh_jobs.len()).unwrap_or(0);
+        let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
+            draw_hud(
+                ui.ctx(),
+                fps_display,
+                (pos.x, pos.y, pos.z),
+                yaw_deg,
+                pitch_deg,
+                pointer_locked,
+                loaded_chunks,
+                mesh_pending,
+            );
+        });
+        let ppp = full_output.pixels_per_point;
+        let jobs = a.egui_ctx.tessellate(full_output.shapes, ppp);
+        (jobs, ppp, full_output.textures_delta)
+    };
+
+    // —— 8. 渲染 + present ——
+    {
+        let mut a = app.borrow_mut();
+        let device = a.renderer.device.clone();
+        let queue = a.renderer.queue.clone();
+        for (id, image_delta) in &textures_delta.set {
+            a.egui_renderer
+                .update_texture(&device, &queue, *id, image_delta);
+        }
+        for id in &textures_delta.free {
+            a.egui_renderer.free_texture(id);
+        }
+
+        let Some(surface_texture) = a.renderer.acquire_frame() else {
+            return Ok(());
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("game_frame"),
+        });
+
+        // 世界 Pass
+        a.renderer
+            .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+
+        // egui Pass
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [cw, ch],
+            pixels_per_point,
+        };
+        let extra_cmds = a.egui_renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("game_egui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut pass = pass.forget_lifetime();
+            a.egui_renderer
+                .render(&mut pass, &paint_jobs, &screen_descriptor);
+        }
+
+        queue.submit(
+            extra_cmds
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        surface_texture.present();
+
+        // 进入 InGame 后请求指针锁（必须在用户手势后；首次的"开始游戏"按钮点击算手势）
+        if a.request_pointer_lock_next {
+            a.canvas.request_pointer_lock();
+            a.request_pointer_lock_next = false;
+        }
+    }
 
     Ok(())
+}
+
+fn apply_server_message(game: &mut Game, msg: ServerMessage) {
+    match msg {
+        ServerMessage::Welcome {
+            entity_id,
+            world_seed,
+            ..
+        } => {
+            game.entity_id = entity_id;
+            log::info!("Welcome: entity_id={entity_id}, seed={world_seed}");
+        }
+        _ => {
+            // Phase 3+ 才处理 BlockUpdate / PlayerTick 等
+        }
+    }
 }
 
 // ============================================================
 // HUD（egui）
 // ============================================================
 
+#[allow(clippy::too_many_arguments)]
 fn draw_hud(
-    ui: &mut egui::Ui,
+    ctx: &egui::Context,
     fps: f32,
     pos: (f32, f32, f32),
     yaw_deg: f32,
     pitch_deg: f32,
     pointer_locked: bool,
+    loaded_chunks: usize,
+    mesh_pending: usize,
 ) {
-    let ctx = ui.ctx().clone();
-
-    // 左上：性能 + 坐标
     egui::Area::new(egui::Id::new("hud_topleft"))
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .show(&ctx, |ui| {
+        .show(ctx, |ui| {
             egui::Frame::default()
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
                 .inner_margin(egui::Margin::symmetric(10, 8))
@@ -428,13 +743,16 @@ fn draw_hud(
                         egui::Color32::from_rgb(180, 190, 200),
                         format!("YAW {:+6.1}°  PITCH {:+5.1}°", yaw_deg, pitch_deg),
                     );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(160, 175, 190),
+                        format!("CHUNKS {loaded_chunks}  MESH_Q {mesh_pending}"),
+                    );
                 });
         });
 
-    // 中心准星：用 Area + Label("+") 简单实现
     egui::Area::new(egui::Id::new("hud_crosshair"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(&ctx, |ui| {
+        .show(ctx, |ui| {
             ui.label(
                 egui::RichText::new("+")
                     .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
@@ -443,10 +761,9 @@ fn draw_hud(
             );
         });
 
-    // 底部：操作提示（egui 默认字体不含 CJK，Phase 1 用 ASCII；Phase 6 接入字体后切回中文）
     egui::Area::new(egui::Id::new("hud_bottom"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
-        .show(&ctx, |ui| {
+        .show(ctx, |ui| {
             let msg = if pointer_locked {
                 "WASD move | Space up | Shift down | Mouse look | ESC release"
             } else {
@@ -459,57 +776,6 @@ fn draw_hud(
                     ui.colored_label(egui::Color32::from_rgb(230, 235, 240), msg);
                 });
         });
-}
-
-// ============================================================
-// 演示 Chunk 构造
-// ============================================================
-
-/// 构造一个 16×16 的演示 chunk：
-/// - y=0..2 全 STONE（基岩层）
-/// - y=2..4 全 DIRT
-/// - y=4 全 GRASS（草坪）
-/// - 在草坪上零星摆几列彩色方块（每种 BlockID 一个柱子，演示颜色）
-fn build_demo_chunk() -> Chunk {
-    let mut chunk = Chunk::empty();
-    // 地基
-    for ly in 0..2 {
-        for lz in 0..CHUNK_X {
-            for lx in 0..CHUNK_Z {
-                chunk.set(lx, ly, lz, BlockID::STONE);
-            }
-        }
-    }
-    for ly in 2..4 {
-        for lz in 0..CHUNK_X {
-            for lx in 0..CHUNK_Z {
-                chunk.set(lx, ly, lz, BlockID::DIRT);
-            }
-        }
-    }
-    for lz in 0..CHUNK_X {
-        for lx in 0..CHUNK_Z {
-            chunk.set(lx, 4, lz, BlockID::GRASS);
-        }
-    }
-
-    // 草坪上摆 6 个柱子，每个 3 高，颜色不同
-    let columns = [
-        (2, 2, BlockID::SAND),
-        (5, 2, BlockID::WOOD),
-        (8, 2, BlockID::LEAVES),
-        (11, 2, BlockID::GLASS),
-        (2, 8, BlockID::WATER),
-        (8, 8, BlockID::STONE),
-    ];
-    for (lx, lz, block) in columns {
-        for dy in 0..3 {
-            chunk.set(lx, 5 + dy, lz, block);
-        }
-    }
-
-    debug_assert!(CHUNK_Y >= 8);
-    chunk
 }
 
 // ============================================================
