@@ -39,6 +39,9 @@ struct App {
     egui_renderer: egui_wgpu::Renderer,
 
     input: Rc<RefCell<InputState>>,
+    /// egui 鼠标事件累加器：浏览器 mousemove/down/up 转 egui::Event 推这里，
+    /// render_*_frame 每帧 drain 入 RawInput.events，让按钮收得到点击。
+    egui_events: Rc<RefCell<Vec<egui::Event>>>,
 
     state: AppState,
     lobby_state: LobbyState,
@@ -87,6 +90,7 @@ pub async fn start() -> Result<(), JsValue> {
     );
 
     let input = Rc::new(RefCell::new(InputState::default()));
+    let egui_events: Rc<RefCell<Vec<egui::Event>>> = Rc::new(RefCell::new(Vec::new()));
 
     let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
@@ -94,6 +98,7 @@ pub async fn start() -> Result<(), JsValue> {
         egui_ctx,
         egui_renderer,
         input: input.clone(),
+        egui_events: egui_events.clone(),
         state: AppState::Lobby,
         lobby_state: LobbyState::default(),
         game: None,
@@ -104,7 +109,7 @@ pub async fn start() -> Result<(), JsValue> {
         request_pointer_lock_next: false,
     }));
 
-    install_event_listeners(&canvas, &document, input.clone(), app.clone())?;
+    install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
     spawn_raf_loop(app);
 
     Ok(())
@@ -144,6 +149,7 @@ fn install_event_listeners(
     canvas: &HtmlCanvasElement,
     document: &web_sys::Document,
     input: Rc<RefCell<InputState>>,
+    egui_events: Rc<RefCell<Vec<egui::Event>>>,
     app: Rc<RefCell<App>>,
 ) -> Result<(), JsValue> {
     // —— 点击 canvas → 请求指针锁（仅在 InGame 时）——
@@ -213,13 +219,22 @@ fn install_event_listeners(
         on_keyup.forget();
     }
 
-    // —— 鼠标移动（仅在指针锁定时累积）——
+    // —— 鼠标移动 ——
+    // 指针锁时累积 dx/dy 给相机；否则上报位置给 egui（UI 命中测试）。
     {
         let input_clone = input.clone();
+        let egui_events_clone = egui_events.clone();
         let on_mousemove = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             let mut s = input_clone.borrow_mut();
             if s.pointer_locked {
                 s.on_mouse_move(e.movement_x() as f32, e.movement_y() as f32);
+            } else {
+                egui_events_clone
+                    .borrow_mut()
+                    .push(egui::Event::PointerMoved(egui::pos2(
+                        e.client_x() as f32,
+                        e.client_y() as f32,
+                    )));
             }
         });
         document
@@ -227,18 +242,66 @@ fn install_event_listeners(
         on_mousemove.forget();
     }
 
-    // —— 鼠标按下（Phase 3 才接 Break/Place，这里仅占位）——
+    // —— 鼠标按下 ——
+    // InGame：转给 InputState（Phase 3 才用）；Lobby：转 egui PointerButton 事件。
     {
         let input_clone = input.clone();
+        let egui_events_clone = egui_events.clone();
+        let app_clone = app.clone();
         let on_mousedown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             input_clone.borrow_mut().on_mouse_down(e.button() as u16);
+            if app_clone.borrow().state != AppState::InGame
+                && let Some(button) = map_pointer_button(e.button())
+            {
+                egui_events_clone
+                    .borrow_mut()
+                    .push(egui::Event::PointerButton {
+                        pos: egui::pos2(e.client_x() as f32, e.client_y() as f32),
+                        button,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    });
+            }
         });
         canvas
             .add_event_listener_with_callback("mousedown", on_mousedown.as_ref().unchecked_ref())?;
         on_mousedown.forget();
     }
 
+    // —— 鼠标松开（只为 egui 服务；InGame 端目前不区分 down/up）——
+    {
+        let egui_events_clone = egui_events.clone();
+        let app_clone = app.clone();
+        let on_mouseup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            if app_clone.borrow().state != AppState::InGame
+                && let Some(button) = map_pointer_button(e.button())
+            {
+                egui_events_clone
+                    .borrow_mut()
+                    .push(egui::Event::PointerButton {
+                        pos: egui::pos2(e.client_x() as f32, e.client_y() as f32),
+                        button,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+            }
+        });
+        document
+            .add_event_listener_with_callback("mouseup", on_mouseup.as_ref().unchecked_ref())?;
+        on_mouseup.forget();
+    }
+
     Ok(())
+}
+
+/// 浏览器 MouseEvent.button() 数值 → egui PointerButton。
+fn map_pointer_button(button: i16) -> Option<egui::PointerButton> {
+    match button {
+        0 => Some(egui::PointerButton::Primary),
+        1 => Some(egui::PointerButton::Middle),
+        2 => Some(egui::PointerButton::Secondary),
+        _ => None,
+    }
 }
 
 /// 把 web_sys::KeyboardEvent.code() 映射到 winit::KeyCode（输入层使用统一枚举）。
@@ -308,11 +371,14 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     // —— 跑 egui Lobby UI ——
     let (action, paint_jobs, pixels_per_point, textures_delta) = {
         let mut a = app.borrow_mut();
+        // 收集本帧累积的鼠标事件（mousemove / mousedown / mouseup）。
+        let events: Vec<egui::Event> = std::mem::take(&mut *a.egui_events.borrow_mut());
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
                 egui::vec2(cw as f32, ch as f32),
             )),
+            events,
             ..Default::default()
         };
         let App {
