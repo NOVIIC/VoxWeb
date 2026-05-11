@@ -7,9 +7,11 @@ use glam::Vec3;
 
 /// 未确认的输入历史（用于协调）。
 pub struct InputHistory {
+    #[allow(dead_code)] // Phase 5 才填充
     entries: Vec<InputEntry>,
 }
 
+#[allow(dead_code)] // Phase 5 才填充
 struct InputEntry {
     tick: u32,
     position: Vec3,
