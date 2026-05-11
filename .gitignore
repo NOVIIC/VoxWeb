@@ -1,4 +1,4 @@
 /target
 /dist
 *local*
-/.claude/
+/.claude/worktrees
