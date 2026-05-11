@@ -13,6 +13,12 @@ impl TransparentPass {
     }
 }
 
+impl Default for TransparentPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderPass for TransparentPass {
     fn name(&self) -> &'static str {
         "transparent"

@@ -115,6 +115,12 @@ impl Renderer {
         self.chunk_meshes.remove(&pos);
     }
 
+    /// 查询某个 chunk 是否已有 GPU mesh。
+    /// Phase 2 ChunkLoader 用其决定邻居是否需重网格化（跨区块剔除生效条件）。
+    pub fn has_chunk_mesh(&self, pos: ChunkPos) -> bool {
+        self.chunk_meshes.contains_key(&pos)
+    }
+
     /// 已上传的 chunk 数量。
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunk_meshes.len()

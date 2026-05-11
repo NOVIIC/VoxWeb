@@ -3,7 +3,9 @@
 //! Phase 1：朴素逐面网格化 —— 遍历每个方块，对每个暴露的面（邻居为空气）
 //! 生成 2 个三角形（6 个顶点）。区块边界外暂时一律视作"空气"。
 //!
-//! Phase 2 会引入"邻居 chunk 引用"做跨区块面剔除，
+//! Phase 2：`generate_with_neighbors` 通过回调查询世界坐标方块，
+//! 实现跨区块面剔除（避免边界处误绘制邻居 chunk 的"墙皮"）。
+//!
 //! Phase 7 会替换为贪婪算法。
 
 use voxweb_core::{BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, properties};
@@ -116,6 +118,54 @@ fn face_is_visible(chunk: &Chunk, lx: i32, ly: i32, lz: i32, face_idx: usize) ->
     properties(neighbor).transparent
 }
 
+/// 跨区块面剔除版网格化。
+///
+/// 与 `generate_opaque_mesh` 行为相同，但所有面可见性查询通过 `get_block_world`
+/// 回调进行。同 chunk 内的查询也走回调（统一接口）；区块外由调用方决定（一般返回邻居
+/// chunk 已加载的真实方块，或 AIR）。
+///
+/// 这是 Phase 2 视觉正确性的核心：避免 chunk 边界处误把邻居 chunk 的实心方块视为空气
+/// 而多绘制一层"墙皮"。
+pub fn generate_with_neighbors(
+    chunk: &Chunk,
+    chunk_pos: voxweb_core::ChunkPos,
+    get_block_world: &dyn Fn(i32, i32, i32) -> BlockID,
+) -> ChunkMeshCpu {
+    let mut vertices: Vec<PackedVertex> = Vec::with_capacity(4096);
+
+    let origin_x = chunk_pos.x * CHUNK_X as i32;
+    let origin_z = chunk_pos.z * CHUNK_Z as i32;
+
+    for ly in 0..CHUNK_Y {
+        for lz in 0..CHUNK_Z {
+            for lx in 0..CHUNK_X {
+                let block = chunk.get(lx, ly, lz);
+                if block == BlockID::AIR {
+                    continue;
+                }
+                let props = properties(block);
+                if props.transparent {
+                    continue;
+                }
+                let tex = props.texture_index;
+
+                for (fi, &(dx, dy, dz)) in FACE_NEIGHBORS.iter().enumerate() {
+                    let wx = origin_x + lx as i32 + dx;
+                    let wy = ly as i32 + dy;
+                    let wz = origin_z + lz as i32 + dz;
+                    let neighbor = get_block_world(wx, wy, wz);
+                    let visible = neighbor == BlockID::AIR || properties(neighbor).transparent;
+                    if visible {
+                        emit_face(&mut vertices, lx as u8, ly as u16, lz as u8, fi, tex);
+                    }
+                }
+            }
+        }
+    }
+
+    ChunkMeshCpu { vertices }
+}
+
 /// 把一个面（2 三角形 = 6 顶点）追加到顶点缓冲。
 fn emit_face(out: &mut Vec<PackedVertex>, lx: u8, ly: u16, lz: u8, face_idx: usize, tex: u8) {
     let face = FACES[face_idx];
@@ -163,5 +213,58 @@ mod tests {
         chunk.set(6, 64, 5, BlockID::STONE);
         let mesh = generate_opaque_mesh(&chunk);
         assert_eq!(mesh.vertex_count(), 60);
+    }
+
+    #[test]
+    fn neighbor_callback_skips_face_when_neighbor_is_solid() {
+        // 单方块在 lx=15, ly=64, lz=5；邻居 chunk (1,0) 的 lx=0, ly=64, lz=5 是 STONE
+        // → PosX 面应被跨区块剔除（与朴素版相比顶点 -6）
+        let mut chunk = Chunk::empty();
+        chunk.set(15, 64, 5, BlockID::STONE);
+
+        // 朴素版（区块外视空气）：6 面 × 6 顶点 = 36
+        let naive = generate_opaque_mesh(&chunk);
+        assert_eq!(naive.vertex_count(), 36);
+
+        // with_neighbors：邻居在 (16, 64, 5) 是 STONE
+        let neighbor_x = 16;
+        let with_n =
+            generate_with_neighbors(&chunk, voxweb_core::ChunkPos::new(0, 0), &|wx, _wy, _wz| {
+                if wx == neighbor_x {
+                    BlockID::STONE
+                } else {
+                    BlockID::AIR
+                }
+            });
+        // 5 面（PosX 被剔除）× 6 顶点 = 30
+        assert_eq!(with_n.vertex_count(), 30);
+    }
+
+    #[test]
+    fn neighbor_callback_air_equivalent_to_naive() {
+        // 全 AIR 回调（区块外一律空气）应等同于 generate_opaque_mesh
+        let mut chunk = Chunk::empty();
+        chunk.set(0, 64, 0, BlockID::STONE);
+        chunk.set(15, 64, 15, BlockID::DIRT);
+
+        let naive = generate_opaque_mesh(&chunk);
+        let with_n =
+            generate_with_neighbors(&chunk, voxweb_core::ChunkPos::new(0, 0), &|_, _, _| {
+                BlockID::AIR
+            });
+        assert_eq!(naive.vertex_count(), with_n.vertex_count());
+    }
+
+    #[test]
+    fn neighbor_callback_handles_y_boundary() {
+        // 顶层方块（ly=255），不存在更高层；回调对 y=256 返回 AIR → PosY 面应发射
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 255, 5, BlockID::STONE);
+        let with_n =
+            generate_with_neighbors(&chunk, voxweb_core::ChunkPos::new(0, 0), &|_, _, _| {
+                BlockID::AIR
+            });
+        // 单方块 6 面（无邻居遮挡）
+        assert_eq!(with_n.vertex_count(), 36);
     }
 }

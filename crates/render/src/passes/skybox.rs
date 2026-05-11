@@ -13,6 +13,12 @@ impl SkyboxPass {
     }
 }
 
+impl Default for SkyboxPass {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderPass for SkyboxPass {
     fn name(&self) -> &'static str {
         "skybox"
