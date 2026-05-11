@@ -19,18 +19,21 @@ pub struct GlobalsUniform {
     pub chunk_origin: [f32; 4],
 }
 
-/// 一个 Chunk 的 GPU 网格资源：顶点缓冲 + 顶点计数。
+/// 一个 Chunk 的 GPU 网格资源：顶点缓冲 + 顶点计数 + 该 chunk 专属的 globals uniform。
+///
+/// 关键：globals buffer 必须**按 chunk 分别持有**，否则在单次 submit 中多次 `queue.write_buffer`
+/// 同一 buffer 会被合并到最后一次写入，导致所有 chunk 用同一个 chunk_origin 渲染（视觉上"全叠在一起"）。
 pub struct ChunkMeshGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub vertex_count: u32,
+    pub globals_buffer: wgpu::Buffer,
+    pub globals_bind_group: wgpu::BindGroup,
 }
 
-/// 不透明方块渲染 Pass（Pipeline + uniform 资源）。
+/// 不透明方块渲染 Pass（Pipeline + bind group layout）。
 pub struct OpaquePass {
     pub pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
-    pub globals_buffer: wgpu::Buffer,
-    pub globals_bind_group: wgpu::BindGroup,
 }
 
 impl OpaquePass {
@@ -39,14 +42,7 @@ impl OpaquePass {
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        // —— uniform buffer + bind group ——
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("opaque.globals"),
-            size: std::mem::size_of::<GlobalsUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        // —— bind group layout（pipeline 创建需要，但 globals buffer 由每个 ChunkMeshGpu 自带）——
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("opaque.globals_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -58,15 +54,6 @@ impl OpaquePass {
                     min_binding_size: NonZeroU64::new(std::mem::size_of::<GlobalsUniform>() as u64),
                 },
                 count: None,
-            }],
-        });
-
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("opaque.globals_bg"),
-            layout: &globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
             }],
         });
 
@@ -128,17 +115,10 @@ impl OpaquePass {
         Self {
             pipeline,
             globals_layout,
-            globals_buffer,
-            globals_bind_group,
         }
     }
 
-    /// 把当前帧的全局 uniform 写到 GPU。
-    pub fn upload_globals(&self, queue: &wgpu::Queue, globals: &GlobalsUniform) {
-        queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(globals));
-    }
-
-    /// 把 CPU 顶点列表打包成 GPU 资源。
+    /// 把 CPU 顶点列表打包成 GPU 资源（含该 chunk 专属的 globals buffer + bind group）。
     pub fn upload_chunk_mesh(
         &self,
         device: &wgpu::Device,
@@ -152,9 +132,25 @@ impl OpaquePass {
             contents: bytemuck::cast_slice(vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
+        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk.globals"),
+            size: std::mem::size_of::<GlobalsUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chunk.globals_bg"),
+            layout: &self.globals_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals_buffer.as_entire_binding(),
+            }],
+        });
         Some(ChunkMeshGpu {
             vertex_buffer,
             vertex_count: vertices.len() as u32,
+            globals_buffer,
+            globals_bind_group,
         })
     }
 }

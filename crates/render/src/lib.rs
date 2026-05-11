@@ -204,11 +204,9 @@ impl Renderer {
         let entries: Vec<(ChunkPos, &ChunkMeshGpu)> =
             self.chunk_meshes.iter().map(|(p, m)| (*p, m)).collect();
 
-        // 多 chunk 情况下 globals.chunk_origin 每次 draw 不一样，需要重写 uniform。
-        // Phase 1 简化：当前帧逐个 chunk 绘制时，每次 write_buffer 一次 globals 再 draw。
-        // 注意：write_buffer 在 same encoder/queue 内是顺序保证的，所以多次写不会冲突。
-        // 但 wgpu 不允许在 RenderPass 进行中写 buffer → 我们必须**每个 chunk 一个独立 RenderPass**，
-        // 第一个清屏，后续 Load。Phase 1 演示通常只有 1 个 chunk，开销可接受。
+        // 每个 chunk 自带一个 globals uniform buffer，避免 queue.write_buffer 在 submit 前
+        // 被合并到最后一次写入（那会让所有 chunk 用同一个 chunk_origin → 视觉上"全叠在一起"）。
+        // 仍然每个 chunk 一个独立 RenderPass：第一个清屏，后续 Load。
 
         for (i, (pos, mesh)) in entries.iter().enumerate() {
             let chunk_origin_world = Vec3::new(
@@ -225,7 +223,9 @@ impl Renderer {
                     0.0,
                 ],
             };
-            self.opaque_pass.upload_globals(&self.queue, &globals);
+            // 写到该 chunk 自己的 uniform buffer
+            self.queue
+                .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
             let load_op = if i == 0 {
                 wgpu::LoadOp::Clear(wgpu::Color {
@@ -267,7 +267,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.opaque_pass.pipeline);
-            pass.set_bind_group(0, &self.opaque_pass.globals_bind_group, &[]);
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.draw(0..mesh.vertex_count, 0..1);
         }
