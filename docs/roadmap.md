@@ -73,10 +73,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 2 · 体素单人
+## Phase 2 · 体素单人 ✅
 
-> **设计已批准**（2026-05-11）：见 [`superpowers/specs/2026-05-11-phase2-design.md`](superpowers/specs/2026-05-11-phase2-design.md)
-> 待实施完成后本标题加 ✅。
+> 完成日期：2026-05-12 · 详见 [`../PHASE_2_DONE.md`](../PHASE_2_DONE.md)
 
 ### 目标
 单机模式可玩：地形生成、动态加载、跨区块剔除。
@@ -88,15 +87,15 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`modules/net.md`](modules/net.md)（NetEndpoint::Local mpsc）
 
 ### 任务清单
-- [ ] `server::terrain` Perlin 高度图地形生成
-- [ ] `server::world` Chunk 表 + tick
-- [ ] `server::Server::handle_client_message` 基础 dispatch（无网络，仅本地 enum 转换）
-- [ ] `client::NetEndpoint::Local` 实现内存通道
-- [ ] `render::chunk_mesh` 朴素逐面网格化（先不上贪婪算法）
-- [ ] 跨区块面剔除（`generate_with_neighbors` + 世界坐标回调）
-- [ ] `client::mesh_jobs` 优先级队列 + 分帧 budget
-- [ ] 渲染距离动态加载/卸载（玩家走远了 chunk 释放）
-- [ ] 大厅 UI：单机模式按钮 → 进入游戏
+- [x] `server::terrain` Perlin 高度图地形生成
+- [x] `server::world` Chunk 表 + tick
+- [x] `server::Server::handle_client_message` 基础 dispatch（无网络，仅本地 enum 转换）
+- [x] `client::NetEndpoint::Local` 实现内存通道
+- [x] `render::chunk_mesh` 朴素逐面网格化（先不上贪婪算法）
+- [x] 跨区块面剔除（`generate_with_neighbors` + 世界坐标回调）
+- [x] `client::mesh_jobs` 优先级队列 + 分帧 budget
+- [x] 渲染距离动态加载/卸载（玩家走远了 chunk 释放）
+- [x] 大厅 UI：单机模式按钮 → 进入游戏
 
 ### 验证
 - 大厅点"单机模式"→ 进入游戏 → 看到连绵地形（草/泥/石分层）

@@ -22,7 +22,7 @@
 | 阶段 | 包含 |
 |---|---|
 | **Phase 1 ✅** | u32 顶点压缩格式（§2）；朴素逐面（`generate_opaque_mesh`） |
-| **Phase 2 ✅**（设计已批准） | `generate_with_neighbors`（§4 跨区块面剔除）；`MeshJobQueue` + `MeshPriority` 4 档枚举（§6） |
+| **Phase 2 ✅** | `generate_with_neighbors`（§4 跨区块面剔除）；`MeshJobQueue` + `MeshPriority` 4 档枚举（§6） |
 | Phase 7 | 贪婪网格化（§3 替换朴素逐面）；AO（§5）；视锥剔除（§9） |
 
 下面 §3 贪婪算法、§5 AO、§9 视锥剔除均为 **Phase 7 设计**；Phase 2 实装使用朴素逐面 + 跨区块剔除。
@@ -291,25 +291,31 @@ pub enum MeshPriority {
 
 ### 分帧预算
 
-每渲染帧最多花 `MESH_BUDGET_MS = 4ms` 跑网格化。超过预算时停下，剩余下一帧继续。
+每渲染帧最多花 `mesh_budget_ms`（默认 4ms，由 `GameSettings` 控制）跑网格化。超过预算时停下，剩余下一帧继续。
 
 ```rust
-pub fn run_until_budget(&mut self, budget_ms: f32, server: &Server, renderer: &mut Renderer) {
-    let start = performance_now();
-    while performance_now() - start < budget_ms as f64 {
-        let Some(pos) = self.pop_highest_priority() else { break; };
-        let Some(chunk) = server.world.chunks.get(&pos) else { continue; };
+pub fn run_until_budget(
+    &mut self,
+    budget_ms: f32,
+    server: &Server,
+    renderer: &mut Renderer,
+    now_ms: &dyn Fn() -> f64,        // 注入 performance.now() 便于测试
+) {
+    let start = now_ms();
+    loop {
+        if (now_ms() - start) as f32 >= budget_ms { break; }
+        let Some(pos) = self.pop_highest() else { break; };
+        let Some(chunk) = server.world.chunks.get(&pos) else { continue; };  // 已被卸载
         let mesh = chunk_mesh::generate_with_neighbors(
             chunk, pos,
             &|wx, wy, wz| server.world.get_block_world(wx, wy, wz),
         );
         renderer.upload_chunk_mesh(pos, &mesh);
-        self.pending.remove(&pos);
     }
 }
 ```
 
-`performance_now()` 通过 `web_sys::Performance::now()` 获取毫秒级时间戳。
+`now_ms` 在运行期是 `web_sys::Performance::now()` 的薄包装；单元测试可注入受控时钟。
 
 ### 触发条件
 
@@ -353,10 +359,26 @@ fn enqueue_with_neighbors(&mut self, pos: Position, priority: Priority) {
 
 ## 八、CPU 数据结构
 
+### Phase 2 实装（朴素逐面 + 跨区块剔除）
+
+```rust
+pub struct ChunkMeshCpu {
+    pub vertices: Vec<PackedVertex>,   // PackedVertex 等价 u32
+}
+
+impl ChunkMeshCpu {
+    pub fn vertex_count(&self) -> u32 { self.vertices.len() as u32 }
+}
+```
+
+每个面发射 6 个顶点（2 个三角形，索引顺序 (0,1,2)+(0,2,3)）。Phase 2 不使用 index buffer：暴露率约 10-30% 下顶点量可控，省一次 buffer 上传更划算。
+
+### Phase 7+ 目标形态
+
 ```rust
 pub struct ChunkMeshCpu {
     pub vertices: Vec<u32>,        // packed
-    pub indices: Vec<u32>,         // 每 quad 6 个索引
+    pub indices: Vec<u32>,         // 贪婪合并后每 quad 6 个索引
     pub bounds: Aabb,              // 视锥剔除用
 }
 
@@ -368,7 +390,7 @@ pub struct ChunkMeshGpu {
 }
 ```
 
-`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 buffers + 写数据）。
+`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 buffers + 写数据）。Phase 2 的 `ChunkMeshGpu` 已经为每个 chunk 持有独立 `globals_buffer + bind_group`，以规避 `queue.write_buffer` 合并写入问题（详见 [`docs/reference.md` §3.1](../reference.md#31-webgpu)）。
 
 ---
 

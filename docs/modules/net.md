@@ -20,7 +20,7 @@
 
 | 阶段 | 包含 |
 |---|---|
-| **Phase 2 ✅**（设计已批准） | `NetEndpoint::Local` 走 `futures::channel::mpsc` 双向通道；`new_local_pair` + `send_client_message` + `try_recv_server_message` + `ServerInbox` |
+| **Phase 2 ✅** | `NetEndpoint::Local` 走 `futures::channel::mpsc` 双向通道；`new_local_pair` + `send_client_message` + `try_recv_server_message` + `ServerInbox` |
 | Phase 4 | `signaling.rs` / `peer.rs` / `room.rs` / `transport.rs` 完整实装；`NetEndpoint::Host / Remote` |
 
 下面 §3 起 `Host / Remote` 部分为 **Phase 4 前瞻设计**；Phase 2 仅实装 `Local` 分支。

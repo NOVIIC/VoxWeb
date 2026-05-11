@@ -27,7 +27,7 @@
 
 | 阶段 | 包含 |
 |---|---|
-| **Phase 2 ✅**（设计已批准） | `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk`；`TerrainGenerator`（已在 Phase 1 stub）；`Server::handle_message` 仅 `Hello → Welcome` 占位 + `Break/Place` 无校验直改 |
+| **Phase 2 ✅** | `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk`；`TerrainGenerator`（已在 Phase 1 stub）；`Server::handle_message` 仅 `Hello → Welcome` 占位 + `Break/Place` 无校验直改 |
 | Phase 3 | `physics::validate_break/place` 仲裁；`World::dirty_chunks` 字段；Break/Place 完整闭环 |
 | Phase 5 | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`take_dirty_chunks` / `ChunkStorage` trait |
 
@@ -57,10 +57,9 @@ pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
     pub terrain: TerrainGenerator,           // [Phase 2] Perlin 高度图
+    pub tick_count: u64,                     // [Phase 2] tick 累加器；Phase 5 起驱动玩家广播
     pub dirty_chunks: HashSet<ChunkPos>,     // [Phase 3] 需要持久化的 chunk
     pub players: HashMap<EntityId, PlayerEntity>,  // [Phase 5]
-    pub current_tick: u32,
-    pub tick_dt: f32,                        // 1/60
 }
 
 impl World {
@@ -75,8 +74,13 @@ impl World {
     pub fn unload_chunk(&mut self, pos: ChunkPos);
 
     /// [Phase 1/2] 直接读写方块（Phase 3 起会触发 dirty）。
+    /// Phase 2：`get_block` 等价于 `get_block_world(pos.x, pos.y, pos.z)`；
+    /// `set_block` 在 chunk 未加载或 local_index 越界时静默忽略。
     pub fn get_block(&self, pos: Position) -> BlockID;
     pub fn set_block(&mut self, pos: Position, block: BlockID);
+
+    /// [Phase 1/2] 推进 tick 计数（Phase 5 起会驱动玩家广播）。
+    pub fn tick(&mut self);
 }
 
 pub type EntityId = u32;     // [Phase 5]
@@ -228,38 +232,25 @@ fn broadcast_tick(&mut self) {
 
 ## 五、`terrain.rs` — 地形生成
 
-> Phase 2 已实装基础形态（在 Phase 1 stub 基础上接入 `World::ensure_chunk_generated`）。
+> Phase 2 ✅ 已实装基础形态（在 Phase 1 stub 基础上接入 `World::ensure_chunk_generated`）。
 
-### 算法
-1. 使用 `noise::Perlin`（seed 派生）生成 2D 高度图
-2. 多倍频叠加：基础 + 山脉 + 平原噪声
-3. 高度映射：`height = 64 + perlin(x, z) * amplitude`
-4. 分层填充：
-   - `y < height - 4`: STONE
-   - `y < height - 1`: DIRT
-   - `y == height`: GRASS
-   - `y > height`: AIR
+### 算法（Phase 2 实装版）
 
-```rust
-pub fn generate(seed: u64, pos: ChunkPos) -> Chunk {
-    let perlin = Perlin::new((seed & 0xFFFFFFFF) as u32);
-    let mut chunk = Chunk::empty();
-    for lx in 0..CHUNK_X {
-        for lz in 0..CHUNK_Z {
-            let wx = pos.x * CHUNK_X as i32 + lx as i32;
-            let wz = pos.z * CHUNK_Z as i32 + lz as i32;
-            let height = sample_height(&perlin, wx, wz);
-            for ly in 0..height.min(CHUNK_Y) {
-                let block = if ly == height - 1 { BlockID::GRASS }
-                            else if ly >= height - 4 { BlockID::DIRT }
-                            else { BlockID::STONE };
-                chunk.set(lx, ly, lz, block);
-            }
-        }
-    }
-    chunk
-}
-```
+1. `TerrainGenerator::new(seed)`：用 `noise::Perlin::new(seed as u32)` 构造一个噪声源
+2. 对 chunk 内每个 `(lx, lz)` 列：
+   - 世界坐标 `(world_x, world_z) = (pos.x * 16 + lx, pos.z * 16 + lz)`
+   - 采样 `perlin.get([world_x * 0.01, world_z * 0.01])` → 值域 `[-1, 1]`
+   - 映射到高度 `height = ((noise + 1) * 0.5 * CHUNK_Y * 0.4) as usize`（最高 ≈ 102）
+3. 分层填充每个 `(lx, ly, lz)`：
+   - `ly == 0` → 强制 STONE（基岩兜底，避免下溢）
+   - `ly + 3 < height` → STONE
+   - `ly < height` → DIRT
+   - `ly == height` → GRASS
+   - `ly > height` → AIR
+
+> 见 [`crates/server/src/terrain.rs`](../../crates/server/src/terrain.rs)。
+>
+> 注意：Phase 2 仅使用单一 Perlin 通道；多倍频叠加 / 山脉 / 平原差异化留给 v2。
 
 ### v2 扩展点
 - 生物群系（草原 / 沙漠 / 雪地）

@@ -106,6 +106,18 @@ async fn detect_webgpu() -> bool {
 - **Storage Buffer**：WebGPU 已支持，但本期未使用（贪婪网格化在 CPU 跑）；v2 GPU 网格化时启用
 - **Compute shader**：本期不用
 - **错误处理**：浏览器 `unhandledpromiserejection` 可能因为 wgpu 内部错误触发；`set_uncaught_error_handler` 截获并 console.error
+- **`queue.write_buffer` 在 submit 前会合并到同一 buffer 的最后一次写入**：
+  错误模式：
+  ```rust
+  for chunk in chunks {
+      queue.write_buffer(&shared_globals_buf, 0, &globals_for(chunk));  // ❌
+      encoder.begin_render_pass(...).draw(...);
+  }
+  queue.submit(...);  // 所有 draw 都看到最后一次写入的值
+  ```
+  WebGPU 模型：单次 submit 内所有 `queue.write_buffer` 在所有 command buffer 命令前执行，对同一 byte range 的多次写入只保留最后一次。
+  正确做法：**每个需要不同 uniform 的 draw 持有独立 buffer**（如 `ChunkMeshGpu` 自带 `globals_buffer + bind_group`），或使用 dynamic offset，或使用 instance buffer 把 per-draw 数据放顶点输入。
+  本项目体现：`crates/render/src/lib.rs::Renderer::render_world` 与 `crates/render/src/passes/opaque.rs::ChunkMeshGpu`
 
 ### 3.2 WebRTC
 

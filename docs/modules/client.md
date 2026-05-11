@@ -24,7 +24,7 @@
 
 | 阶段 | 包含 |
 |---|---|
-| **Phase 2 ✅**（设计已批准） | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
+| **Phase 2 ✅** | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
 | Phase 3 | Walk 模式 + `physics.rs` + `raycast.rs`；挖放 hotbar |
 | Phase 4 | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote` |
 | Phase 5 | `prediction.rs` / `interp.rs` 实装；`storage.rs` IndexedDB；远端玩家身体渲染 |
@@ -62,31 +62,46 @@ crates/client/src/
 
 ## 三、`lib.rs` — wasm 入口
 
-```rust
-use wasm_bindgen::prelude::*;
+Phase 2 实装：直接通过浏览器原生 API（`add_event_listener_with_callback`）注册事件，不引入 `winit` 事件循环。`#[wasm_bindgen(start)]` 异步函数完成 Renderer + egui 初始化后挂上 RAF 闭包链。
 
+```rust
 #[wasm_bindgen(start)]
-pub fn start() {
+pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     tracing_wasm::set_as_global_default();
 
-    wasm_bindgen_futures::spawn_local(async {
-        if let Err(e) = run().await {
-            web_sys::console::error_1(&format!("VoxWeb fatal: {e:?}").into());
-        }
-    });
-}
+    let canvas: HtmlCanvasElement = /* document.get_element_by_id("game") */;
+    let renderer = Renderer::new(&canvas).await?;
+    let egui_ctx = egui::Context::default();
+    let egui_renderer = egui_wgpu::Renderer::new(/* ... */);
+    let input = Rc::new(RefCell::new(InputState::default()));
+    let egui_events = Rc::new(RefCell::new(Vec::<egui::Event>::new()));
 
-async fn run() -> Result<(), AppError> {
-    let canvas = grab_canvas("game")?;     // <canvas id="game">
-    let renderer = Renderer::new(canvas.clone()).await?;
-    let mut app = App::new(renderer, canvas).await?;
+    let app = Rc::new(RefCell::new(App {
+        canvas, renderer, egui_ctx, egui_renderer,
+        input: input.clone(),
+        egui_events: egui_events.clone(),
+        state: AppState::Lobby,
+        lobby_state: LobbyState::default(),
+        game: None,
+        last_time_ms, fps_frames: 0, fps_accum: 0.0, fps_display: 0.0,
+        request_pointer_lock_next: false,
+    }));
 
-    // 由 winit 的 web 后端把 RAF 接管 → ApplicationHandler::about_to_wait 中触发渲染
-    app.run_event_loop()?;
+    install_event_listeners(&canvas, &document, input, egui_events, app.clone())?;
+    spawn_raf_loop(app);
     Ok(())
 }
 ```
+
+**事件路由**（`install_event_listeners`）：
+- `click` on canvas → 仅在 InGame 时 `canvas.request_pointer_lock()`
+- `pointerlockchange` on document → 写回 `input.pointer_locked`
+- `keydown` / `keyup` on document → InGame 时映射到 `InputState`；Lobby 时不消费（让 egui 处理文本输入）
+- `mousemove` on document：指针锁时累积相机 dx/dy；否则上报 `egui::Event::PointerMoved`（让 Lobby 按钮能接收 hover）
+- `mousedown` / `mouseup`：InGame 时写 InputState，Lobby 时转 `egui::Event::PointerButton`
+
+> 关键修复（commit edae0e6）：早期版本只在 InGame 才向 egui 喂事件，导致大厅按钮无法点击。Phase 2 起 mouse 事件在所有 state 下都会推到 `egui_events` 累加器，每帧 drain 入 `RawInput.events`。
 
 ---
 
@@ -122,17 +137,27 @@ pub enum ConnectingStage {
 
 ### App / Game 主结构
 
-Phase 2 起，`App` 容器只持有跨状态资源（renderer / egui / input）。游戏内运行时持有于 `Game` 子结构，仅 `InGame` 时存在：
+Phase 2 起，`App` 容器只持有跨状态资源（renderer / egui / input / 大厅 UI state）。游戏内运行时持有于 `Game` 子结构，仅 `InGame` 时存在：
 
 ```rust
-pub struct App {
-    pub canvas: web_sys::HtmlCanvasElement,
-    pub renderer: Renderer,
-    pub egui_ctx: egui::Context,
-    pub egui_renderer: egui_wgpu::Renderer,
-    pub input: Rc<RefCell<InputState>>,
-    pub state: AppState,
-    pub game: Option<Game>,            // [Phase 2] InGame 时存在
+struct App {
+    canvas: HtmlCanvasElement,
+    renderer: Renderer,
+    egui_ctx: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+
+    input: Rc<RefCell<InputState>>,
+    /// 浏览器 mouse 事件累加器：每帧 drain 到 egui RawInput.events
+    egui_events: Rc<RefCell<Vec<egui::Event>>>,
+
+    state: AppState,
+    lobby_state: LobbyState,           // [Phase 2] 大厅输入框文本等
+    game: Option<Game>,                // [Phase 2] InGame 时存在
+
+    // 帧计时 / FPS / 一次性的 InGame 指针锁请求
+    last_time_ms: f64,
+    fps_frames: u32, fps_accum: f32, fps_display: f32,
+    request_pointer_lock_next: bool,
 }
 
 pub struct Game {
@@ -144,6 +169,7 @@ pub struct Game {
     pub chunk_loader: ChunkLoader,     // [Phase 2]
     pub frame_clock: FrameClock,       // [Phase 2+]
     pub settings: GameSettings,        // [Phase 2+]
+    pub entity_id: u32,                // [Phase 2] 由 Welcome 填充；Phase 2 固定为 1
 
     // —— 以下为后续 Phase 引入 ——
     pub physics: ClientPhysics,        // [Phase 3]
@@ -153,6 +179,18 @@ pub struct Game {
     pub storage: IndexedDbStorage,     // [Phase 5]
     pub chat: ChatHistory,             // [Phase 6]
 }
+
+/// [Phase 2+]
+pub struct GameSettings {
+    pub render_distance: u32,          // 默认 6
+    pub mouse_sensitivity: f32,        // 默认 0.0025
+    pub fly_speed: f32,                // 默认 12.0 方块/秒
+    pub mesh_budget_ms: f32,           // 默认 4.0
+}
+
+/// [Phase 2+] 固定步长（1/60）累加器：渲染帧的 dt 累加到 `accumulator`，
+/// 每次 `consume_logic_step` 扣除一步返回 true；累加上限 0.25s 防止后台 Tab 回前台时风暴。
+pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 ```
 
 > Phase 2 不引入 `world_view`：Local 模式下 mesh 回调直接借 `server.world.get_block_world`。Phase 5 加入 Remote 模式时才有 `WorldView` 副本（由 ChunkSnapshot 喂数据）。
@@ -163,59 +201,68 @@ pub struct Game {
 
 ### Phase 2 主循环（Lobby / InGame 二态）
 
+`render_frame` 按 `app.state` 分流到两个分支。Loading / 未启用态全部 fall back 到 Lobby。
+
 ```rust
-fn render_frame(app: &mut App) {
-    let dt = app.frame_clock.tick();
+fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
+    let dt = update_clock(app);            // 计算 dt + 滚动 FPS
+    let (cw, ch) = sync_canvas_size(...);  // 同步 canvas client size + Renderer.resize
 
-    match &mut app.state {
-        AppState::Lobby => render_lobby_frame(app, dt),
-        AppState::InGame => render_game_frame(app, dt),
-        _ => {} // 其它态由后续 Phase 接入
+    match app.borrow().state.clone() {
+        AppState::InGame => render_game_frame(app, dt, cw, ch),
+        _ => render_lobby_frame(app, cw, ch),   // Loading / Lobby / 后续未启用态
     }
-}
-
-fn render_game_frame(app: &mut App, dt: f32) {
-    let game = app.game.as_mut().unwrap();
-
-    // 1. drain Local 通道（Client→Server）
-    game.net.drain_inbox_to(&mut game.server.borrow_mut(), &mut game.server_inbox);
-
-    // 2. drain Local 通道（Server→Client）
-    while let Some(msg) = game.net.try_recv_server_message() {
-        game.apply_server_message(msg);
-    }
-
-    // 3. 输入 → 相机（Fly 模式）
-    game.update_input_and_camera(dt);
-
-    // 4. 60Hz 逻辑帧累加器
-    game.frame_clock.accumulate(dt);
-    while game.frame_clock.consume_logic_step() {
-        game.server.borrow_mut().tick();
-    }
-
-    // 5. Chunk 滚动加载
-    game.chunk_loader.update(
-        game.camera.position,
-        &mut game.server.borrow_mut(),
-        &mut game.mesh_jobs,
-        &mut app.renderer,
-    );
-
-    // 6. 网格化任务（4ms budget）
-    game.mesh_jobs.run_until_budget(
-        MESH_BUDGET_MS,
-        &game.server.borrow(),
-        &mut app.renderer,
-    );
-
-    // 7. egui HUD
-    let egui_output = app.build_hud(game);
-
-    // 8. wgpu 渲染 + present
-    app.renderer.render(&game.camera, egui_output);
 }
 ```
+
+#### `render_lobby_frame`
+
+1. 取 `egui_events` 累加器 drain 出鼠标事件 → 塞入 `RawInput.events`
+2. `egui_ctx.run_ui(...)` 跑大厅 UI（`draw_lobby` 返回 `Option<LobbyAction>`）
+3. 若返回 `LobbyAction::StartSinglePlayer { seed }` → `start_single_player(app, seed)`：
+   - 用 `getrandom` 抓 8 字节 → u64 seed（输入为空时）
+   - `Game::new_local(seed, settings)` 创建 server + mpsc + Camera
+   - 发 `ClientMessage::Hello` 入队
+   - 置 `state = InGame`、`request_pointer_lock_next = true`
+4. 编码 lobby Pass：先 `Clear` 暗蓝色背景，再画 egui
+
+#### `render_game_frame`（8 步）
+
+```rust
+fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
+    // 1. drain Client→Server（ServerInbox.try_recv_client_message）
+    //    → Server.handle_message(entity_id, msg)
+    //    → 把 replies 推回 ServerInbox.send_server_message
+    // 2. drain Server→Client（net.try_recv_server_message）→ apply_server_message
+    //    （Phase 2：仅 Welcome 把 entity_id 写回 game.entity_id）
+
+    // 3. 输入 → 相机（Fly 模式）
+    //    - 指针锁时 apply_mouse(dx, dy, sensitivity)
+    //    - apply_fly_input(input, fly_speed, dt)
+    //    - input.reset_delta()
+
+    // 4. 60Hz 逻辑帧累加器
+    //    frame_clock.accumulate(dt);
+    //    while frame_clock.consume_logic_step() { server.tick(); }
+
+    // 5. ChunkLoader 滚动（&mut Server / &mut MeshJobQueue / &mut Renderer）
+    //    见 §6.7 — 同 chunk 内移动不触发；跨边界时算 diff
+    // 6. mesh_jobs.run_until_budget(mesh_budget_ms, &Server, &mut Renderer, &now_ms)
+    //    见 §6.7
+
+    // 7. egui HUD：FPS / POS / YAW PITCH / CHUNKS / MESH_Q / 准星 / 底部提示
+    // 8. wgpu 渲染 + present
+    //    - Renderer::render_world（OpaquePass：清屏 + 多 chunk Pass）
+    //    - egui Pass（Load）
+    //    - 若 request_pointer_lock_next == true → canvas.request_pointer_lock()
+    Ok(())
+}
+```
+
+> **借用顺序**（避免 RefCell 二次借用 / borrow_mut 冲突）：
+> 1. 先 `app.borrow_mut()` drain mpsc inbox
+> 2. 后续 ChunkLoader.update 需 `&mut Server` + `&mut Renderer`，用结构体解构借出
+> 3. mesh_jobs.run_until_budget 用 `server.borrow()`（immutable）+ `&mut Renderer`，与上一步不重叠
 
 ### Phase 5+ 完整主循环（前瞻）
 
@@ -304,7 +351,13 @@ impl InputManager {
 **MeshJobQueue**：
 
 ```rust
-pub enum MeshPriority { Critical, High, Medium, Low }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MeshPriority {
+    Critical = 0,   // 玩家正站立的 chunk
+    High = 1,       // 玩家附近 1 chunk 范围
+    Medium = 2,     // 渲染距离内其它
+    Low = 3,        // 邻居加载触发的重网格化 / 边界 chunk
+}
 
 pub struct MeshJobQueue {
     queues: [VecDeque<ChunkPos>; 4],   // 按 MeshPriority 索引
@@ -314,41 +367,61 @@ pub struct MeshJobQueue {
 impl MeshJobQueue {
     pub fn enqueue(&mut self, pos: ChunkPos, priority: MeshPriority);
     pub fn cancel(&mut self, pos: ChunkPos);
-    pub fn run_until_budget(&mut self, budget_ms: f32, server: &Server, renderer: &mut Renderer);
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    /// `now_ms` 注入便于测试与平台抽象，运行期传 `&now_ms`（封装 performance.now()）
+    pub fn run_until_budget(
+        &mut self,
+        budget_ms: f32,
+        server: &Server,
+        renderer: &mut Renderer,
+        now_ms: &dyn Fn() -> f64,
+    );
 }
 ```
 
-`run_until_budget` 每次取最高优先级队列 head，调 `chunk_mesh::generate_with_neighbors`，回调 `|wx,wy,wz| server.world.get_block_world(...)`，结果 `renderer.upload_chunk_mesh`。`performance.now()` 监控耗时超 budget 退出。
+`run_until_budget` 每次取最高优先级队列 head，从 `server.world.chunks.get(&pos)` 取出 chunk（若已被卸载就跳过），调 `chunk_mesh::generate_with_neighbors(chunk, pos, &|wx,wy,wz| server.world.get_block_world(...))`，结果通过 `renderer.upload_chunk_mesh` 上传。`(now_ms() - start) as f32 >= budget_ms` 时退出。
+
+> **防重语义**：同 chunk 二次 `enqueue` 被忽略，保留最早的优先级（不"升级"）。如需调整优先级，先 `cancel` 再 `enqueue`。
 
 **ChunkLoader**：
 
 ```rust
 pub struct ChunkLoader {
-    pub render_distance: u32,          // 默认 6
-    pub unload_buffer: u32,            // 默认 3（实际卸载半径 = render_distance + buffer）
+    pub render_distance: i32,          // 默认 6
+    pub unload_buffer: i32,            // 常数 3（实际卸载半径 = render_distance + buffer）
     pub loaded: HashSet<ChunkPos>,
     last_center: Option<ChunkPos>,
 }
 
 impl ChunkLoader {
+    pub fn new(render_distance: u32) -> Self;
+    pub fn invalidate(&mut self);     // 下一次 update 强制重算
+    /// 返回是否发生了变更（用于调试 / 性能 stat）
     pub fn update(
         &mut self,
         camera_pos: Vec3,
         server: &mut Server,
         mesh_jobs: &mut MeshJobQueue,
         renderer: &mut Renderer,
-    );
+    ) -> bool;
 }
+
+// 工具函数
+pub fn chunk_pos_of(world_pos: Vec3) -> ChunkPos;       // div_euclid 处理负坐标
+pub fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i32;
+pub fn priority_for_distance(pos: ChunkPos, center: ChunkPos) -> MeshPriority;
+//   d == 0 → Critical, d == 1 → High, d >= 2 → Medium
 ```
 
-`update`：
-1. 算出当前 chunk 中心；若与上次相同则跳过（chunk 内移动不触发）
-2. 计算期望集合（render_distance 半径方形）
-3. 新增 chunk：先 `server.world.ensure_chunk_generated(pos)` → `mesh_jobs.enqueue(pos, prio)`
-4. 对**这一批新 chunk** 的水平邻居（已在 loaded 中且 renderer.has_chunk_mesh）以 `MeshPriority::Low` 重新入队，使跨区块剔除生效
-5. 卸载：超出 `render_distance + unload_buffer` 的 chunk → `server.unload_chunk` + `mesh_jobs.cancel` + `renderer.drop_chunk_mesh`
+`update` 行为：
+1. 算出当前 chunk 中心；若与 `last_center` 相同则直接返回 false（chunk 内移动不触发）
+2. 计算期望集合（`render_distance` 半径切比雪夫方形）
+3. 新增 chunk：`desired - loaded`，逐个 `server.world.ensure_chunk_generated(pos)` → `mesh_jobs.enqueue(pos, prio)`
+4. 对**这一批新 chunk** 的 4 个水平邻居（已在 `loaded` 中且 `renderer.has_chunk_mesh(neighbor) == true`）以 `MeshPriority::Low` 重新入队，使跨区块剔除生效
+5. 卸载：`loaded` 中切比雪夫距离 `> render_distance + unload_buffer` 的 chunk → `server.unload_chunk` + `mesh_jobs.cancel` + `renderer.drop_chunk_mesh`
 
-> **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠。
+> **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠。Phase 2 主循环（[`crates/client/src/lib.rs`](../../crates/client/src/lib.rs)）严格遵守此顺序。
 
 ### 6.8 `physics.rs`（[Phase 3]，详见 [`features/physics.md`](../features/physics.md)）
 本地玩家 AABB 物理预测（重力、跳跃、分轴碰撞）。仅作"乐观更新"，Host 仲裁后通过 prediction 模块协调。
