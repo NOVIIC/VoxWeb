@@ -33,11 +33,14 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [x] 设置 `console_error_panic_hook` + `tracing-wasm`
 - [x] CI：`cargo check --target wasm32-unknown-unknown` + `cargo fmt --check`
 - [x] `signaling/` TS 项目初始化（空 worker，仅返回 200）
+- [ ] **浏览器能力前置检测（wasm 加载之前）**：在 `index.html` / `start.html` 内联检测脚本（< 2 KB gz），检查 WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；缺失项展示降级页面并阻止 wasm 加载；仅 WebRTC 缺失时提供"仅单机模式"入口。详见 [`reference.md` §浏览器能力前置检测](reference.md#浏览器能力前置检测wasm-加载之前) 与 [`features/persistence.md` §十五](features/persistence.md#十五浏览器能力前置检测)
 
 ### 验证
 - `trunk serve` → 浏览器打开 http://localhost:8080 → 看到纯色背景 + 居中文字
 - 控制台无错误
 - WASM gz 体积 < 1.5 MB
+- **不支持浏览器（如 Firefox stable 缺 WebGPU）访问时看到友好提示，且 `.wasm` 不被下载（Network 面板可验证）**
+- **加 `?force=1` query 可跳过检测进入游戏（开发模式用）**
 
 ### 可能踩的坑
 - wgpu Surface 在 canvas 未挂载到 DOM 时初始化会失败 → 等 RAF 第一次回调再创建
@@ -189,7 +192,13 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [ ] Action Ack 协调
 - [ ] PeerJoined / PeerLeft 玩家进出广播
 - [ ] 简单玩家身体渲染（一个 box，颜色按 entity_id 派生）
-- [ ] **基础 IndexedDB 持久化**：Host 启动加载、退出 flush（最小可用版）
+- [ ] **基础 OPFS 持久化（最小可用版）**：
+  - `crates/core/src/chunk.rs` 加 `encode` / `decode`（palette + RLE，目标 < 5 KB/chunk）
+  - `crates/client/src/storage.rs` 用 OPFS 实现 `WorldStorage` trait
+  - 启动 prime（出生点 4 chunk 半径同步加载）+ 运行时按需 load
+  - `PersistenceManager` 拆分 `snapshot_dirty` / `commit_flushed` / `record_failure`，flush 失败不丢 dirty
+  - 周期 1s flush + `pagehide` 退出 flush（Variant A，主线程 async）
+  - 浏览器能力检测在 Phase 0 已完成，此处可信任 OPFS 可用
 
 ### 验证
 - A 创建房间 → B 加入
@@ -271,16 +280,22 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [ ] Transparent Pass（水/玻璃 alpha blend）
 - [ ] UI Pass 重构为 trait 实现
 - [ ] 透明方块网格独立 buffer + 距离排序
-- [ ] 持久化：周期性 flush（5s） + 暂停菜单"立即保存"
-- [ ] 配额管理 UI（暂停菜单显示使用量）
-- [ ] 加载失败错误处理 + 删档功能
+- [ ] **存档完善**：
+  - `crates/server/src/world.rs` 引入 LRU + pinned 集合（capacity 4096，runtime 可调）
+  - 暂停菜单"立即保存"按钮 + 配额 UI（使用量、> 80% 警告、> 95% 暂停 dirty）
+  - `navigator.storage.persist()` 启动时申请
+  - 协议 migration 框架（`storage_version` + `migrations[]` 数组，本期含 identity）
+  - 加载失败错误处理 + 删档功能（不再因版本不匹配强制删档）
+- [ ] （可选）Variant B Worker + sync handle 升级：若 Phase 5 上线后出现可观察的"关 Tab 丢数据"投诉，新增 `crates/client/src/storage_worker.rs` 走 `FileSystemSyncAccessHandle`；详见 [`features/persistence.md` §十二](features/persistence.md#十二variant-a-vs-variant-bworker)
 
 ### 验证
 - 看到清晰的天空（地平线渐变 + 太阳）
 - 水透明，能看到下面的方块
 - Depth Pre-Pass 开/关切换不影响画面，但 stat 显示帧时变化
 - 存档使用量准确显示
+- 手动注入 10000 dirty chunk（控制台 `voxwebDebug.fillDirty(10000)`）→ OPFS 占用 < 200 MB；启动重连 < 3s；运行内存 < 500 MB
 - 强制删档后重进世界为初始地形
+- 修改 `world.json.storage_version` 为 999 → 大厅显示"需升级 VoxWeb" 而非删档
 
 ---
 

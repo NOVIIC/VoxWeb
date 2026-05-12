@@ -63,23 +63,12 @@ web-sys = { version = "0.3", features = [
     "PointerEvent",
     "KeyboardEvent",
     "MouseEvent",
-    "BeforeUnloadEvent",
     "Element",
     "EventTarget",
-    "IdbFactory",
-    "IdbDatabase",
-    "IdbObjectStore",
-    "IdbTransaction",
-    "IdbVersionChangeEvent",
-    "IdbRequest",
-    "IdbCursor",
     "Gpu",
     "GpuAdapter",
 ] }
 js-sys = "0.3"
-
-# --- 持久化 ---
-idb = "0.6"
 
 # --- 异步通信 ---
 futures-channel = "0.3"

@@ -12,7 +12,7 @@
 - 玩家状态：入会、位置、离会
 - 物理仲裁：拒绝非法位置（穿墙、瞬移）
 - 方块挖放仲裁：射程、合法性、广播变更
-- 持久化触发：维护 dirty 集合，让 client 异步任务执行 IndexedDB 写入
+- 持久化触发：维护 dirty 集合 + LRU 卸载策略，让 client 异步任务执行 OPFS 写入
 
 **部署形态**：
 - **Local-Only**：内嵌于 client，输入输出走内存通道
@@ -43,7 +43,7 @@ crates/server/src/
 ├── world.rs            ChunkStore + EntityTable + Tick
 ├── terrain.rs          Perlin 地形生成
 ├── physics.rs          物理仲裁（位置合法性、挖放校验）
-└── persistence.rs      Persistence trait（具体实现在 client::storage）
+└── persistence.rs      PersistenceManager + LRU 卸载（具体存储读写在 client::storage）
 ```
 
 ---
@@ -171,7 +171,7 @@ impl Server {
                 └─ 都没有？terrain::generate(seed, pos) → 插入
 ```
 
-**注意**：`server` 自身**不直接读 IndexedDB**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`（Phase 5）。
+**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`（Phase 5）。
 
 ### 玩家位置更新
 
@@ -411,19 +411,31 @@ fn send_initial_snapshot(&mut self, recipient: EntityId) {
 
 > **Phase 5** 引入。Phase 2 / 3 / 4 不持久化（每次进入世界重生成；同 seed 确定性保证一致）。
 
-`server` 通过 trait 抽象不感知具体存储：
+`server` 通过抽象接口不感知具体存储，仅维护"哪些 chunk 脏了"以及"何时把它们交给 client 写"。具体接口在 [`crates/server/src/persistence.rs`](../../crates/server/src/persistence.rs)：
 
 ```rust
-pub trait ChunkStorage {
-    fn save_chunks(&self, dirty: Vec<(ChunkPos, Chunk)>);
-    fn load_chunk(&self, pos: ChunkPos) -> Option<Chunk>;
+pub struct PersistenceManager {
+    dirty: HashSet<ChunkPos>,
+    in_flight: HashSet<ChunkPos>,
+    failure_backoff_until: HashMap<ChunkPos, f64>,
+    next_flush_tick: u64,
+}
+
+impl PersistenceManager {
+    pub fn mark_dirty(&mut self, pos: ChunkPos);
+    pub fn snapshot_dirty(&mut self, limit: usize) -> Vec<ChunkPos>;   // dirty → in_flight，不删
+    pub fn commit_flushed(&mut self, positions: &[ChunkPos]);           // 写入成功后清理 in_flight
+    pub fn record_flush_failure(&mut self, positions: &[ChunkPos]);     // 失败：in_flight → dirty + 退避
+    pub fn should_flush(&self, current_tick: u64) -> bool;
 }
 ```
 
-但**实际实现不在 server crate 内**（避免引入 `idb` / `web-sys` 依赖污染 server 的平台无关性）。
-- Client 端实现 `IndexedDbStorage: ChunkStorage`
-- Client 主循环每 N 秒调 `let dirty = server.take_dirty_chunks();` 然后 `spawn_local(async { storage.save(dirty).await })`
-- 加载请求由 client 触发：`storage.load(pos)` → `await` → `server.load_chunk_from_storage(pos, chunk)`
+**实际存储实现不在 server crate 内**（避免引入 `web-sys` 依赖污染 server 的平台无关性）：
+- Client 端 [`crates/client/src/storage.rs`](../../crates/client/src/storage.rs) 实现 `WorldStorage` trait（默认 `OpfsStorage`）
+- Client 主循环每 1 秒：`let to_flush = persistence.snapshot_dirty(64);` → 主线程 encode（每帧最多 4 chunk）→ `spawn_local(async { storage.save_chunks(...).await })` → 成功 commit / 失败 record_failure
+- 加载请求由 client 触发：`storage.load_chunk(pos)` → `decode` → `server.load_chunk_from_storage(pos, chunk)`
+
+`World` 还配套 LRU + pinned 集合避免内存爆炸（capacity 4096，渲染距离内 chunk 不可驱逐；dirty chunk 驱逐前必须先 flush）。
 
 详见 [`features/persistence.md`](../features/persistence.md)。
 
@@ -453,4 +465,4 @@ pub trait ChunkStorage {
 - 时间循环（昼夜变化的服务端建模 — 客户端做即可）
 - 区域权限 / 玩家管理（v2）
 - 玩家死亡 / 掉血
-- 外部数据库（Postgres 等） — 本期仅 IndexedDB
+- 外部数据库（Postgres 等） — 本期仅浏览器 OPFS

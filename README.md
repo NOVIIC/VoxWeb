@@ -12,7 +12,7 @@ VoxWeb 是一款 **运行在浏览器内** 的体素沙盒游戏，采用 Rust �
 1. **零后端静态托管**：游戏本体是一个 `.wasm` + `.html` + `.js` 包，部署在 **Caddy 静态站点** 上，玩家访问网址即玩。
 2. **P2P 多人联机**：玩家之间通过 WebRTC `DataChannel` 直连传输世界数据；信令服务独立部署在 **Cloudflare Workers**（与静态站分离），不与游戏本体耦合。
 3. **主机权威架构（Host-Authoritative）**：第一个进入房间的玩家成为 Host，运行权威服务端逻辑（地形生成、物理仲裁、方块挖放校验）；其它玩家作为 Remote Client，本地仅做渲染和输入预测。
-4. **功能一览**：第一人称、AABB 物理、跳跃、挖掘/放置、贪婪网格化、Egui UI、地形 Perlin 生成；P2P 联机、IndexedDB 存档、多 Pass 渲染（含天空盒）。
+4. **功能一览**：第一人称、AABB 物理、跳跃、挖掘/放置、贪婪网格化、Egui UI、地形 Perlin 生成；P2P 联机、OPFS 存档（palette+RLE 压缩、LRU 内存管理），多 Pass 渲染（含天空盒）。
 5. **典型用户场景**：朋友间打开网页，一人开房分享 6 位房间号，其它人输入房间号即可同房游戏；离线玩家也可单人模式（Local-Only 角色，跳过信令直接运行 Server）。
 
 ---
@@ -26,7 +26,8 @@ VoxWeb 是一款 **运行在浏览器内** 的体素沙盒游戏，采用 Rust �
 | 渲染后端 | 仅 WebGPU | 主流浏览器（Chrome/Edge/Safari17+）已支持，Firefox 用户需 nightly；不实现 WebGL2 兜底以减少代码复杂度 |
 | 项目结构 | 多 Crate workspace | 模块边界清晰，便于单独测试与未来代码共享 |
 | 线程模型 | 单线程 async（`wasm-bindgen-futures`） | 避开 SharedArrayBuffer / Web Worker 调试复杂度，重 CPU 任务用分帧调度兜底 |
-| 存档 | IndexedDB（仅 Host 写入） | 浏览器原生持久化，配额大；Remote Client 不持有权威世界 |
+| 存档 | OPFS（Origin Private File System，仅 Host 写入） | 多 GB 容量；Worker 内 `FileSystemSyncAccessHandle` 可同步落盘；palette+RLE 压缩 + LRU 卸载支持万级 dirty chunk。早期曾选 IndexedDB，因大存档下配额/内存/启动加载/退出 flush 同时撞墙改用 OPFS（详见 [`docs/features/persistence.md`](docs/features/persistence.md) §二） |
+| 浏览器能力检测 | `index.html` 内联检测脚本（WASM 加载前） | OPFS / WebGPU / WebRTC 等硬依赖，提前拦截不兼容浏览器避免下载几 MB wasm 后再失败 |
 | 序列化 | `bincode`（little-endian、定长配置） | 与 DataChannel 二进制传输契合，体积比 JSON 小一个数量级 |
 | 编译目标 | `wasm32-unknown-unknown` + `wasm-bindgen` | 主流路径，工具链成熟 |
 | 构建工具 | `trunk`（首选）或 `wasm-pack` | trunk 集成 HTML 模板与资源管线，开箱即用 |
@@ -54,7 +55,7 @@ docs/
 │   ├── meshing.md              贪婪网格化 + 跨区块面剔除 + u32 顶点压缩 + 分帧调度
 │   ├── physics.md              玩家 AABB + 重力 + 跳跃 + DDA 射线 + 挖放
 │   ├── ui.md                   UI 状态机：大厅/HUD/暂停/聊天/玩家列表/名牌
-│   └── persistence.md          IndexedDB schema + 读写时机 + 房间-世界绑定
+│   └── persistence.md          OPFS schema + 压缩 + 读写时机 + 房间-世界绑定
 ├── deployment.md               Caddy 静态站 + 信令 Workers 部署 + 构建工具链
 ├── reference.md                技术栈版本表 + 浏览器 API 约束 + 已知坑
 └── roadmap.md                  Phase 0-9 路线图，每个 Phase 可独立验证
@@ -76,7 +77,7 @@ docs/
 | `docs/features/meshing.md` | 贪婪网格化算法、压缩格式、AO | 改区块网格性能、加新方块属性时 |
 | `docs/features/physics.md` | AABB、跳跃、DDA、挖放消息流 | 改物理手感、改方块交互时 |
 | `docs/features/ui.md` | egui 各场景界面、指针锁、聊天 | 改 UI 任意页面时 |
-| `docs/features/persistence.md` | IndexedDB schema、读写时机 | 改存档逻辑时 |
+| `docs/features/persistence.md` | OPFS 文件布局、chunk 压缩、读写时机、LRU | 改存档逻辑时 |
 | `docs/deployment.md` | Caddy 配置、wrangler 部署、构建命令 | 部署 / 改 CI / 改构建管线时 |
 | `docs/reference.md` | 依赖版本、浏览器约束、坑列表 | 升级依赖、排查浏览器兼容问题时 |
 | `docs/roadmap.md` | Phase 切分、验证标准 | 决定下一步做什么、估排期时 |
@@ -126,6 +127,9 @@ docs/
 | **Host** | 房主，运行权威 Server 实例的 peer |
 | **Remote Client** | 非房主玩家，通过 DataChannel 接收 Host 状态 |
 | **Local-Only** | 单人模式（无网络），Server 直接挂在 Client 内 |
+| **OPFS** | Origin Private File System，浏览器内置的"源专属"虚拟文件系统；本项目存档底层 |
+| **FSA** | File System Access API（`showDirectoryPicker`），让用户授权读写真实磁盘目录；Phase 9 stretch 用作可选导出渠道 |
+| **palette + RLE** | Chunk 序列化方案：先收集唯一 BlockID 形成 palette，再对 palette index 做 run-length 编码；详见 `docs/features/persistence.md` 第四节 |
 | **Peer** | WebRTC 对等连接节点（一个浏览器 Tab） |
 | **DataChannel** | WebRTC 字节流通道，本项目使用两条：`reliable` 和 `unreliable` |
 | **Reliable Channel** | ordered+reliable，传 ChunkSync / BlockUpdate / Chat / Join/Leave |

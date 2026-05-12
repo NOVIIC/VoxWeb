@@ -34,7 +34,6 @@ tracing.workspace = true
 tracing-wasm.workspace = true
 log.workspace = true
 
-idb.workspace = true
 getrandom.workspace = true
 
 [lints]

@@ -35,7 +35,7 @@
 | `wasm-bindgen-futures` | 0.4.x | async/await 支持 | |
 | `web-sys` | 0.3.x | 浏览器 API 绑定 | feature flag 按需启用 |
 | `js-sys` | 0.3.x | JS 类型 | |
-| `idb` | 0.6+ | IndexedDB 异步包装 | |
+| `async-trait` | 0.1+ | trait 内 async fn | `WorldStorage` trait 使用 `?Send` |
 | `futures-channel` | 0.3 | mpsc/oneshot | 跨 async 通信 |
 | `console_error_panic_hook` | 0.1 | panic 输出到 console | |
 | `tracing` + `tracing-wasm` | 0.1+ / 0.2+ | 日志 | |
@@ -48,17 +48,25 @@
 version = "0.3"
 features = [
   "Window", "Document", "HtmlCanvasElement", "Performance",
-  "Storage", "Location", "Navigator", "ResizeObserver",
+  "Storage", "StorageManager", "Location", "Navigator", "ResizeObserver",
   "WebSocket", "MessageEvent", "BinaryType", "ErrorEvent",
   "RtcPeerConnection", "RtcConfiguration", "RtcDataChannel",
   "RtcDataChannelInit", "RtcSessionDescription", "RtcSessionDescriptionInit",
   "RtcIceCandidate", "RtcIceCandidateInit", "RtcSdpType",
   "PointerEvent", "KeyboardEvent", "MouseEvent",
-  "BeforeUnloadEvent", "Element", "EventTarget",
-  "IdbFactory", "IdbDatabase", "IdbObjectStore", "IdbTransaction",
-  "IdbVersionChangeEvent", "IdbRequest", "IdbCursor",
+  "PageTransitionEvent", "Element", "EventTarget",
+  # —— OPFS（存档） ——
+  "FileSystemDirectoryHandle", "FileSystemFileHandle",
+  "FileSystemGetFileOptions", "FileSystemGetDirectoryOptions",
+  "FileSystemRemoveOptions", "FileSystemWritableFileStream",
+  "FileSystemHandle", "FileSystemHandleKind",
+  "File", "Blob",
+  # —— WebGPU ——
+  "Gpu", "GpuAdapter",
 ]
 ```
+
+> 已移除 `Idb*` / `BeforeUnloadEvent`：本项目 Phase 5 起改用 OPFS（详见 [`features/persistence.md`](features/persistence.md)），退出 flush 监听 `pagehide` 而非 `beforeunload`。
 
 ### 信令服务（TS）
 
@@ -72,27 +80,57 @@ features = [
 
 ## 二、浏览器支持矩阵
 
-| 浏览器 | WebGPU | WebRTC | IndexedDB | 指针锁 | 推荐度 |
+| 浏览器 | WebGPU | WebRTC | OPFS | 指针锁 | 推荐度 |
 |---|---|---|---|---|---|
-| Chrome 113+ | ✅ | ✅ | ✅ | ✅ | 推荐 |
-| Edge 113+ | ✅ | ✅ | ✅ | ✅ | 推荐 |
-| Safari 17+ | ✅（macOS Sonoma+ / iOS 17+） | ✅ | ✅ | ✅（macOS） | 推荐（桌面） |
-| Firefox stable | ❌ 默认（需 nightly） | ✅ | ✅ | ✅ | 不推荐 |
+| Chrome 113+ | ✅ | ✅ | ✅（102+） | ✅ | 推荐 |
+| Edge 113+ | ✅ | ✅ | ✅（102+） | ✅ | 推荐 |
+| Safari 17+ | ✅（macOS Sonoma+ / iOS 17+） | ✅ | ✅（17+） | ✅（macOS） | 推荐（桌面） |
+| Firefox 115+ stable | ❌ WebGPU 默认（需 nightly） | ✅ | ✅（111+） | ✅ | 不推荐 |
 | Firefox Nightly | ✅（about:config 开启 dom.webgpu.enabled） | ✅ | ✅ | ✅ | 可用 |
 | 移动 Chrome (Android) | ✅（114+） | ✅ | ✅ | ❌ 部分 | 不在本期范围 |
-| 移动 Safari (iOS) | ✅（17+） | ✅ | ✅ | ❌ | 不在本期范围 |
+| 移动 Safari (iOS) | ✅（17+） | ✅ | ✅（17+） | ❌ | 不在本期范围 |
 
-### WebGPU 检测与降级
+### 浏览器能力前置检测（wasm 加载之前）
 
-```rust
-async fn detect_webgpu() -> bool {
-    let nav = web_sys::window()?.navigator();
-    JsFuture::from(nav.gpu()?.request_adapter().ok()?).await.is_ok()
-}
+由于 OPFS / WebGPU / WebRTC 等是硬依赖，**必须在 `<script>` 加载 `.wasm` 之前**用纯 JS 检测，避免下载几 MB wasm 后才在运行时报错。脚本放 [`index.html`](../index.html) 与 [`start.html`](../start.html) 的 `<head>` 内联（< 2 KB gz）。
+
+检测项：
+
+```js
+const checks = {
+  wasm:        () => typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function',
+  webgpu:      () => 'gpu' in navigator,
+  opfs:        () => navigator.storage && typeof navigator.storage.getDirectory === 'function',
+  webrtc:      () => typeof RTCPeerConnection === 'function' && 'createDataChannel' in RTCPeerConnection.prototype,
+  websocket:   () => typeof WebSocket === 'function',
+  pointerlock: () => 'requestPointerLock' in HTMLElement.prototype,
+};
+const required = ['wasm', 'webgpu', 'opfs', 'webrtc', 'websocket', 'pointerlock'];
+const missing = required.filter(k => !checks[k]());
 ```
 
-不支持时大厅显示：
-> 您的浏览器不支持 WebGPU。请使用 Chrome / Edge / Safari 17+ 访问，或在 Firefox 中启用 `dom.webgpu.enabled`。
+**降级提示文案表**（写在内联脚本内常量）：
+
+| 缺失项 | 提示 |
+|---|---|
+| `wasm` | 浏览器太旧，不支持 WebAssembly。请升级浏览器。 |
+| `webgpu` | 浏览器不支持 WebGPU。Firefox 用户请切换 nightly；Safari 请升级到 17+。 |
+| `opfs` | 浏览器不支持 OPFS（存档系统所需）。请升级到 Chrome / Edge 102+、Firefox 111+、Safari 17+。 |
+| `webrtc` | 不支持 WebRTC，无法多人联机（仅单机模式可继续）。 |
+| `websocket` | 不支持 WebSocket，无法连接信令服务器。 |
+| `pointerlock` | 不支持指针锁，第一人称视角无法启用。 |
+
+**特殊处理**：若 **仅 `webrtc` 缺失** 而其他必备项都满足 → 提供"仅单机模式"按钮，wasm 启动后强制走 Local-Only 路径，禁用大厅"创建/加入房间"。其他必备项缺失 → 拒绝加载 wasm，显示降级页面（纯 HTML/CSS）。
+
+**最低浏览器版本**（取所有必备项交集）：
+
+| 浏览器 | 最低版本 | 缺什么 |
+|---|---|---|
+| Chrome / Edge | 113+ | 113 起 WebGPU 默认开启 |
+| Firefox | 115+ stable，WebGPU 需 nightly | stable 仍缺 WebGPU |
+| Safari (macOS) | 17+ | 17 起 OPFS + WebGPU 同步可用 |
+
+**`?force=1` 跳过**：URL 加 query `?force=1` 跳过检测直接加载 wasm，仅用于开发/调试，正式版可移除。
 
 ---
 
@@ -134,13 +172,20 @@ async fn detect_webgpu() -> bool {
 - **wss URL**：HTTPS 站点必须用 wss（混合内容会被浏览器拦截）
 - **重连**：本期不实现；用户主动重新加入
 
-### 3.4 IndexedDB
+### 3.4 OPFS
 
-- **配额**：通常 ≥ 1 GB，但浏览器隐身模式下可能仅几十 MB
-- **同步 API 不可用**：所有操作异步
-- **事务超时**：长事务（大批量 chunk 写入）可能超时；分批 ≤ 100 chunks/事务
-- **结构化克隆**：存 Uint8Array 时浏览器内部会 copy，注意频繁存大 chunk 的 GC 压力
-- **DevTools**：Application → IndexedDB 可手动查看与删除
+- **配额**：通常磁盘 60% 上限（chromium）；隐身模式下大幅缩水至几十 MB；可调 `navigator.storage.persist()` 申请持久存储以避免自动清理
+- **同步 API 仅 Worker 内可用**：`FileSystemSyncAccessHandle.write()`，主线程只有 async 路径；Phase 5 走 async（Variant A），Phase 8 视情况升级到 Worker（Variant B）
+- **`removeEntry({recursive:true})`**：Chromium / Firefox 较新版本支持；旧 Safari 需逐文件 `removeEntry` 自实现递归删
+- **大目录性能**：单目录 ≥ 10k 文件时 OPFS 内部 SQLite-like 索引仍可承担；但 `entries()` 异步迭代会拖到 100-300 ms，需要 loading UI 遮蔽
+- **DevTools 入口**：
+  - Chrome / Edge：DevTools → Application → Storage → 选 origin → "Open Origin Private File System"
+  - Firefox 111+：DevTools → Storage → 同级有 OPFS 节点
+  - Safari：暂无 UI，靠控制台命令 `window.voxwebDebug.*`
+- **`pagehide` 是退出 flush 的事件**（不是 `beforeunload`）：在移动 Safari 比 `beforeunload` 可靠；BFCache 路径下浏览器会 await 完异步任务
+- **跨域隔离**：每个 origin 的 OPFS 互相隔离，不能直接共享存档
+
+完整设计与读写时机：[`features/persistence.md`](features/persistence.md)。
 
 ### 3.5 指针锁
 
@@ -232,7 +277,7 @@ let normalized = if is_firefox() { dx / dpr } else { dx };
 ### 4.8 文件系统
 
 - 无 `std::fs`
-- 持久化只能用 IndexedDB / localStorage / OPFS（v2 stretch）
+- 持久化使用 **OPFS**（[`features/persistence.md`](features/persistence.md)）；localStorage 仅存轻量配置；File System Access API 仅 Phase 9 stretch 用作可选导出
 - 加载 assets 用 `include_bytes!`（编译期嵌入）或运行时 `fetch`
 
 ---
@@ -260,7 +305,7 @@ let normalized = if is_firefox() { dx / dpr } else { dx };
 - **Console**：Rust panic / `tracing::error!` 全在这里
 - **Performance**：录制 5-10s 帧，看每帧时间分布
 - **Network → WS**：信令 WebSocket 消息
-- **Application → IndexedDB**：存档查看
+- **Application → Storage → OPFS**：存档查看（详见 [`features/persistence.md`](features/persistence.md) §十四）
 - **Memory**：堆快照（注意 WASM 堆不在此显示，需要 wasm-bindgen 助记）
 
 ### 6.2 chrome://gpu
@@ -289,10 +334,11 @@ trunk 在 release 模式下默认不带 sourcemap（节省体积）。debug 模�
 | WebRTC NAT 穿透失败 | 中 | v2 加 TURN 中继 |
 | 单线程网格化卡顿 | 中 | 分帧 budget + 优先级队列 |
 | WASM 体积超 6MB | 中 | 持续 twiggy 监测 |
-| IndexedDB 写入失败（隐身模式） | 低 | 降级为内存模式，UI 提示 |
+| OPFS 配额耗尽（隐身模式 / 长期世界） | 中 | UI 显示用量；> 80% 警告；> 95% 暂停 dirty 写入；引导导出/删档 |
+| OPFS 写入失败 / `pagehide` 未完成 flush | 中 | 1s 周期 flush 兜底；Variant B（Worker + sync handle）作为升级路径 |
 | 浏览器后台 Tab 时间漂移 | 低 | dt 上限 + 跳过过大逻辑步 |
 | egui 中文字体嵌入体积 | 中 | 用 subset font 仅嵌入常用字 |
-| 协议版本不兼容 | 中 | Hello.version 校验 + 大厅删档重建 |
+| 协议版本不兼容 | 中 | `world.json.storage_version` 校验 + migrations 数组（详见 [`features/persistence.md`](features/persistence.md) §十） |
 | Cloudflare Workers 配额 | 低 | 信令通量极小，难以触顶 |
 | 主机退出导致房间销毁 | 中 | 文档说明，v2 stretch goal 实现迁移 |
 

@@ -102,17 +102,17 @@
   - 信令 WebSocket 消息收发（连接建立 / 断开 / Offer/Answer / ICE）
   - WebRTC PeerConnection 状态机推进
   - DataChannel `onmessage` 回调（解码消息 → 推入 mpsc 通道）
-  - IndexedDB 读写（Host：启动加载历史 / 周期性 flush）
+  - OPFS 读写（Host：启动 prime / 按需 load / 周期性 flush，详见 [`features/persistence.md`](features/persistence.md)）
   - 远端 Chunk 解码 + 网格化任务入队
 - **调度**：通过 `wasm_bindgen_futures::spawn_local` 启动；与渲染/逻辑帧通过 `futures-channel` mpsc 通信
-- **重要约束**：异步任务**不得阻塞主循环**，所有 await 点必须是真异步（如 IndexedDB 请求、WebSocket 消息），不要在 await 之间做长 CPU 工作
+- **重要约束**：异步任务**不得阻塞主循环**，所有 await 点必须是真异步（如 OPFS 文件读、WebSocket 消息），不要在 await 之间做长 CPU 工作
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │                       单线程协作调度示意                              │
 │                                                                    │
 │  ┌────────────┐                                                    │
-│  │ Browser    │  RAF 回调       事件回调（WebRTC/IndexedDB/WS）       │
+│  │ Browser    │  RAF 回调       事件回调（WebRTC/OPFS/WS）              │
 │  │ Event Loop │ ────────┐       ────────┐                          │
 │  └────────────┘         │              │                          │
 │                         ↓              ↓                          │
@@ -120,7 +120,7 @@
 │                │ render_frame() │ │ async tasks    │               │
 │                │  - 输入        │ │  - signaling   │               │
 │                │  - 相机        │ │  - peer state  │               │
-│                │  - logic tick  │ │  - IndexedDB   │               │
+│                │  - logic tick  │ │  - OPFS        │               │
 │                │    (n 次)      │ │  - mesh job    │               │
 │                │  - mesh budget │ │    (decode)    │               │
 │                │  - egui        │ └────────────────┘               │
@@ -177,7 +177,7 @@ VoxWeb/
 │   │       ├── world.rs        # World + 玩家表 + tick
 │   │       ├── terrain.rs      # Perlin 地形
 │   │       ├── physics.rs      # 物理仲裁
-│   │       └── persistence.rs  # IndexedDB 触发逻辑（具体读写在 client 异步任务中）
+│   │       └── persistence.rs  # OPFS flush 触发逻辑（具体读写在 client 异步任务中）
 │   ├── net/                    # P2P 网络层
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -204,7 +204,7 @@ VoxWeb/
 │           │   ├── pause.rs    # 暂停菜单
 │           │   ├── chat.rs     # 聊天
 │           │   └── players.rs  # 玩家列表/名牌
-│           └── storage.rs      # IndexedDB 异步包装（idb crate）
+│           └── storage.rs      # OPFS 异步包装（WorldStorage trait + OpfsStorage 实现）
 └── signaling/                  # 独立部署（TS 项目）
     ├── wrangler.toml
     ├── package.json

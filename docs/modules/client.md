@@ -13,7 +13,7 @@
 - 主循环（RAF + 固定 60Hz 逻辑帧累加器）
 - 输入（键盘/鼠标）、相机控制、本地物理预测、DDA 射线
 - UI（egui）— 大厅、HUD、暂停、聊天、玩家列表、名牌
-- IndexedDB 持久化的具体实现（`idb` crate）
+- OPFS 持久化的具体实现（`web_sys::FileSystemDirectoryHandle` + palette/RLE 压缩）
 - 网格化任务调度（mesh job queue）
 
 `client` crate 的 cargo crate-type 设为 `["cdylib", "rlib"]`，便于 wasm-bindgen 输出。
@@ -27,7 +27,7 @@
 | **Phase 2 ✅** | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
 | Phase 3 | Walk 模式 + `physics.rs` + `raycast.rs`；挖放 hotbar |
 | Phase 4 | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote` |
-| Phase 5 | `prediction.rs` / `interp.rs` 实装；`storage.rs` IndexedDB；远端玩家身体渲染 |
+| Phase 5 | `prediction.rs` / `interp.rs` 实装；`storage.rs` OPFS 最小可用版（启动 prime + 按需 load + 1s flush）；远端玩家身体渲染 |
 | Phase 6 | `ui::chat / players / pause` 完整；EscMenu / ChatOpen 状态 |
 
 下面 §4 起的 `App` 完整结构是**Phase 5+ 终态**。Phase 2 实际仅需子集，标注见 §4。
@@ -48,7 +48,7 @@ crates/client/src/
 ├── raycast.rs          [Phase 3] DDA 射线
 ├── prediction.rs       [Phase 5] 客户端预测协调
 ├── interp.rs           [Phase 5] 远端玩家位置插值
-├── storage.rs          [Phase 5] IndexedDB 异步包装
+├── storage.rs          [Phase 5] OPFS 异步包装（`WorldStorage` trait + `OpfsStorage` 实现）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
     ├── lobby.rs        [Phase 2] 大厅：单机模式按钮 + 种子（Phase 4 加 Host/Join）
@@ -176,7 +176,7 @@ pub struct Game {
     pub prediction: Prediction,        // [Phase 5]
     pub interp: PlayerInterp,          // [Phase 5]
     pub world_view: WorldView,         // [Phase 5] Remote 模式用；Local 直接 borrow server.world
-    pub storage: IndexedDbStorage,     // [Phase 5]
+    pub storage: OpfsStorage,          // [Phase 5] 实现 WorldStorage trait
     pub chat: ChatHistory,             // [Phase 6]
 }
 
@@ -282,7 +282,7 @@ fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
     self.mesh_jobs.run_until_budget(MESH_BUDGET_MS, &mut self.renderer);
     let egui_output = self.build_ui();
     self.renderer.render_frame(&self.frame_data(), egui_output);
-    self.maybe_flush_persistence();      // 每 30 秒 IndexedDB 写入
+    self.maybe_flush_persistence();      // 每 1 秒触发一次 OPFS 写入（snapshot dirty + 异步 save）
 }
 ```
 
@@ -460,19 +460,24 @@ impl PlayerInterp {
 ### 6.12 `storage.rs`（[Phase 5]）
 
 ```rust
-pub struct IndexedDbStorage {
-    db: idb::Database,
+#[async_trait::async_trait(?Send)]
+pub trait WorldStorage {
+    async fn open(room_id: &str, seed: u64) -> Result<Self, StorageError> where Self: Sized;
+    async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError>;
+    async fn load_chunk(&self, pos: ChunkPos) -> Result<Option<Vec<u8>>, StorageError>;
+    async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError>;
+    async fn delete_world(&self) -> Result<(), StorageError>;
+    async fn quota(&self) -> Option<QuotaInfo>;
 }
 
-impl IndexedDbStorage {
-    pub async fn open(room_id: &str) -> Result<Self, idb::Error>;
-    pub async fn save_chunks(&self, chunks: Vec<(ChunkPos, Chunk)>) -> Result<(), idb::Error>;
-    pub async fn load_chunk(&self, pos: ChunkPos) -> Result<Option<Chunk>, idb::Error>;
-    pub async fn delete_world(&self) -> Result<(), idb::Error>;
+pub struct OpfsStorage {
+    root: web_sys::FileSystemDirectoryHandle,         // opfs:/voxweb/<world_key>/
+    chunks_dir: web_sys::FileSystemDirectoryHandle,
+    world_key: String,
 }
 ```
 
-**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后通过 `futures-channel::oneshot` 把结果投递回主循环。
+**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后通过 `futures-channel::oneshot` 把结果投递回主循环。chunk 字节流的 encode/decode 由 [`crates/core/src/chunk.rs`](../../crates/core/src/chunk.rs) 的 `encode` / `decode`（palette + RLE）负责，storage 层只处理原始字节。
 
 详见 [`features/persistence.md`](../features/persistence.md)。
 
@@ -546,7 +551,7 @@ pub struct AppSettings {
 }
 ```
 
-存放：localStorage（轻量配置）；不进 IndexedDB（IndexedDB 留给世界数据）。
+存放：localStorage（轻量配置）；不进 OPFS（OPFS 留给世界数据）。
 
 ---
 
