@@ -499,6 +499,58 @@
             }
         }
     </style>
+
+    <!--
+      浏览器能力前置检测（landing 轻量版）。
+      与 start.html 中的同步检测一致；不在此阻止跳转，而是把"Start"按钮置为不可用并提示。
+      最终拦截仍在 start.html 中完成（document.write + window.stop 阻止 wasm 加载）。
+    -->
+    <script>
+      (function () {
+        if (new URLSearchParams(location.search).get('force') === '1') return;
+
+        var checks = {
+          wasm: function () {
+            return typeof WebAssembly === 'object'
+                && typeof WebAssembly.instantiate === 'function';
+          },
+          webgpu: function () { return 'gpu' in navigator; },
+          opfs: function () {
+            return !!(navigator.storage
+                   && typeof navigator.storage.getDirectory === 'function');
+          },
+          webrtc: function () {
+            return typeof RTCPeerConnection === 'function'
+                && 'createDataChannel' in RTCPeerConnection.prototype;
+          },
+          websocket: function () { return typeof WebSocket === 'function'; },
+          pointerlock: function () { return 'requestPointerLock' in HTMLElement.prototype; }
+        };
+        var required = ['wasm', 'webgpu', 'opfs', 'webrtc', 'websocket', 'pointerlock'];
+        var missing = required.filter(function (k) { return !checks[k](); });
+
+        // 全部满足 或 仅 WebRTC 缺失（单机仍可玩）→ 不干预 UI
+        if (!missing.length) return;
+        if (missing.length === 1 && missing[0] === 'webrtc') return;
+
+        document.addEventListener('DOMContentLoaded', function () {
+          var btn = document.querySelector('.start-button');
+          if (!btn) return;
+          btn.textContent = 'Unsupported Browser';
+          btn.title = '缺失：' + missing.join(', ');
+          btn.style.opacity = '0.55';
+          btn.style.cursor = 'not-allowed';
+          btn.addEventListener('click', function (e) {
+            e.preventDefault();
+            alert(
+              '您的浏览器缺少 VoxWeb 所需能力：\n  ' + missing.join(', ') +
+              '\n\n推荐 Chrome / Edge 113+、Firefox 115+（WebGPU 需 nightly）、Safari 17+。' +
+              '\n仅供开发调试可访问 /start?force=1 跳过检测。'
+            );
+          });
+        });
+      })();
+    </script>
 </head>
 <body>
 

@@ -33,7 +33,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [x] 设置 `console_error_panic_hook` + `tracing-wasm`
 - [x] CI：`cargo check --target wasm32-unknown-unknown` + `cargo fmt --check`
 - [x] `signaling/` TS 项目初始化（空 worker，仅返回 200）
-- [ ] **浏览器能力前置检测（wasm 加载之前）**：在 `index.html` / `start.html` 内联检测脚本（< 2 KB gz），检查 WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；缺失项展示降级页面并阻止 wasm 加载；仅 WebRTC 缺失时提供"仅单机模式"入口。详见 [`reference.md` §浏览器能力前置检测](reference.md#浏览器能力前置检测wasm-加载之前) 与 [`features/persistence.md` §十五](features/persistence.md#十五浏览器能力前置检测)
+- [x] **浏览器能力前置检测（wasm 加载之前）**：在 `index.html` / `start.html` 内联检测脚本（< 2 KB gz），检查 WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；缺失项展示降级页面并阻止 wasm 加载；仅 WebRTC 缺失时提供"仅单机模式"入口（`window.__VOXWEB_FORCE_LOCAL_ONLY = true`）。详见 [`reference.md` §浏览器能力前置检测](reference.md#浏览器能力前置检测wasm-加载之前) 与 [`features/persistence.md` §十五](features/persistence.md#十五浏览器能力前置检测)。回填日期：2026-05-12（见 [PHASE_0_DONE.md](../PHASE_0_DONE.md) §回填）
 
 ### 验证
 - `trunk serve` → 浏览器打开 http://localhost:8080 → 看到纯色背景 + 居中文字

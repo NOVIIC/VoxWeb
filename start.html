@@ -4,9 +4,117 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="signaling-url" content="wss://signal.voxweb.example.com" />
+  <title>VoxWeb</title>
+
+  <!--
+    浏览器能力前置检测。
+    必须在 trunk 注入的 `<script type="module">` 解析之前同步运行；
+    不通过时 `window.stop()` 中止 wasm 预加载并用 `document.write` 替换整个文档。
+    详见 docs/features/persistence.md §十五 / docs/reference.md §浏览器能力前置检测。
+  -->
+  <script>
+    (function () {
+      // 开发模式跳过：URL 加 ?force=1
+      if (new URLSearchParams(location.search).get('force') === '1') {
+        return;
+      }
+
+      var checks = {
+        wasm: function () {
+          return typeof WebAssembly === 'object'
+              && typeof WebAssembly.instantiate === 'function';
+        },
+        webgpu: function () {
+          return 'gpu' in navigator;
+        },
+        opfs: function () {
+          return !!(navigator.storage
+                 && typeof navigator.storage.getDirectory === 'function');
+        },
+        webrtc: function () {
+          return typeof RTCPeerConnection === 'function'
+              && 'createDataChannel' in RTCPeerConnection.prototype;
+        },
+        websocket: function () {
+          return typeof WebSocket === 'function';
+        },
+        pointerlock: function () {
+          return 'requestPointerLock' in HTMLElement.prototype;
+        }
+      };
+
+      var required = ['wasm', 'webgpu', 'opfs', 'webrtc', 'websocket', 'pointerlock'];
+      var missing = required.filter(function (k) { return !checks[k](); });
+
+      // 全部满足：放行后续 trunk 注入的 wasm 加载
+      if (missing.length === 0) return;
+
+      // 仅 WebRTC 缺失：允许进入单机模式，仅设 flag 供 Rust 端读取
+      if (missing.length === 1 && missing[0] === 'webrtc') {
+        window.__VOXWEB_FORCE_LOCAL_ONLY = true;
+        return;
+      }
+
+      var messages = {
+        wasm:        '不支持 WebAssembly。请升级浏览器。',
+        webgpu:      '不支持 WebGPU。Firefox 用户需切换 nightly；Safari 需升级到 17 以上。',
+        opfs:        '不支持 OPFS（存档系统所需）。请升级到 Chrome / Edge 102+、Firefox 111+、Safari 17+。',
+        webrtc:      '不支持 WebRTC。无法多人联机。',
+        websocket:   '不支持 WebSocket。无法连接信令服务器。',
+        pointerlock: '不支持指针锁。第一人称视角无法启用。'
+      };
+
+      var rows = missing.map(function (k) {
+        return '<tr><td class="key">' + k + '</td><td class="msg">' + messages[k] + '</td></tr>';
+      }).join('');
+
+      var html = [
+        '<!DOCTYPE html>',
+        '<html lang="zh-Hans"><head>',
+          '<meta charset="UTF-8">',
+          '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+          '<title>VoxWeb 不兼容此浏览器</title>',
+          '<style>',
+            'html, body { margin: 0; min-height: 100vh; background: #1a1a2e;',
+            '             color: #e8e3da; font-family: "Segoe UI", "Helvetica Neue", sans-serif; }',
+            'body { display: flex; align-items: center; justify-content: center; padding: 24px; }',
+            '.box { max-width: 640px; width: 100%; padding: 40px;',
+            '       background: rgba(255,255,255,0.04);',
+            '       border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; }',
+            'h1 { margin: 0 0 8px; font-size: 1.4rem; font-weight: 500; color: #ff8a8a; }',
+            '.lead { margin: 0 0 20px; color: #9a9290; line-height: 1.6; }',
+            'table { width: 100%; border-collapse: collapse; margin: 0 0 20px; font-size: 0.9rem; }',
+            'td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }',
+            'td.key { width: 110px; color: #ffb37a; font-family: ui-monospace, Consolas, monospace; font-weight: 600; }',
+            'td.msg { color: #d6cfc6; line-height: 1.5; }',
+            '.hint { margin: 0; font-size: 0.85rem; color: #8a8380; line-height: 1.6; }',
+            '.hint + .hint { margin-top: 10px; }',
+            '.hint a { color: #a6b3d6; text-decoration: none; }',
+            '.hint a:hover { text-decoration: underline; }',
+            '.hint strong { color: #c0bab1; font-weight: 500; }',
+          '</style>',
+        '</head><body>',
+        '<div class="box">',
+          '<h1>很抱歉，你的浏览器不支持运行 VoxWeb</h1>',
+          '<p class="lead">VoxWeb 需要现代浏览器的以下能力：</p>',
+          '<table>', rows, '</table>',
+          '<p class="hint">推荐使用 <strong>Chrome / Edge ≥ 113</strong>、<strong>Firefox ≥ 115（WebGPU 需 nightly）</strong>、<strong>Safari ≥ 17</strong>。移动浏览器暂不在支持范围内。</p>',
+          '<p class="hint">仅供开发调试：<a href="?force=1">跳过检测继续</a>（不保证任何功能可用）。</p>',
+        '</div>',
+        '</body></html>'
+      ].join('');
+
+      // 中止 trunk 已发起的预加载请求（含 wasm 二进制）
+      window.stop();
+      // 同步替换整个文档：解析器到达 trunk 注入的 <script> 之前完成
+      document.open();
+      document.write(html);
+      document.close();
+    })();
+  </script>
+
   <!-- 构建时复制 index.html -->
   <link data-trunk rel="copy-file" href="index.html" />
-  <title>VoxWeb</title>
 
   <!-- trunk 入口：编译期注入 wasm-bindgen 生成的 JS 胶水 + WASM 二进制 -->
   <link data-trunk rel="rust" href="crates/client/Cargo.toml" data-type="main"
