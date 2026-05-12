@@ -529,24 +529,42 @@
         var required = ['wasm', 'webgpu', 'opfs', 'webrtc', 'websocket', 'pointerlock'];
         var missing = required.filter(function (k) { return !checks[k](); });
 
-        // 全部满足 或 仅 WebRTC 缺失（单机仍可玩）→ 不干预 UI
-        if (!missing.length) return;
-        if (missing.length === 1 && missing[0] === 'webrtc') return;
+        // 检测移动设备：Android / iOS 手机和平板
+        // 现代 Android Chrome 虽通过所有 API 检测，但游戏无触屏控件，不适用于移动端
+        var ua = navigator.userAgent || '';
+        var isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua)
+          || (navigator.maxTouchPoints > 2 && /Macintosh/i.test(ua));
+
+        // 全部满足 + 非移动设备 → 不干预 UI
+        if (!missing.length && !isMobile) return;
+        // 仅 WebRTC 缺失 + 非移动设备（单机仍可玩）→ 不干预 UI
+        if (!isMobile && missing.length === 1 && missing[0] === 'webrtc') return;
 
         document.addEventListener('DOMContentLoaded', function () {
           var btn = document.querySelector('.start-button');
           if (!btn) return;
           btn.textContent = 'Unsupported Browser';
-          btn.title = '缺失：' + missing.join(', ');
+          btn.title = isMobile ? '移动设备暂不支持' : '缺失：' + missing.join(', ');
           btn.style.opacity = '0.55';
           btn.style.cursor = 'not-allowed';
           btn.addEventListener('click', function (e) {
             e.preventDefault();
-            alert(
-              '您的浏览器缺少 VoxWeb 所需能力：\n  ' + missing.join(', ') +
-              '\n\n推荐 Chrome / Edge 113+、Firefox 115+（WebGPU 需 nightly）、Safari 17+。' +
-              '\n仅供开发调试可访问 /start?force=1 跳过检测。'
-            );
+            if (isMobile && !missing.length) {
+              alert(
+                'VoxWeb 暂不支持移动端浏览器。\n\n' +
+                '游戏需要键盘和鼠标操作，触屏控件尚未实现。\n' +
+                '请使用桌面 Chrome / Edge 113+ 打开本页面。'
+              );
+            } else {
+              var lines = [];
+              if (isMobile) lines.push('移动设备（触屏操作未支持）');
+              lines = lines.concat(missing);
+              alert(
+                '您的浏览器缺少 VoxWeb 所需能力：\n  ' + lines.join(', ') +
+                '\n\n推荐 Chrome / Edge 113+、Firefox 115+（WebGPU 需 nightly）、Safari 17+。' +
+                '\n仅供开发调试可访问 /start?force=1 跳过检测。'
+              );
+            }
           });
         });
       })();

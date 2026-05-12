@@ -46,11 +46,17 @@
       var required = ['wasm', 'webgpu', 'opfs', 'webrtc', 'websocket', 'pointerlock'];
       var missing = required.filter(function (k) { return !checks[k](); });
 
-      // 全部满足：放行后续 trunk 注入的 wasm 加载
-      if (missing.length === 0) return;
+      // 检测移动设备：Android / iOS 手机和平板
+      // 现代 Android Chrome 虽通过所有 API 检测，但游戏无触屏控件，不适用于移动端
+      var ua = navigator.userAgent || '';
+      var isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua)
+        || (navigator.maxTouchPoints > 2 && /Macintosh/i.test(ua));
 
-      // 仅 WebRTC 缺失：允许进入单机模式，仅设 flag 供 Rust 端读取
-      if (missing.length === 1 && missing[0] === 'webrtc') {
+      // 全部满足 + 非移动设备：放行后续 trunk 注入的 wasm 加载
+      if (missing.length === 0 && !isMobile) return;
+
+      // 仅 WebRTC 缺失 + 非移动设备：允许进入单机模式，仅设 flag 供 Rust 端读取
+      if (!isMobile && missing.length === 1 && missing[0] === 'webrtc') {
         window.__VOXWEB_FORCE_LOCAL_ONLY = true;
         return;
       }
@@ -64,7 +70,13 @@
         pointerlock: '不支持指针锁。第一人称视角无法启用。'
       };
 
-      var rows = missing.map(function (k) {
+      // 构建检测失败行：移动设备优先显示
+      var rowKeys = missing.slice();
+      if (isMobile) rowKeys.unshift('mobile');
+      var rows = rowKeys.map(function (k) {
+        if (k === 'mobile') {
+          return '<tr><td class="key">mobile</td><td class="msg">检测到移动设备。VoxWeb 暂不支持触屏操作，请使用桌面浏览器。</td></tr>';
+        }
         return '<tr><td class="key">' + k + '</td><td class="msg">' + messages[k] + '</td></tr>';
       }).join('');
 
@@ -98,7 +110,7 @@
           '<h1>很抱歉，你的浏览器不支持运行 VoxWeb</h1>',
           '<p class="lead">VoxWeb 需要现代浏览器的以下能力：</p>',
           '<table>', rows, '</table>',
-          '<p class="hint">推荐使用 <strong>Chrome / Edge ≥ 113</strong>、<strong>Firefox ≥ 115（WebGPU 需 nightly）</strong>、<strong>Safari ≥ 17</strong>。移动浏览器暂不在支持范围内。</p>',
+          '<p class="hint">推荐使用桌面端 <strong>Chrome / Edge ≥ 113</strong>、<strong>Firefox ≥ 115（WebGPU 需 nightly）</strong>、<strong>Safari ≥ 17</strong>。移动端浏览器暂不支持（需要键盘与鼠标操作）。</p>',
           '<p class="hint">仅供开发调试：<a href="?force=1">跳过检测继续</a>（不保证任何功能可用）。</p>',
         '</div>',
         '</body></html>'
