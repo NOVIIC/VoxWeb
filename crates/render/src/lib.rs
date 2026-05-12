@@ -21,9 +21,11 @@ use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use voxweb_core::ChunkPos;
+use voxweb_core::chunk::Position;
 
 use crate::chunk_mesh::ChunkMeshCpu;
 use crate::passes::opaque::{ChunkMeshGpu, GlobalsUniform, OpaquePass};
+use crate::passes::selection::{SelectionGlobals, SelectionPass};
 
 /// 深度纹理格式（与 OpaquePass 中的 DepthStencilState 对齐）。
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -42,6 +44,7 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
 
     opaque_pass: OpaquePass,
+    selection_pass: SelectionPass,
     chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>,
 }
 
@@ -54,6 +57,7 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth(&ctx.device, w, h);
         let opaque_pass = OpaquePass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
+        let selection_pass = SelectionPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
 
         Ok(Self {
             device: ctx.device,
@@ -65,6 +69,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             opaque_pass,
+            selection_pass,
             chunk_meshes: HashMap::new(),
         })
     }
@@ -271,6 +276,57 @@ impl Renderer {
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.draw(0..mesh.vertex_count, 0..1);
         }
+    }
+
+    /// 渲染选中方块的线框。`block_pos = None` 时跳过（玩家未瞄准任何方块）。
+    /// 必须在 `render_world` 之后调用，共享同一份 depth view 但不写深度。
+    pub fn render_selection(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        view_proj: Mat4,
+        block_pos: Option<Position>,
+    ) {
+        let Some(pos) = block_pos else {
+            return;
+        };
+        let globals = SelectionGlobals {
+            view_proj: view_proj.to_cols_array_2d(),
+            block_origin: [pos.x as f32, pos.y as f32, pos.z as f32, 0.0],
+        };
+        self.queue.write_buffer(
+            &self.selection_pass.globals_buffer,
+            0,
+            bytemuck::bytes_of(&globals),
+        );
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("selection_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.selection_pass.pipeline);
+        pass.set_bind_group(0, &self.selection_pass.globals_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.selection_pass.vertex_buffer.slice(..));
+        pass.draw(0..SelectionPass::VERTEX_COUNT, 0..1);
     }
 }
 

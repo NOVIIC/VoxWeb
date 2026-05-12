@@ -1,13 +1,13 @@
 //! VoxWeb 客户端入口（cdylib）。
 //!
-//! Phase 2：
-//! - Lobby UI：单机模式按钮 + 种子输入
-//! - InGame：Local 模式 Server + NetEndpoint::Local + ChunkLoader 滚动 + MeshJobQueue
-//! - 主循环按 AppState 分流：Lobby（仅 egui） / InGame（完整 server tick + 网格化 + 渲染）
+//! Phase 3：
+//! - InGame：物理（Walk/Fly）、DDA 射线、挖放动作、Hotbar、选中线框、ActionAck rollback、PlayerInput 上报。
+//! - 主循环按 AppState 分流：Lobby（仅 egui） / InGame（完整 server tick + 物理 + 网格化 + 渲染）。
 
 pub mod app;
 pub mod camera;
 pub mod chunk_loader;
+pub mod hotbar;
 pub mod input;
 pub mod interp;
 pub mod mesh_jobs;
@@ -24,12 +24,22 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+use voxweb_core::block::BlockID;
+use voxweb_core::chunk::Position;
 use voxweb_core::protocol::{ClientMessage, ServerMessage};
 use voxweb_render::Renderer;
 
 use crate::app::{AppState, Game, GameSettings};
+use crate::camera::CameraMode;
+use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
+use crate::mesh_jobs::MeshPriority;
+use crate::prediction::{PendingAction, PendingKind};
+use crate::raycast::raycast;
 use crate::ui::lobby::{LobbyAction, LobbyState, draw_lobby};
+
+/// 玩家眼睛到目标方块的最大射程（与 server::physics::MAX_REACH 对齐）。
+const MAX_REACH: f32 = 6.0;
 
 /// 全局 App：跨 state 持有 renderer / egui / input；InGame 时持有 Game。
 struct App {
@@ -63,7 +73,7 @@ pub async fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     tracing_wasm::set_as_global_default();
 
-    log::info!("VoxWeb 启动（Phase 2：体素单人）");
+    log::info!("VoxWeb 启动（Phase 3：物理与交互）");
 
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("无 window"))?;
     let document = window
@@ -194,7 +204,7 @@ fn install_event_listeners(
                 return;
             }
             if let Some(key) = map_key(&e.code()) {
-                input_clone.borrow_mut().on_key_down(key);
+                input_clone.borrow_mut().on_key_down(key, now_ms());
             }
             if input_clone.borrow().pointer_locked {
                 e.prevent_default();
@@ -243,16 +253,20 @@ fn install_event_listeners(
     }
 
     // —— 鼠标按下 ——
-    // InGame：转给 InputState（Phase 3 才用）；Lobby：转 egui PointerButton 事件。
+    // InGame：转给 InputState；Lobby：转 egui PointerButton 事件。
     {
         let input_clone = input.clone();
         let egui_events_clone = egui_events.clone();
         let app_clone = app.clone();
         let on_mousedown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            input_clone.borrow_mut().on_mouse_down(e.button() as u16);
-            if app_clone.borrow().state != AppState::InGame
-                && let Some(button) = map_pointer_button(e.button())
-            {
+            // 防止右键弹出浏览器上下文菜单（仅在 InGame 锁定指针时）
+            let is_ingame = app_clone.borrow().state == AppState::InGame;
+            if is_ingame {
+                input_clone.borrow_mut().on_mouse_down(e.button() as u16);
+                if e.button() == 2 {
+                    e.prevent_default();
+                }
+            } else if let Some(button) = map_pointer_button(e.button()) {
                 egui_events_clone
                     .borrow_mut()
                     .push(egui::Event::PointerButton {
@@ -268,14 +282,16 @@ fn install_event_listeners(
         on_mousedown.forget();
     }
 
-    // —— 鼠标松开（只为 egui 服务；InGame 端目前不区分 down/up）——
+    // —— 鼠标松开：InGame 转给 InputState、Lobby 转 egui ——
     {
+        let input_clone = input.clone();
         let egui_events_clone = egui_events.clone();
         let app_clone = app.clone();
         let on_mouseup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            if app_clone.borrow().state != AppState::InGame
-                && let Some(button) = map_pointer_button(e.button())
-            {
+            let is_ingame = app_clone.borrow().state == AppState::InGame;
+            if is_ingame {
+                input_clone.borrow_mut().on_mouse_up(e.button() as u16);
+            } else if let Some(button) = map_pointer_button(e.button()) {
                 egui_events_clone
                     .borrow_mut()
                     .push(egui::Event::PointerButton {
@@ -289,6 +305,21 @@ fn install_event_listeners(
         document
             .add_event_listener_with_callback("mouseup", on_mouseup.as_ref().unchecked_ref())?;
         on_mouseup.forget();
+    }
+
+    // —— 阻止右键上下文菜单（InGame 时）——
+    {
+        let app_clone = app.clone();
+        let on_contextmenu = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            if app_clone.borrow().state == AppState::InGame {
+                e.prevent_default();
+            }
+        });
+        canvas.add_event_listener_with_callback(
+            "contextmenu",
+            on_contextmenu.as_ref().unchecked_ref(),
+        )?;
+        on_contextmenu.forget();
     }
 
     Ok(())
@@ -317,6 +348,15 @@ fn map_key(code: &str) -> Option<winit::keyboard::KeyCode> {
         "ShiftLeft" => KeyCode::ShiftLeft,
         "ShiftRight" => KeyCode::ShiftRight,
         "Escape" => KeyCode::Escape,
+        "Digit1" => KeyCode::Digit1,
+        "Digit2" => KeyCode::Digit2,
+        "Digit3" => KeyCode::Digit3,
+        "Digit4" => KeyCode::Digit4,
+        "Digit5" => KeyCode::Digit5,
+        "Digit6" => KeyCode::Digit6,
+        "Digit7" => KeyCode::Digit7,
+        "Digit8" => KeyCode::Digit8,
+        "Digit9" => KeyCode::Digit9,
         _ => return None,
     })
 }
@@ -326,7 +366,7 @@ fn map_key(code: &str) -> Option<winit::keyboard::KeyCode> {
 // ============================================================
 
 fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
-    let _dt = update_clock(app);
+    let dt = update_clock(app);
 
     // 同步 canvas 尺寸
     let (cw, ch) = {
@@ -341,7 +381,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
     // 按 state 分流
     let state = app.borrow().state.clone();
     match state {
-        AppState::InGame => render_game_frame(app, _dt, cw, ch),
+        AppState::InGame => render_game_frame(app, dt, cw, ch),
         // Loading / Lobby / 其它态：渲染大厅 UI（其它态待后续 Phase）
         _ => render_lobby_frame(app, cw, ch),
     }
@@ -506,8 +546,8 @@ fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>) {
         version: 1,
     });
 
-    // 把 spawn 位置塞进相机（先看一眼地形）
-    game.camera.position = glam::Vec3::new(8.0, 100.0, 8.0);
+    // 相机 yaw/pitch 用默认值（physics 驱动 position）
+    game.camera.position = game.physics.eye_position();
     game.camera.pitch = -0.4;
 
     let mut a = app.borrow_mut();
@@ -557,16 +597,19 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         let Some(game) = a.game.as_mut() else {
             return Ok(());
         };
+        let mut msgs = Vec::new();
         while let Some(msg) = game.net.try_recv_server_message() {
+            msgs.push(msg);
+        }
+        for msg in msgs {
             apply_server_message(game, msg);
         }
     }
 
-    // —— 3. 输入 → 相机 + 4. 逻辑帧 ——
-    let (camera_pos, view_proj, fps_display, mesh_budget) = {
+    // —— 3. 输入 → 相机朝向 + 物理 + 动作 ——
+    let (camera_pos, view_proj, fps_display, mesh_budget, current_hit_pos) = {
         let mut a = app.borrow_mut();
         let fps_display = a.fps_display;
-        // 先克隆 input 的 Rc，再 mut-borrow game，避免对 `a` 的双重借用
         let input_rc = a.input.clone();
         let Some(game) = a.game.as_mut() else {
             return Ok(());
@@ -574,6 +617,8 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         game.camera.aspect = cw as f32 / ch.max(1) as f32;
 
         let mut input = input_rc.borrow_mut();
+
+        // 鼠标转向
         if input.pointer_locked && (input.mouse_dx != 0.0 || input.mouse_dy != 0.0) {
             game.camera.apply_mouse(
                 input.mouse_dx,
@@ -581,21 +626,80 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
                 game.settings.mouse_sensitivity,
             );
         }
-        game.camera
-            .apply_fly_input(&input, game.settings.fly_speed, dt);
-        input.reset_delta();
-        drop(input);
 
+        // Hotbar 切换
+        if let Some(idx) = input.hotbar_request.take() {
+            game.hotbar.select(idx);
+        }
+
+        // 双击空格切换 Fly/Walk
+        if input.fly_toggle_pending {
+            game.physics.toggle_mode();
+            log::info!("模式切换 → {:?}", game.physics.mode);
+        }
+
+        // 物理 step（指针锁定状态下才接受 WASD 输入；否则只跑重力）
+        let world_ref = game.server.clone();
+        {
+            let server_borrow = world_ref.borrow();
+            let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
+            // 不锁定时不接受方向输入，避免后台移动；但仍然跑物理（让重力工作）
+            if input.pointer_locked {
+                game.physics.step(&getter, &game.camera, &input, dt);
+            } else {
+                let neutral = neutral_input(&input);
+                game.physics.step(&getter, &game.camera, &neutral, dt);
+            }
+        }
+        game.camera.position = game.physics.eye_position();
+
+        // 60Hz 逻辑帧
         game.frame_clock.accumulate(dt);
+        let mut steps_consumed: u32 = 0;
         while game.frame_clock.consume_logic_step() {
             game.server.borrow_mut().tick();
+            steps_consumed += 1;
         }
+
+        // 每个 logic step 上报一条 PlayerInput（Phase 3：让 server 知道玩家位置以做范围/重叠校验）
+        if steps_consumed > 0 && game.entity_id != 0 {
+            let tick = game.server.borrow().tick;
+            game.net.send_client_message(ClientMessage::PlayerInput {
+                tick,
+                position: game.physics.feet_position,
+                yaw: game.camera.yaw,
+                pitch: game.camera.pitch,
+            });
+        }
+
+        // DDA 射线检测（每帧）
+        let hit = {
+            let server_borrow = world_ref.borrow();
+            let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
+            raycast(
+                game.camera.position,
+                game.camera.forward(),
+                MAX_REACH,
+                &getter,
+            )
+        };
+        game.current_hit = hit;
+
+        // 挖放动作（仅在指针锁定时启用，防止 lobby/UI 误触）
+        if input.pointer_locked {
+            dispatch_actions(game, &input);
+        }
+
+        // 帧末清掉边沿
+        input.reset_delta();
+        drop(input);
 
         (
             game.camera.position,
             game.camera.vp_matrix(),
             fps_display,
             game.settings.mesh_budget_ms,
+            game.current_hit.map(|h| h.pos),
         )
     };
 
@@ -642,37 +746,32 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
             )),
             ..Default::default()
         };
-        let yaw_deg = a
-            .game
-            .as_ref()
-            .map(|g| g.camera.yaw.to_degrees())
-            .unwrap_or(0.0);
-        let pitch_deg = a
-            .game
-            .as_ref()
-            .map(|g| g.camera.pitch.to_degrees())
-            .unwrap_or(0.0);
-        let pos = a
-            .game
-            .as_ref()
-            .map(|g| g.camera.position)
-            .unwrap_or_default();
-        let loaded_chunks = a
-            .game
-            .as_ref()
-            .map(|g| g.chunk_loader.loaded.len())
-            .unwrap_or(0);
-        let mesh_pending = a.game.as_ref().map(|g| g.mesh_jobs.len()).unwrap_or(0);
+        let game = a.game.as_ref();
+        let yaw_deg = game.map(|g| g.camera.yaw.to_degrees()).unwrap_or(0.0);
+        let pitch_deg = game.map(|g| g.camera.pitch.to_degrees()).unwrap_or(0.0);
+        let pos = game.map(|g| g.camera.position).unwrap_or_default();
+        let loaded_chunks = game.map(|g| g.chunk_loader.loaded.len()).unwrap_or(0);
+        let mesh_pending = game.map(|g| g.mesh_jobs.len()).unwrap_or(0);
+        let mode = game.map(|g| g.physics.mode).unwrap_or(CameraMode::Walk);
+        let on_ground = game.map(|g| g.physics.on_ground).unwrap_or(false);
+        let hotbar_items = game.map(|g| g.hotbar.items).unwrap_or([BlockID::AIR; 9]);
+        let hotbar_selected = game.map(|g| g.hotbar.selected).unwrap_or(0);
         let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
             draw_hud(
                 ui.ctx(),
-                fps_display,
-                (pos.x, pos.y, pos.z),
-                yaw_deg,
-                pitch_deg,
-                pointer_locked,
-                loaded_chunks,
-                mesh_pending,
+                HudData {
+                    fps: fps_display,
+                    pos: (pos.x, pos.y, pos.z),
+                    yaw_deg,
+                    pitch_deg,
+                    pointer_locked,
+                    loaded_chunks,
+                    mesh_pending,
+                    mode,
+                    on_ground,
+                    hotbar_items,
+                    hotbar_selected,
+                },
             );
         });
         let ppp = full_output.pixels_per_point;
@@ -707,6 +806,10 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         // 世界 Pass
         a.renderer
             .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+
+        // 选中方块线框（命中时）
+        a.renderer
+            .render_selection(&mut encoder, &view, view_proj, current_hit_pos);
 
         // egui Pass
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -759,6 +862,92 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
     Ok(())
 }
 
+/// 把方向输入清零的输入快照副本（用于失去指针锁时仍跑物理但不响应方向）。
+fn neutral_input(orig: &InputState) -> InputState {
+    let mut n = orig.clone();
+    n.forward = false;
+    n.backward = false;
+    n.left = false;
+    n.right = false;
+    n.jump_held = false;
+    n.jump_just_pressed = false;
+    n.sneak = false;
+    n
+}
+
+/// 鼠标左键挖、右键放：检查冷却 + 边沿 + raycast 命中，构造乐观更新 + 发消息。
+fn dispatch_actions(game: &mut Game, input: &InputState) {
+    let now = now_ms();
+    let cooldown = game.settings.min_action_interval_ms;
+
+    // —— 挖（连续触发：held + 冷却）——
+    if input.break_held
+        && now - game.last_break_at_ms >= cooldown
+        && let Some(hit) = game.current_hit
+    {
+        let pos = hit.pos;
+        let backup = {
+            let server = game.server.borrow();
+            server.world.get_block(pos)
+        };
+        // Local 模式 client 和 server 共享同一份 world，乐观更新会干扰 server 校验
+        // （server 读回 AIR 误判 BlockNotEmpty 拒绝）。因此跳过乐观 set_block；
+        // BlockUpdate 返回后再重 mesh。Phase 5 Remote 端加独立 WorldView 时再加乐观路径。
+        let request_id = game.pending.next_request_id();
+        game.pending.insert(
+            request_id,
+            PendingAction {
+                kind: PendingKind::Break,
+                pos,
+                backup,
+            },
+        );
+        game.net
+            .send_client_message(ClientMessage::Break { pos, request_id });
+        game.last_break_at_ms = now;
+    }
+
+    // —— 放（一次性：just_pressed）——
+    if input.place_just_pressed
+        && let Some(hit) = game.current_hit
+    {
+        let neighbor = Position::new(
+            hit.pos.x + hit.normal.x,
+            hit.pos.y + hit.normal.y,
+            hit.pos.z + hit.normal.z,
+        );
+        let block = game.hotbar.current();
+        // 本地预检：放置位置与玩家 AABB 重叠 → 拒绝
+        let block_aabb = voxweb_core::Aabb::block_at(neighbor);
+        let player_box = voxweb_core::player_aabb(game.physics.feet_position);
+        if player_box.intersects(&block_aabb) {
+            log::info!("放置位置与玩家重叠，本地拒绝");
+            return;
+        }
+        let backup = {
+            let server = game.server.borrow();
+            server.world.get_block(neighbor)
+        };
+        if backup != BlockID::AIR {
+            return;
+        }
+        let request_id = game.pending.next_request_id();
+        game.pending.insert(
+            request_id,
+            PendingAction {
+                kind: PendingKind::Place(block),
+                pos: neighbor,
+                backup,
+            },
+        );
+        game.net.send_client_message(ClientMessage::Place {
+            pos: neighbor,
+            block,
+            request_id,
+        });
+    }
+}
+
 fn apply_server_message(game: &mut Game, msg: ServerMessage) {
     match msg {
         ServerMessage::Welcome {
@@ -769,8 +958,35 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             game.entity_id = entity_id;
             log::info!("Welcome: entity_id={entity_id}, seed={world_seed}");
         }
+        ServerMessage::ActionAck {
+            request_id,
+            accepted,
+            reason,
+        } => {
+            if let Some(rolled) = game.pending.resolve(request_id, accepted) {
+                // server 拒绝 → 写回 backup + 重 mesh
+                log::warn!(
+                    "ActionAck rejected: id={request_id} reason={reason:?} pos={:?}",
+                    rolled.pos
+                );
+                game.server
+                    .borrow_mut()
+                    .world
+                    .set_block(rolled.pos, rolled.backup);
+                for cp in affected_chunks(rolled.pos) {
+                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                }
+            }
+        }
+        ServerMessage::BlockUpdate { pos, .. } => {
+            // Local 模式 server 已经写过 world；这里只需重 mesh 受影响 chunk。
+            // Phase 5 远端 BlockUpdate 也走这条路径，到时 world 由这里同步。
+            for cp in affected_chunks(pos) {
+                game.mesh_jobs.enqueue(cp, MeshPriority::High);
+            }
+        }
         _ => {
-            // Phase 3+ 才处理 BlockUpdate / PlayerTick 等
+            // Phase 5+ 才处理 PlayerTick / PeerJoined / Chat 等
         }
     }
 }
@@ -779,9 +995,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
 // HUD（egui）
 // ============================================================
 
-#[allow(clippy::too_many_arguments)]
-fn draw_hud(
-    ctx: &egui::Context,
+struct HudData {
     fps: f32,
     pos: (f32, f32, f32),
     yaw_deg: f32,
@@ -789,7 +1003,14 @@ fn draw_hud(
     pointer_locked: bool,
     loaded_chunks: usize,
     mesh_pending: usize,
-) {
+    mode: CameraMode,
+    on_ground: bool,
+    hotbar_items: [BlockID; 9],
+    hotbar_selected: usize,
+}
+
+fn draw_hud(ctx: &egui::Context, data: HudData) {
+    // 左上角 stat
     egui::Area::new(egui::Id::new("hud_topleft"))
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
         .show(ctx, |ui| {
@@ -799,23 +1020,42 @@ fn draw_hud(
                 .show(ui, |ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 230, 235),
-                        format!("FPS  {:>5.1}", fps),
+                        format!("FPS  {:>5.1}", data.fps),
                     );
                     ui.colored_label(
                         egui::Color32::from_rgb(220, 230, 235),
-                        format!("POS  x {:+8.2}  y {:+8.2}  z {:+8.2}", pos.0, pos.1, pos.2),
+                        format!(
+                            "POS  x {:+8.2}  y {:+8.2}  z {:+8.2}",
+                            data.pos.0, data.pos.1, data.pos.2
+                        ),
                     );
                     ui.colored_label(
                         egui::Color32::from_rgb(180, 190, 200),
-                        format!("YAW {:+6.1}°  PITCH {:+5.1}°", yaw_deg, pitch_deg),
+                        format!("YAW {:+6.1}°  PITCH {:+5.1}°", data.yaw_deg, data.pitch_deg),
+                    );
+                    let mode_str = match data.mode {
+                        CameraMode::Walk => "Walk",
+                        CameraMode::Fly => "Fly",
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 200, 180),
+                        format!(
+                            "MODE {}  {}",
+                            mode_str,
+                            if data.on_ground { "[ground]" } else { "" }
+                        ),
                     );
                     ui.colored_label(
                         egui::Color32::from_rgb(160, 175, 190),
-                        format!("CHUNKS {loaded_chunks}  MESH_Q {mesh_pending}"),
+                        format!(
+                            "CHUNKS {}  MESH_Q {}",
+                            data.loaded_chunks, data.mesh_pending
+                        ),
                     );
                 });
         });
 
+    // 准星
     egui::Area::new(egui::Id::new("hud_crosshair"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
@@ -827,19 +1067,57 @@ fn draw_hud(
             );
         });
 
-    egui::Area::new(egui::Id::new("hud_bottom"))
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
+    // 提示栏
+    egui::Area::new(egui::Id::new("hud_hint"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -80.0))
         .show(ctx, |ui| {
-            let msg = if pointer_locked {
-                "WASD move | Space up | Shift down | Mouse look | ESC release"
+            let msg = if data.pointer_locked {
+                "WASD walk | Space jump (×2 = fly) | LMB break | RMB place | 1-9 hotbar | ESC release"
             } else {
                 "Click to enter camera control"
             };
             egui::Frame::default()
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110))
-                .inner_margin(egui::Margin::symmetric(14, 8))
+                .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.colored_label(egui::Color32::from_rgb(230, 235, 240), msg);
+                });
+        });
+
+    // Hotbar：屏幕底部居中的 9 格
+    egui::Area::new(egui::Id::new("hud_hotbar"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
+        .show(ctx, |ui| {
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, block) in data.hotbar_items.iter().enumerate() {
+                            let selected = i == data.hotbar_selected;
+                            let label = crate::hotbar::block_label(*block);
+                            let txt = format!("{}\n{}", i + 1, label);
+                            let bg = if selected {
+                                egui::Color32::from_rgba_unmultiplied(240, 200, 80, 220)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(60, 70, 80, 200)
+                            };
+                            let fg = if selected {
+                                egui::Color32::BLACK
+                            } else {
+                                egui::Color32::from_rgb(230, 235, 240)
+                            };
+                            egui::Frame::default()
+                                .fill(bg)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.set_min_size(egui::vec2(54.0, 36.0));
+                                    ui.vertical_centered(|ui| {
+                                        ui.colored_label(fg, egui::RichText::new(&txt).size(11.0));
+                                    });
+                                });
+                        }
+                    });
                 });
         });
 }

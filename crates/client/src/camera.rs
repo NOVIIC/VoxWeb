@@ -1,15 +1,15 @@
 //! 第一人称相机：位置、朝向、视图/投影矩阵。
 //!
-//! Phase 1 仅 Fly 模式（无重力，自由飞行），Phase 3 引入 Walk 模式 + 重力。
+//! Phase 3 起 `Camera` 只负责朝向与矩阵，位置由 `LocalPhysics` 每帧驱动同步。
 
 use glam::{Mat4, Vec3};
 
-/// 相机模式（Phase 1 默认 Fly）。
+/// 相机模式：决定物理子系统跑哪条分支。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CameraMode {
-    /// 飞行：WASD 沿前/右向移动，空格上、Shift 下，无重力
+    /// 飞行：WASD + 空格/Shift，无重力、无碰撞
     Fly,
-    /// 步行：受重力，跳跃，碰撞（Phase 3 实装）
+    /// 步行：受重力、跳跃、AABB 分轴碰撞
     Walk,
 }
 
@@ -25,7 +25,6 @@ pub struct Camera {
     pub aspect: f32,
     pub near: f32,
     pub far: f32,
-    pub mode: CameraMode,
 }
 
 impl Default for Camera {
@@ -38,13 +37,12 @@ impl Default for Camera {
             aspect: 16.0 / 9.0,
             near: 0.1,
             far: 1000.0,
-            mode: CameraMode::Fly,
         }
     }
 }
 
 impl Camera {
-    /// 朝向单位向量。
+    /// 朝向单位向量（含 pitch 分量）。
     pub fn forward(&self) -> Vec3 {
         Vec3::new(
             self.yaw.cos() * self.pitch.cos(),
@@ -54,11 +52,15 @@ impl Camera {
         .normalize()
     }
 
+    /// 水平面（XZ）上的前向单位向量，丢弃 pitch 分量。
+    /// Walk 模式按这个走，避免视角朝下时反而向地里走。
+    pub fn forward_horizontal(&self) -> Vec3 {
+        Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize_or_zero()
+    }
+
     /// 右向单位向量（不依赖 pitch，沿水平面）。
-    /// 在 wgpu 右手系下：right = forward × up；up × forward 会得到反向。
+    /// wgpu 右手系下：forward × up = (-sin yaw, 0, cos yaw)
     pub fn right(&self) -> Vec3 {
-        // forward = (cos yaw, 0, sin yaw)，up = +Y
-        // forward × up = (-sin yaw, 0, cos yaw)
         Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos())
     }
 
@@ -84,34 +86,28 @@ impl Camera {
         let limit = 89.0_f32.to_radians();
         self.pitch = self.pitch.clamp(-limit, limit);
     }
+}
 
-    /// 应用 WASD/空格/Shift 移动（Fly 模式）。`dt` 单位秒。
-    pub fn apply_fly_input(&mut self, input: &crate::input::InputState, speed: f32, dt: f32) {
-        let mut delta = Vec3::ZERO;
-        // 水平方向 forward（无 pitch 分量），保持飞行手感
-        let horiz_forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize_or_zero();
-        let right = self.right();
-        if input.forward {
-            delta += horiz_forward;
-        }
-        if input.backward {
-            delta -= horiz_forward;
-        }
-        if input.right {
-            delta += right;
-        }
-        if input.left {
-            delta -= right;
-        }
-        if input.jump {
-            delta += Vec3::Y;
-        }
-        if input.sneak {
-            delta -= Vec3::Y;
-        }
-        if delta.length_squared() > 0.0 {
-            delta = delta.normalize() * speed * dt;
-            self.position += delta;
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_horizontal_strips_pitch() {
+        let mut c = Camera::default();
+        c.yaw = 0.0; // 朝 +X
+        c.pitch = -0.5; // 朝下
+        let fh = c.forward_horizontal();
+        assert!(fh.y.abs() < 1e-6);
+        assert!((fh.x - 1.0).abs() < 1e-6);
+        assert!(fh.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn right_orthogonal_to_horizontal_forward() {
+        let c = Camera::default();
+        let fh = c.forward_horizontal();
+        let r = c.right();
+        assert!(fh.dot(r).abs() < 1e-5);
     }
 }

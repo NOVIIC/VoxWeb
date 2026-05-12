@@ -109,7 +109,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 3 · 物理与交互
+## Phase 3 · 物理与交互 ✅
+
+> 完成日期：2026-05-12 · 详见 [`../PHASE_3_DONE.md`](../PHASE_3_DONE.md)
 
 ### 目标
 玩家有物理身体，能跳、能挖、能放。
@@ -119,16 +121,16 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`networking/protocol.md`](networking/protocol.md)（Break/Place 消息流）
 
 ### 任务清单
-- [ ] `client::physics` AABB + 重力 + 跳跃 + 分轴碰撞
-- [ ] Walk / Fly 模式切换（双击空格）
-- [ ] `client::raycast` DDA 算法
-- [ ] HUD 选中方块线框
-- [ ] 鼠标左键挖（本地直接修改 + send Break）
-- [ ] 鼠标右键放（计算邻居位置 + send Place）
-- [ ] `server::physics::validate_break/place` 仲裁
-- [ ] BlockUpdate 闭环：本地 server 处理 → 客户端收到 → 重网格化
-- [ ] 1-9 键 hotbar（hotbar UI HUD 简化版）
-- [ ] ActionAck rollback 路径（即使本地一定通过，也要走完逻辑）
+- [x] `client::physics` AABB + 重力 + 跳跃 + 分轴碰撞
+- [x] Walk / Fly 模式切换（双击空格）
+- [x] `client::raycast` DDA 算法
+- [x] HUD 选中方块线框
+- [x] 鼠标左键挖（本地直接修改 + send Break）
+- [x] 鼠标右键放（计算邻居位置 + send Place）
+- [x] `server::physics::validate_break/place` 仲裁
+- [x] BlockUpdate 闭环：本地 server 处理 → 客户端收到 → 重网格化
+- [x] 1-9 键 hotbar（hotbar UI HUD 简化版）
+- [x] ActionAck rollback 路径（即使本地一定通过，也要走完逻辑）
 
 ### 验证
 - 单机模式下走路、跳跃、攀爬上小山坡

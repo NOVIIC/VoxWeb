@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use glam::Vec3;
+use voxweb_core::chunk::Position;
 use voxweb_core::{CHUNK_X, CHUNK_Z, ChunkPos};
 use voxweb_render::Renderer;
 use voxweb_server::Server;
@@ -100,6 +101,37 @@ pub fn chunk_pos_of(world_pos: Vec3) -> ChunkPos {
     ChunkPos::new(x, z)
 }
 
+/// 一次方块变更影响的 chunk 集合：自身所在 chunk + 若位于 x/z 边界则对应横向邻居。
+/// Y 不分 chunk，所以不考虑上下邻居。最多返回 4 个（同时在 x 与 z 双边界的角点）。
+pub fn affected_chunks(pos: Position) -> Vec<ChunkPos> {
+    let cp = ChunkPos::new(
+        pos.x.div_euclid(CHUNK_X as i32),
+        pos.z.div_euclid(CHUNK_Z as i32),
+    );
+    let local_x = pos.x.rem_euclid(CHUNK_X as i32);
+    let local_z = pos.z.rem_euclid(CHUNK_Z as i32);
+    let mut out = Vec::with_capacity(4);
+    out.push(cp);
+    // x 方向边界：local==0 → 影响 -x 邻居；local==15 → 影响 +x 邻居
+    if local_x == 0 {
+        out.push(ChunkPos::new(cp.x - 1, cp.z));
+    } else if local_x == CHUNK_X as i32 - 1 {
+        out.push(ChunkPos::new(cp.x + 1, cp.z));
+    }
+    if local_z == 0 {
+        out.push(ChunkPos::new(cp.x, cp.z - 1));
+    } else if local_z == CHUNK_Z as i32 - 1 {
+        out.push(ChunkPos::new(cp.x, cp.z + 1));
+    }
+    // 角点情况（同时跨 x 和 z 边界）也补上斜对角 chunk
+    if out.len() == 3 {
+        let dx = out[1].x - cp.x;
+        let dz = out[2].z - cp.z;
+        out.push(ChunkPos::new(cp.x + dx, cp.z + dz));
+    }
+    out
+}
+
 /// 切比雪夫距离（最大轴差）—— 适合方形 render distance。
 pub fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i32 {
     (a.x - b.x).abs().max((a.z - b.z).abs())
@@ -170,5 +202,47 @@ mod tests {
             priority_for_distance(ChunkPos::new(5, 3), c),
             MeshPriority::Medium
         );
+    }
+
+    #[test]
+    fn affected_chunks_interior_returns_one() {
+        let pos = Position::new(5, 64, 7);
+        let v = affected_chunks(pos);
+        assert_eq!(v, vec![ChunkPos::new(0, 0)]);
+    }
+
+    #[test]
+    fn affected_chunks_x_boundary_returns_two() {
+        // local_x = 0 → 还影响 (-1, 0)
+        let v = affected_chunks(Position::new(0, 64, 5));
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&ChunkPos::new(0, 0)));
+        assert!(v.contains(&ChunkPos::new(-1, 0)));
+
+        // local_x = 15 → 还影响 (1, 0)
+        let v = affected_chunks(Position::new(15, 64, 5));
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&ChunkPos::new(0, 0)));
+        assert!(v.contains(&ChunkPos::new(1, 0)));
+    }
+
+    #[test]
+    fn affected_chunks_corner_returns_four() {
+        // 角点 (0, _, 0) → 自身 + (-1, 0) + (0, -1) + (-1, -1)
+        let v = affected_chunks(Position::new(0, 64, 0));
+        assert_eq!(v.len(), 4);
+        assert!(v.contains(&ChunkPos::new(0, 0)));
+        assert!(v.contains(&ChunkPos::new(-1, 0)));
+        assert!(v.contains(&ChunkPos::new(0, -1)));
+        assert!(v.contains(&ChunkPos::new(-1, -1)));
+    }
+
+    #[test]
+    fn affected_chunks_handles_negative_coords() {
+        // pos.x = -1 → chunk_x = -1, local_x = 15 → 还影响 (0, *)
+        let v = affected_chunks(Position::new(-1, 64, 5));
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&ChunkPos::new(-1, 0)));
+        assert!(v.contains(&ChunkPos::new(0, 0)));
     }
 }

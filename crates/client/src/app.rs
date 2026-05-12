@@ -1,17 +1,22 @@
 //! 客户端全局状态机 + Game 子结构定义。
 //!
-//! Phase 2：AppState 仅使用 Lobby / InGame；其余态留给后续 Phase。
-//! Game 子结构持有 InGame 状态下的所有运行时（Server / NetEndpoint / Camera / 调度器等）。
+//! Phase 3：Game 持有 LocalPhysics（驱动 camera.position）、Hotbar、PendingActions、
+//! current_hit（DDA 射线命中缓存）等运行时状态。
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use glam::Vec3;
 use voxweb_net::{NetEndpoint, ServerInbox};
 use voxweb_server::Server;
 
 use crate::camera::Camera;
 use crate::chunk_loader::ChunkLoader;
+use crate::hotbar::Hotbar;
 use crate::mesh_jobs::MeshJobQueue;
+use crate::physics::LocalPhysics;
+use crate::prediction::PendingActions;
+use crate::raycast::RaycastHit;
 
 /// 应用全局状态。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -33,17 +38,19 @@ pub enum AppState {
     Disconnected,
 }
 
-/// Phase 2 游戏运行时设置。Phase 6 起会扩展为 AppSettings 全集。
+/// Phase 3 游戏运行时设置。Phase 6 起会扩展为 AppSettings 全集。
 #[derive(Clone, Debug)]
 pub struct GameSettings {
     /// 渲染距离（单位：chunk）。默认 6，UI 可调 2..=10（Phase 6 落地）。
     pub render_distance: u32,
     /// 鼠标灵敏度。
     pub mouse_sensitivity: f32,
-    /// 飞行速度（方块/秒）。
+    /// Fly 模式速度（方块/秒）；Phase 3 起 Walk 速度走 physics 常量。
     pub fly_speed: f32,
     /// 每帧网格化预算（毫秒）。
     pub mesh_budget_ms: f32,
+    /// 挖掘连续触发的冷却（毫秒）。
+    pub min_action_interval_ms: f64,
 }
 
 impl Default for GameSettings {
@@ -53,6 +60,7 @@ impl Default for GameSettings {
             mouse_sensitivity: 0.0025,
             fly_speed: 12.0,
             mesh_budget_ms: 4.0,
+            min_action_interval_ms: 100.0,
         }
     }
 }
@@ -103,31 +111,43 @@ pub struct Game {
     pub server_inbox: ServerInbox,
     pub net: NetEndpoint,
     pub camera: Camera,
+    pub physics: LocalPhysics,
+    pub hotbar: Hotbar,
+    pub pending: PendingActions,
     pub mesh_jobs: MeshJobQueue,
     pub chunk_loader: ChunkLoader,
     pub frame_clock: FrameClock,
     pub settings: GameSettings,
+    /// DDA 命中缓存（每帧更新；HUD 线框 + 挖放动作消费）。
+    pub current_hit: Option<RaycastHit>,
+    /// 上次挖掘成功时间（performance.now()，毫秒），用于连续挖掘冷却。
+    pub last_break_at_ms: f64,
     /// 自己的 entity_id（由 Welcome 提供）。
     pub entity_id: u32,
 }
 
 impl Game {
-    /// 启动一个单机游戏：创建 Server + 配对 NetEndpoint + 初始相机。
-    /// 调用方负责后续：发 Hello、初始 chunk_loader.update。
+    /// 启动一个单机游戏：创建 Server + 配对 NetEndpoint + 初始相机/物理。
     pub fn new_local(seed: u64, settings: GameSettings) -> Self {
         let server = Rc::new(RefCell::new(Server::new(seed)));
         let (net, server_inbox) = NetEndpoint::new_local_pair();
         let camera = Camera::default();
+        let physics = LocalPhysics::new(Vec3::new(8.0, 100.0, 8.0));
         let render_distance = settings.render_distance;
         Self {
             server,
             server_inbox,
             net,
             camera,
+            physics,
+            hotbar: Hotbar::default(),
+            pending: PendingActions::new(),
             mesh_jobs: MeshJobQueue::new(),
             chunk_loader: ChunkLoader::new(render_distance),
             frame_clock: FrameClock::new(),
             settings,
+            current_hit: None,
+            last_break_at_ms: 0.0,
             entity_id: 0, // 待 Welcome 填充
         }
     }

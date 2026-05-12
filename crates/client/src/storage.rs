@@ -62,10 +62,7 @@ impl OpfsStorage {
     }
 
     /// 批量写入若干 encoded chunk。失败时调用方负责把失败的 ChunkPos 还回 dirty 集合。
-    pub async fn save_chunks(
-        &self,
-        _items: Vec<(ChunkPos, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
+    pub async fn save_chunks(&self, _items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError> {
         // Phase 5: 对每个 item 走 createWritable / write / close
         Ok(())
     }

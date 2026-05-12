@@ -1,11 +1,11 @@
 //! wgpu Device / Surface 初始化，与浏览器 canvas 绑定。
+//!
+//! 实际只在 wasm32 + WebGPU 后端运行（项目仅浏览器部署）；
+//! desktop target 保留一个返回 Err 的存根，让 lib 单元测试能在桌面跑通编译。
 
 use std::sync::Arc;
 
-use wgpu::{
-    DeviceDescriptor, Instance, InstanceDescriptor, MemoryHints, PowerPreference, PresentMode,
-    RequestAdapterOptions, SurfaceCapabilities, TextureFormat, TextureUsages,
-};
+use wgpu::{SurfaceCapabilities, TextureFormat, TextureUsages};
 
 /// 初始化 wgpu 所需的上下文：从一块 HTML canvas 获取 GPU 设备和 Surface。
 pub struct DeviceContext {
@@ -15,10 +15,14 @@ pub struct DeviceContext {
     pub surface_format: TextureFormat,
 }
 
-/// 创建 wgpu Instance、Adapter、Device 和 Surface。
-/// `canvas` 必须是已挂载到 DOM 的 `<canvas>` 元素。
+/// 创建 wgpu Instance、Adapter、Device 和 Surface（wasm32 实现）。
+#[cfg(target_arch = "wasm32")]
 pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceContext, String> {
-    // 创建 WGPU 实例（仅 WebGPU 后端）
+    use wgpu::{
+        DeviceDescriptor, Instance, InstanceDescriptor, MemoryHints, PowerPreference,
+        RequestAdapterOptions,
+    };
+
     let instance_desc = InstanceDescriptor {
         backends: wgpu::Backends::BROWSER_WEBGPU,
         flags: wgpu::InstanceFlags::default(),
@@ -28,12 +32,10 @@ pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceCo
     };
     let instance = Instance::new(instance_desc);
 
-    // 从 canvas 创建 surface
     let surface = instance
         .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
         .map_err(|e| format!("创建 Surface 失败: {e}"))?;
 
-    // 请求 GPU 适配器
     let adapter_options = RequestAdapterOptions {
         power_preference: PowerPreference::HighPerformance,
         force_fallback_adapter: false,
@@ -44,11 +46,9 @@ pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceCo
         .await
         .map_err(|e| format!("无法获取 GPU 适配器：{e}"))?;
 
-    // 获取 surface 能力
     let caps = surface.get_capabilities(&adapter);
     let surface_format = select_format(&caps);
 
-    // 创建设备 + 队列
     let device_desc = DeviceDescriptor {
         label: None,
         required_features: wgpu::Features::empty(),
@@ -72,7 +72,14 @@ pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceCo
     })
 }
 
+/// Desktop 存根：直接返回错误。本项目只在浏览器跑，desktop 仅为单元测试编译目标。
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn init_device(_canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceContext, String> {
+    Err("init_device 只在 wasm32 浏览器目标下可用".to_string())
+}
+
 /// 从 SurfaceCapabilities 中选择首选纹理格式。
+#[allow(dead_code)] // desktop target 下 init_device 走存根分支，不调用本函数
 fn select_format(caps: &SurfaceCapabilities) -> TextureFormat {
     let preferred = &caps.formats;
     for fmt in [
@@ -101,7 +108,7 @@ pub fn configure_surface(
             format,
             width,
             height,
-            present_mode: PresentMode::Fifo,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,

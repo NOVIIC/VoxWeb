@@ -28,7 +28,7 @@
 | 阶段 | 包含 |
 |---|---|
 | **Phase 2 ✅** | `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk`；`TerrainGenerator`（已在 Phase 1 stub）；`Server::handle_message` 仅 `Hello → Welcome` 占位 + `Break/Place` 无校验直改 |
-| Phase 3 | `physics::validate_break/place` 仲裁；`World::dirty_chunks` 字段；Break/Place 完整闭环 |
+| **Phase 3 ✅** | `physics::validate_break/place`（6m 射程 + AABB overlap）；`Server::players` 最小 tracker（feat Hello 插入 + PlayerInput 更新）；Break/Place 调 validate → ActionAck + BlockUpdate 闭环 |
 | Phase 5 | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`take_dirty_chunks` / `ChunkStorage` trait |
 
 下面 §3 起描述的是**完整设计**；每节遇到 Phase 3+ 才引入的字段会用 `> Phase N` 注明。
@@ -58,8 +58,8 @@ pub struct World {
     pub chunks: HashMap<ChunkPos, Chunk>,
     pub terrain: TerrainGenerator,           // [Phase 2] Perlin 高度图
     pub tick_count: u64,                     // [Phase 2] tick 累加器；Phase 5 起驱动玩家广播
-    pub dirty_chunks: HashSet<ChunkPos>,     // [Phase 3] 需要持久化的 chunk
-    pub players: HashMap<EntityId, PlayerEntity>,  // [Phase 5]
+    pub dirty_chunks: HashSet<ChunkPos>,     // [Phase 5] 需要持久化的 chunk
+    pub players: HashMap<EntityId, PlayerEntity>,  // [Phase 5] 完整玩家实体表
 }
 
 impl World {
@@ -104,16 +104,12 @@ pub struct Server {
     pub world: World,
     pub tick: u32,                           // [Phase 1+]
     pub seed: u64,                           // [Phase 1+]
-    pub config: ServerConfig,                // [Phase 3+]
+    pub players: HashMap<u32, Vec3>,         // [Phase 3 ✅] entity_id → feet_position（挖放仲裁用）
     pub outbox: VecDeque<OutboundMessage>,   // [Phase 5] 待广播的消息
 }
 
-/// [Phase 3+]
-pub struct ServerConfig {
-    pub render_distance_chunks: u32,
-    pub max_break_range: f32,                // 6.0 默认
-    pub max_move_per_tick: f32,              // 防穿墙：上限速度 × dt
-}
+// ServerConfig 和 physics 常量直接写在 physics.rs（MAX_REACH=6.0 等），
+// Phase 3 不引入 ServerConfig 结构体（Keep It Simple）。
 
 /// [Phase 5]
 pub struct OutboundMessage {
@@ -131,13 +127,12 @@ impl Server {
     /// [Phase 1+]
     pub fn new(seed: u64) -> Self;
 
-    /// [Phase 1+] 处理来自客户端的消息（Local 或 Remote）。
-    /// Phase 2：仅 Hello→Welcome 占位 + Break/Place 直改（无校验）。
-    /// Phase 3：加入 validate_break/place + dirty 标记。
-    /// Phase 5：完整 dispatch + outbox。
+    /// [Phase 3 ✅] 处理来自客户端的消息（Local 或 Remote）。
+    /// Hello → 插入 players 表 + Welcome；PlayerInput → 更新 players 表；
+    /// Break/Place → 调 validate → Ok 则 set_block + ActionAck + BlockUpdate；失败仅 ActionAck。
     pub fn handle_message(&mut self, sender: u32, msg: ClientMessage) -> Vec<ServerMessage>;
 
-    /// [Phase 1+] 推进一个逻辑帧（60Hz 调用）。Phase 2 仅累加 tick 计数。
+    /// [Phase 1+] 推进一个逻辑帧（60Hz 调用）。Phase 2-3 仅累加 tick + world.tick。
     pub fn tick(&mut self);
 
     // —— 以下为 Phase 5 引入 ——
@@ -262,45 +257,38 @@ fn broadcast_tick(&mut self) {
 
 ## 六、`physics.rs` — 物理仲裁
 
-> **Phase 3** 引入。Phase 2 不实装。
+> **Phase 3 ✅** 实装。Phase 2 stub 仅占位。
 
 > 玩家本地物理预测在 `client::physics`；这里只做**仲裁**（防作弊最低限度）。
 
-### 位置合法性
-- 移动距离上限：见 `world.rs` 中已实现
-- 穿墙检测：`server.physics::check_position_inside_solid(world, pos)` 不强制；本期客户端预测已经做碰撞，仲裁只在挖放时确保操作位置合理
-
 ### 挖方块
 ```rust
-pub fn validate_break(world: &World, entity: EntityId, target: Position) -> Result<(), AckReason> {
-    let player = world.players.get(&entity).ok_or(AckReason::Cooldown)?;
-    let dist = (player.position - target.as_vec3()).length();
-    if dist > MAX_BREAK_RANGE { return Err(AckReason::OutOfRange); }
+pub const MAX_REACH: f32 = 6.0;    // 眼睛到方块中心的最大距离
 
-    let block = world.get_block(target).ok_or(AckReason::BlockNotEmpty)?;
-    if block == BlockID::AIR { return Err(AckReason::BlockNotEmpty); }
-    Ok(())
+pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckReason {
+    // 1) y 越界检查
+    // 2) 眼-块中心距离 > MAX_REACH → OutOfRange
+    // 3) 目标已是 AIR → BlockNotEmpty（语义复用）
+    //    Ok
 }
 ```
 
 ### 放方块
 ```rust
-pub fn validate_place(world: &World, entity: EntityId, pos: Position, block: BlockID) -> Result<(), AckReason> {
-    let player = world.players.get(&entity).ok_or(AckReason::Cooldown)?;
-    let dist = (player.position - pos.as_vec3()).length();
-    if dist > MAX_PLACE_RANGE { return Err(AckReason::OutOfRange); }
-
-    let existing = world.get_block(pos).ok_or(AckReason::BlockNotEmpty)?;
-    if existing != BlockID::AIR { return Err(AckReason::BlockNotEmpty); }
-
-    // 检查是否与玩家 AABB 重叠
-    let aabb = aabb_for_block(pos);
-    let player_aabb = player_aabb_at(player.position);
-    if aabb.intersects(&player_aabb) { return Err(AckReason::Overlap); }
-
-    Ok(())
+pub fn validate_place(
+    world: &World, pos: Position, _block: BlockID, player_feet: Vec3
+) -> AckReason {
+    // 1) y 越界检查
+    // 2) 距离 > MAX_REACH → OutOfRange
+    // 3) 目标非空 → BlockNotEmpty
+    // 4) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
+    //    Ok
 }
 ```
+
+共享 AABB 工具在 `voxweb_core::geometry`（`Aabb`、`player_aabb`、`Aabb::block_at`、`Aabb::intersects`），client 和 server 共用同一套定义。
+
+玩家位置由 `Server::players: HashMap<u32, Vec3>` 提供（Hello 插入初始 spawn，PlayerInput 60Hz 更新）。`validate_break/place` 的签名接受显式 `player_feet` 参数（而非 entity_id），便于测试时直接注入位置。
 
 ---
 
@@ -332,11 +320,11 @@ pub fn tick(&mut self) {
 
 ## 八、消息分发逻辑
 
-> **Phase 2 范围**：仅 `Hello`→`Welcome { entity_id: 1, server_tick, world_seed }` 与 `Break/Place` 无校验直改。`PlayerInput / Chat / Ping` 一律忽略（返回空）。
+> **Phase 2 ✅**：仅 `Hello`→`Welcome` 与 `Break/Place` 无校验直改。`PlayerInput / Chat / Ping` 忽略。
 >
-> **Phase 3** 加入 `validate_break/place` + dirty 标记。
+> **Phase 3 ✅**：`validate_break/place` 接入；`players` 表由 Hello/PlayerInput 维护。实际实现见 [`crates/server/src/lib.rs`](../../crates/server/src/lib.rs)。
 >
-> **Phase 5** 完整 dispatch（如下）+ outbox + Recipient。
+> **Phase 5**：补 `broadcast_tick`（PlayerTick）+ `send_initial_snapshot` + `Recipient` + outbox。
 
 `Server::handle_client_message` 的核心 dispatch（Phase 5 完整版）：
 
@@ -450,10 +438,11 @@ impl PersistenceManager {
 - `World::ensure_chunk_generated` 幂等（二次调用不重生成）
 - `World::get_block_world` chunk 内 / 未加载 / y 越界三种情况
 
-**Phase 3+**：
-- `physics::validate_break` 各拒绝路径覆盖
-- `Server::handle_client_message` 状态机：Hello → Welcome → 多次 Break → 一次非法 Place → ActionAck 全部正确
-- `tick()` 不会随时间无限增长内存（dirty 集合需被外部 drain）
+**Phase 3 ✅**：
+- `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / AIR → BlockNotEmpty
+- `physics::validate_place`：y 越界 / 射程 / BlockNotEmpty / AABB Overlap
+- `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
+- 全部 10 个单元测试通过 `cargo test -p voxweb-server --lib`
 
 ---
 

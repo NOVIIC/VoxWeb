@@ -1,24 +1,315 @@
 //! DDA 射线检测：沿视线方向查找目标方块。
 //!
-//! 使用 Amanatides & Woo 算法进行体素遍历。
+//! 使用 Amanatides & Woo 网格步进算法。
+//! 命中条件：方块非 AIR 且 `properties().solid == true`。
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
+use voxweb_core::block::{BlockID, properties};
 use voxweb_core::chunk::Position;
+use voxweb_render::vertex::Face;
 
 /// DDA 射线检测结果。
+#[derive(Copy, Clone, Debug)]
 pub struct RaycastHit {
-    /// 命中方块的坐标
+    /// 命中方块的世界坐标
     pub pos: Position,
-    /// 命中面的法线（用于计算放置位置）
-    pub normal: glam::IVec3,
-    /// 从射线起点到命中点的距离
+    /// 命中面的法线（指向命中点所在的外侧方块），用于放置位置计算
+    pub normal: IVec3,
+    /// 命中面（PosX / NegY / ...）
+    pub face: Face,
+    /// 命中方块的 BlockID
+    pub block: BlockID,
+    /// 从射线起点到命中点的距离（米）
     pub distance: f32,
 }
 
-/// 从 origin 沿 direction 发射射线，在 max_distance 内查找第一个非空气方块。
-/// 返回命中信息。Phase 3 实现完整 DDA。
-pub fn raycast(_origin: Vec3, _direction: Vec3, _max_distance: f32) -> Option<RaycastHit> {
-    // Phase 3: DDA 迭代实现
-    None
+/// 从 `origin` 沿 `direction` 发射射线，在 `max_distance` 内查找第一个 solid 方块。
+///
+/// `get_block` 是世界坐标 → BlockID 的查询闭包（未加载/越界返回 AIR 即可）。
+/// 返回 None 表示射程内未命中任何 solid 方块。
+pub fn raycast(
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+) -> Option<RaycastHit> {
+    let dir = direction.normalize_or_zero();
+    if dir.length_squared() < 1e-8 {
+        return None;
+    }
+
+    // 当前所在体素（按整数坐标）
+    let mut current = IVec3::new(
+        origin.x.floor() as i32,
+        origin.y.floor() as i32,
+        origin.z.floor() as i32,
+    );
+
+    // 步进方向：+1 / -1 / 0（dir 分量为零时该轴永不步进）
+    let step = IVec3::new(
+        if dir.x > 0.0 {
+            1
+        } else if dir.x < 0.0 {
+            -1
+        } else {
+            0
+        },
+        if dir.y > 0.0 {
+            1
+        } else if dir.y < 0.0 {
+            -1
+        } else {
+            0
+        },
+        if dir.z > 0.0 {
+            1
+        } else if dir.z < 0.0 {
+            -1
+        } else {
+            0
+        },
+    );
+
+    // 每跨越一个体素需要的 t 增量（射线长度参数）
+    let t_delta = Vec3::new(
+        if dir.x != 0.0 {
+            1.0 / dir.x.abs()
+        } else {
+            f32::INFINITY
+        },
+        if dir.y != 0.0 {
+            1.0 / dir.y.abs()
+        } else {
+            f32::INFINITY
+        },
+        if dir.z != 0.0 {
+            1.0 / dir.z.abs()
+        } else {
+            f32::INFINITY
+        },
+    );
+
+    // 到下一个网格平面的 t 值
+    let mut t_max = Vec3::new(
+        next_boundary_t(origin.x, dir.x),
+        next_boundary_t(origin.y, dir.y),
+        next_boundary_t(origin.z, dir.z),
+    );
+
+    // 起点格子若已命中（origin 恰好在某 solid 方块内），face 含糊；返回时按"最后一次步进"或默认 +Y。
+    // 实际上玩家眼睛在 AIR 里，几乎不会出现这种情况；保留兜底。
+    if let Some(block) = block_solid(get_block, current)
+        && origin.x.floor() == current.x as f32
+    {
+        // 起点格命中：normal 为零向量、face 任取（这里给 PosY）
+        return Some(RaycastHit {
+            pos: Position::new(current.x, current.y, current.z),
+            normal: IVec3::ZERO,
+            face: Face::PosY,
+            block,
+            distance: 0.0,
+        });
+    }
+
+    // 上一次踏入新体素时使用的轴（用于命中后推算 face）
+    let mut last_axis: Axis;
+    let mut traveled: f32;
+
+    loop {
+        // 选 t_max 三者中最小的轴推进
+        if t_max.x < t_max.y && t_max.x < t_max.z {
+            traveled = t_max.x;
+            current.x += step.x;
+            t_max.x += t_delta.x;
+            last_axis = Axis::X;
+        } else if t_max.y < t_max.z {
+            traveled = t_max.y;
+            current.y += step.y;
+            t_max.y += t_delta.y;
+            last_axis = Axis::Y;
+        } else {
+            traveled = t_max.z;
+            current.z += step.z;
+            t_max.z += t_delta.z;
+            last_axis = Axis::Z;
+        }
+
+        if traveled > max_distance {
+            return None;
+        }
+
+        if let Some(block) = block_solid(get_block, current) {
+            // 命中面 = 进入该体素时穿过的那个面
+            // 例如沿 +X 步进进入新体素 → 命中的是新体素的 NegX 面，normal 指向 -X
+            let (face, normal) = face_and_normal(last_axis, step);
+            return Some(RaycastHit {
+                pos: Position::new(current.x, current.y, current.z),
+                normal,
+                face,
+                block,
+                distance: traveled,
+            });
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+/// 给定起点 `s` 和方向分量 `d`，返回射线参数 t 使得 `s + t*d` 抵达下一个整数网格面。
+fn next_boundary_t(s: f32, d: f32) -> f32 {
+    if d > 0.0 {
+        // 下一个 +X 整数面
+        let next = s.floor() + 1.0;
+        (next - s) / d
+    } else if d < 0.0 {
+        // 下一个 -X 整数面
+        let next = s.floor();
+        (next - s) / d
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// 该格子的方块若 solid（非 AIR 且 properties.solid=true），返回 Some(block)。
+fn block_solid(get_block: &dyn Fn(i32, i32, i32) -> BlockID, pos: IVec3) -> Option<BlockID> {
+    let block = get_block(pos.x, pos.y, pos.z);
+    if block == BlockID::AIR {
+        return None;
+    }
+    if !properties(block).solid {
+        return None;
+    }
+    Some(block)
+}
+
+/// 根据进入方向轴 + 步进符号，推算命中面 + 法线（向外）。
+fn face_and_normal(axis: Axis, step: IVec3) -> (Face, IVec3) {
+    match axis {
+        Axis::X => {
+            if step.x > 0 {
+                (Face::NegX, IVec3::new(-1, 0, 0))
+            } else {
+                (Face::PosX, IVec3::new(1, 0, 0))
+            }
+        }
+        Axis::Y => {
+            if step.y > 0 {
+                (Face::NegY, IVec3::new(0, -1, 0))
+            } else {
+                (Face::PosY, IVec3::new(0, 1, 0))
+            }
+        }
+        Axis::Z => {
+            if step.z > 0 {
+                (Face::NegZ, IVec3::new(0, 0, -1))
+            } else {
+                (Face::PosZ, IVec3::new(0, 0, 1))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 在 x=3, y=64, z=0 处放一个 STONE 方块，其它 AIR。
+    fn single_block_at(target: (i32, i32, i32)) -> impl Fn(i32, i32, i32) -> BlockID {
+        move |x, y, z| {
+            if (x, y, z) == target {
+                BlockID::STONE
+            } else {
+                BlockID::AIR
+            }
+        }
+    }
+
+    #[test]
+    fn raycast_positive_x_hits_negx_face() {
+        let getter = single_block_at((3, 64, 0));
+        let hit = raycast(
+            Vec3::new(0.5, 64.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+            &getter,
+        )
+        .expect("应命中 (3,64,0)");
+        assert_eq!(hit.pos, Position::new(3, 64, 0));
+        assert_eq!(hit.face, Face::NegX);
+        assert_eq!(hit.normal, IVec3::new(-1, 0, 0));
+        // 从 x=0.5 沿 +X 到 x=3 共 2.5 米
+        assert!(
+            (hit.distance - 2.5).abs() < 1e-3,
+            "distance={}",
+            hit.distance
+        );
+    }
+
+    #[test]
+    fn raycast_negative_y_hits_posy_face() {
+        let getter = single_block_at((0, 64, 0));
+        let hit = raycast(
+            Vec3::new(0.5, 70.5, 0.5),
+            Vec3::new(0.0, -1.0, 0.0),
+            20.0,
+            &getter,
+        )
+        .expect("应命中 (0,64,0)");
+        assert_eq!(hit.pos, Position::new(0, 64, 0));
+        assert_eq!(hit.face, Face::PosY);
+        assert_eq!(hit.normal, IVec3::new(0, 1, 0));
+        // 从 y=70.5 沿 -Y 到 y=65（方块顶面）= 5.5 米
+        assert!(
+            (hit.distance - 5.5).abs() < 1e-3,
+            "distance={}",
+            hit.distance
+        );
+    }
+
+    #[test]
+    fn raycast_out_of_range_returns_none() {
+        let getter = single_block_at((100, 64, 0));
+        let hit = raycast(
+            Vec3::new(0.5, 64.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            6.0, // 远小于 100
+            &getter,
+        );
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn raycast_skips_non_solid_blocks() {
+        // 把 (2, 64, 0) 设为 WATER（透明 + 非 solid），(3, 64, 0) 设为 STONE
+        let getter = |x: i32, y: i32, z: i32| {
+            if (x, y, z) == (2, 64, 0) {
+                BlockID::WATER
+            } else if (x, y, z) == (3, 64, 0) {
+                BlockID::STONE
+            } else {
+                BlockID::AIR
+            }
+        };
+        let hit = raycast(
+            Vec3::new(0.5, 64.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+            &getter,
+        )
+        .expect("应穿过 WATER 命中 STONE");
+        assert_eq!(hit.pos, Position::new(3, 64, 0));
+    }
+
+    #[test]
+    fn raycast_zero_direction_returns_none() {
+        let getter = single_block_at((0, 0, 0));
+        let hit = raycast(Vec3::new(0.5, 64.5, 0.5), Vec3::ZERO, 10.0, &getter);
+        assert!(hit.is_none());
+    }
 }

@@ -31,7 +31,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.add_space(8.0);
             ui.colored_label(
                 egui::Color32::from_rgb(160, 170, 180),
-                "Browser Voxel Sandbox (Phase 2)",
+                "Browser Voxel Sandbox (Phase 3)",
             );
 
             ui.add_space(48.0);
@@ -79,7 +79,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
         .show(ctx, |ui| {
             ui.colored_label(
                 egui::Color32::from_rgb(100, 110, 120),
-                "VoxWeb 0.1.0 · Phase 2",
+                "VoxWeb 0.1.0 · Phase 3",
             );
         });
 
