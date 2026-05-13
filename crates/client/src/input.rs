@@ -104,6 +104,25 @@ impl InputState {
         self.esc_menu = false;
     }
 
+    /// 清掉所有"持续按下"状态（held 类字段 + sneak）。
+    /// 指针锁切换时调用：ESC 释放锁的瞬间浏览器焦点会变化，期间按住的键松开时
+    /// keyup 事件可能丢失，否则重新获取锁后会出现"卡键"自动飞 / 走的现象。
+    /// 双击空格判定时间戳也一并清掉，避免暂停期间残留的 last_space_press 触发误切模式。
+    pub fn clear_held(&mut self) {
+        self.forward = false;
+        self.backward = false;
+        self.left = false;
+        self.right = false;
+        self.jump_held = false;
+        self.jump_just_pressed = false;
+        self.sneak = false;
+        self.break_held = false;
+        self.break_just_pressed = false;
+        self.place_held = false;
+        self.place_just_pressed = false;
+        self.last_space_press_at_ms = None;
+    }
+
     /// 处理键盘按下事件。
     /// `now_ms` 为当前 performance.now() 毫秒值，用于双击空格判定（由调用方注入便于测试）。
     pub fn on_key_down(&mut self, key: KeyCode, now_ms: f64) {
@@ -255,5 +274,33 @@ mod tests {
         assert_eq!(s.hotbar_request, Some(0));
         s.on_key_down(KeyCode::Digit9, 0.0);
         assert_eq!(s.hotbar_request, Some(8));
+    }
+
+    #[test]
+    fn clear_held_releases_sticky_keys() {
+        // 回归测试：按住空格 / WASD 时如果指针锁释放，浏览器焦点变化可能让 keyup 丢失。
+        // clear_held 应当把所有 held 字段复位，避免恢复锁后"卡键"自动移动。
+        let mut s = InputState::default();
+        s.on_key_down(KeyCode::Space, 100.0);
+        s.on_key_down(KeyCode::KeyW, 100.0);
+        s.on_key_down(KeyCode::KeyA, 100.0);
+        s.on_key_down(KeyCode::ShiftLeft, 100.0);
+        s.on_mouse_down(0);
+        s.on_mouse_down(2);
+        assert!(s.jump_held && s.forward && s.left && s.sneak);
+        assert!(s.break_held && s.place_held);
+
+        s.clear_held();
+        assert!(!s.jump_held);
+        assert!(!s.forward);
+        assert!(!s.backward);
+        assert!(!s.left);
+        assert!(!s.right);
+        assert!(!s.sneak);
+        assert!(!s.break_held);
+        assert!(!s.place_held);
+        // 双击空格时间戳也应清掉，避免锁恢复后下一次按空格被误判为双击
+        s.on_key_down(KeyCode::Space, 150.0);
+        assert!(!s.fly_toggle_pending, "暂停后的首次按空格不应触发模式切换");
     }
 }

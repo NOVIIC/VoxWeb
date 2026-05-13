@@ -185,7 +185,15 @@ fn install_event_listeners(
                 .pointer_lock_element()
                 .map(|el| el == *canvas_id.as_ref())
                 .unwrap_or(false);
-            input_clone.borrow_mut().pointer_locked = locked;
+            let mut s = input_clone.borrow_mut();
+            // 锁状态切换时清掉所有 held 输入。
+            // ESC 释放锁的瞬间浏览器焦点会变化，期间按住的键松开时
+            // keyup 事件可能丢失（document 收不到），下次恢复锁时会出现
+            // "卡键"自动飞 / 走 / 挖。这里在切换时统一复位。
+            if s.pointer_locked != locked {
+                s.clear_held();
+            }
+            s.pointer_locked = locked;
         });
         document.add_event_listener_with_callback(
             "pointerlockchange",
