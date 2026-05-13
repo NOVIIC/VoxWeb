@@ -1093,6 +1093,7 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         for (i, block) in data.hotbar_items.iter().enumerate() {
                             let selected = i == data.hotbar_selected;
                             let label = crate::hotbar::block_label(*block);
@@ -1107,14 +1108,23 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             } else {
                                 egui::Color32::from_rgb(230, 235, 240)
                             };
+                            // 用 allocate_ui_with_layout 显式给每格固定 54×36 的空间，
+                            // 避免在 horizontal 内嵌套 vertical_centered 时取走全部可用宽度
+                            // 导致 9 个格子全部叠在同一位置只显示一个的现象。
                             egui::Frame::default()
                                 .fill(bg)
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
-                                    ui.set_min_size(egui::vec2(54.0, 36.0));
-                                    ui.vertical_centered(|ui| {
-                                        ui.colored_label(fg, egui::RichText::new(&txt).size(11.0));
-                                    });
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(54.0, 36.0),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            ui.colored_label(
+                                                fg,
+                                                egui::RichText::new(&txt).size(11.0),
+                                            );
+                                        },
+                                    );
                                 });
                         }
                     });

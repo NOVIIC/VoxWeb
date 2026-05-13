@@ -1,7 +1,7 @@
 //! 客户端物理：玩家 AABB 与世界方块的分轴扫动碰撞，含 Walk / Fly 双模式。
 //!
 //! Walk 模式：重力 + 跳跃 + lerp 平滑的水平加速 + Y/X/Z 三轴依次扫动；
-//! Fly 模式：直接按相机朝向自由飞行，速度归零，不受重力。
+//! Fly 模式：WASD 沿水平面方向（不含 pitch）飞行，Space/Shift 控制升/降，速度归零不受重力。
 //!
 //! 服务端权威物理在 `voxweb_server::physics`（仅做范围/重叠校验）。
 //! 此处客户端物理为本地预测：在 Phase 3 单机模式下与 server 共享同一份 world，
@@ -88,8 +88,9 @@ impl LocalPhysics {
 
     fn step_fly(&mut self, camera: &Camera, input: &InputState, dt: f32) {
         let mut dir = Vec3::ZERO;
-        // Fly 用完整相机朝向（含 pitch），便于自由观察
-        let f = camera.forward();
+        // Fly 模式下 WASD 仅控制水平面方向（与 Walk 一致），避免视线朝下时按 W
+        // 反而往地里钻。垂直方向交给 Space（上升）/ Shift（下降）。
+        let f = camera.forward_horizontal();
         let r = camera.right();
         let u = Vec3::Y;
         if input.forward {
@@ -402,5 +403,50 @@ mod tests {
         assert!((eye.y - (60.0 + PLAYER_EYE_OFFSET)).abs() < 1e-6);
         assert!((eye.x - 1.0).abs() < 1e-6);
         assert!((eye.z - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fly_forward_is_horizontal_even_when_looking_down() {
+        // 即便相机朝下盯地，按 W（forward）也应只在水平面上移动，不下沉。
+        let getter = |_x: i32, _y: i32, _z: i32| BlockID::AIR;
+        let mut p = LocalPhysics::new(Vec3::new(0.0, 100.0, 0.0));
+        p.mode = CameraMode::Fly;
+        let mut camera = Camera::default();
+        camera.yaw = 0.0; // 朝 +X
+        camera.pitch = -1.2; // 大角度俯视
+        let mut input = InputState::default();
+        input.forward = true;
+        let y_before = p.feet_position.y;
+        p.step(&getter, &camera, &input, 0.5);
+        assert!(
+            (p.feet_position.y - y_before).abs() < 1e-4,
+            "Fly 模式按 W 不应改变 Y，但 y_before={} y_after={}",
+            y_before,
+            p.feet_position.y
+        );
+        assert!(
+            p.feet_position.x > 0.0,
+            "应当沿 +X 前进，得到 x={}",
+            p.feet_position.x
+        );
+    }
+
+    #[test]
+    fn fly_space_raises_player() {
+        // Fly 模式下空格应当让玩家上升（垂直方向交给 Space/Shift）。
+        let getter = |_x: i32, _y: i32, _z: i32| BlockID::AIR;
+        let mut p = LocalPhysics::new(Vec3::new(0.0, 100.0, 0.0));
+        p.mode = CameraMode::Fly;
+        let camera = Camera::default();
+        let mut input = InputState::default();
+        input.jump_held = true;
+        let y_before = p.feet_position.y;
+        p.step(&getter, &camera, &input, 0.5);
+        assert!(
+            p.feet_position.y > y_before,
+            "Space 应让玩家上升，y_before={} y_after={}",
+            y_before,
+            p.feet_position.y
+        );
     }
 }
