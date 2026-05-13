@@ -21,9 +21,7 @@
 | 阶段 | 包含 |
 |---|---|
 | **Phase 2 ✅** | `NetEndpoint::Local` 走 `futures::channel::mpsc` 双向通道；`new_local_pair` + `send_client_message` + `try_recv_server_message` + `ServerInbox` |
-| Phase 4 | `signaling.rs` / `peer.rs` / `room.rs` / `transport.rs` 完整实装；`NetEndpoint::Host / Remote` |
-
-下面 §3 起 `Host / Remote` 部分为 **Phase 4 前瞻设计**；Phase 2 仅实装 `Local` 分支。
+| **Phase 4 ✅** | `signaling.rs` / `peer.rs` / `room.rs` / `transport.rs` 完整实装；`NetEndpoint::Host / Remote`；信令 WebSocket + WebRTC PeerConnection + 双 DataChannel；Ping/Pong RTT 测量 |
 
 ---
 
@@ -285,32 +283,35 @@ impl PeerConnection {
 ```rust
 pub enum RoomSession {
     Idle,
-    JoiningSignaling,
-    Negotiating { progress: NegotiationProgress },
+    SignalingConnect,
+    AwaitRegistered,
+    Negotiating(NegotiationProgress),
     Connected,
     Disconnected { reason: String },
 }
 
 pub struct NegotiationProgress {
     pub signaling_ok: bool,
-    pub offer_sent: bool,
-    pub answer_received: bool,
-    pub ice_complete: bool,
+    pub registered: bool,
+    pub offer_exchanged: bool,
+    pub answer_exchanged: bool,
+    pub data_channel_opened: bool,
 }
 ```
 
 状态转换：
 
 ```
-Idle ──connect()──▶ JoiningSignaling ──Registered──▶ Negotiating
-                                                         │
-   ┌───────────────────────── ICE complete + DataChannel open ──┐
-   ▼                                                            ▼
-Connected ◀────────────────────────────────────  Negotiating
-   │
-   │ DataChannel close / signaling close / 显式 leave
-   ▼
-Disconnected
+Idle ──connect()──▶ SignalingConnect ──WS open──▶ AwaitRegistered ──Registered──▶ Negotiating
+                                                                                       │
+                                      ICE complete + DataChannel open                   │
+                                      ┌────────────────────────────────────────────────┘
+                                      ▼
+                                   Connected
+                                      │
+                                      │ DC close / signaling close / 显式 leave
+                                      ▼
+                                   Disconnected
 ```
 
 ---

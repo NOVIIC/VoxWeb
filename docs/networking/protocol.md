@@ -41,7 +41,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 | `Place` | reliable | 按需 | `pos: Position, block: BlockID, request_id: u32` | 放方块 |
 | `Chat` | reliable | 按需 | `content: String` | 文字聊天（≤ 256 字符） |
 | `Ping` | unreliable | 5s | `client_time_ms: u64` | 时延探测，可选 |
-| `Goodbye` | reliable | 一次（断开前） | 无 | 优雅关闭，可选 |
+| `Goodbye` | reliable | 一次（断开前） | 无 | 优雅关闭（v2） |
 
 ### Server → Client
 

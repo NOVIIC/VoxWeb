@@ -2,12 +2,14 @@
 //!
 //! Phase 3：Game 持有 LocalPhysics（驱动 camera.position）、Hotbar、PendingActions、
 //! current_hit（DDA 射线命中缓存）等运行时状态。
+//! Phase 4：Game 增加 [`GameMode`] 区分 Local / Host / Remote，并补 RTT 计时字段。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use glam::Vec3;
-use voxweb_net::{NetEndpoint, ServerInbox};
+use voxweb_net::{NetEndpoint, NetError, ServerInbox};
 use voxweb_server::Server;
 
 use crate::camera::Camera;
@@ -36,6 +38,18 @@ pub enum AppState {
     ChatOpen,
     /// 连接断开提示（Phase 4+ 起使用）
     Disconnected,
+}
+
+/// 当前 Game 实例的网络模式（决定主循环要不要 server.tick / chunk_loader 等）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GameMode {
+    /// 单机：内部 mpsc，server 全权处理。
+    Local,
+    /// 房主：本地 mpsc + 信令 + 多 Remote PC。本地 server 仍正常 tick。
+    Host,
+    /// 远端客户端：仅持有 PeerConnection 到 Host。Phase 4 仍跑本地 server 做 placeholder
+    /// （世界与 Host 不同步，Phase 5 改为 Host 推送）。
+    Remote,
 }
 
 /// Phase 3 游戏运行时设置。Phase 6 起会扩展为 AppSettings 全集。
@@ -107,6 +121,7 @@ impl Default for FrameClock {
 
 /// InGame 状态下的所有运行时资源。
 pub struct Game {
+    pub mode: GameMode,
     pub server: Rc<RefCell<Server>>,
     pub server_inbox: ServerInbox,
     pub net: NetEndpoint,
@@ -124,6 +139,14 @@ pub struct Game {
     pub last_break_at_ms: f64,
     /// 自己的 entity_id（由 Welcome 提供）。
     pub entity_id: u32,
+    /// Phase 4：RTT（毫秒）。`None` 表示未测过 / 上次 Ping 还没回。Local 模式永远 None。
+    pub rtt_ms: Option<f32>,
+    /// 上次发 Ping 的 performance.now() 毫秒。0 表示从未发过。
+    pub last_ping_sent_ms: f64,
+    /// 待响应的 Ping 集合：client_time_ms → 发送时刻 performance.now() ms。
+    pub pending_pings: HashMap<u64, f64>,
+    /// 房间号（Host/Remote 模式有效；Local 留空）。
+    pub room_id: String,
 }
 
 impl Game {
@@ -131,10 +154,72 @@ impl Game {
     pub fn new_local(seed: u64, settings: GameSettings) -> Self {
         let server = Rc::new(RefCell::new(Server::new(seed)));
         let (net, server_inbox) = NetEndpoint::new_local_pair();
+        Self::assemble(
+            GameMode::Local,
+            server,
+            server_inbox,
+            net,
+            settings,
+            String::new(),
+        )
+    }
+
+    /// 启动一个 Host 游戏：本地仍跑 Server（Local 风格），同时连信令接受 Remote。
+    pub fn new_host(
+        seed: u64,
+        settings: GameSettings,
+        signaling_url: &str,
+        room_id: &str,
+        display_name: &str,
+    ) -> Result<Self, NetError> {
+        let server = Rc::new(RefCell::new(Server::new(seed)));
+        let (net, server_inbox) = NetEndpoint::new_host(signaling_url, room_id, display_name)?;
+        Ok(Self::assemble(
+            GameMode::Host,
+            server,
+            server_inbox,
+            net,
+            settings,
+            room_id.to_string(),
+        ))
+    }
+
+    /// 启动一个 Remote 客户端：连信令、等 Host SDP。Phase 4 本地仍创建一个 Server 占位
+    /// （世界不与 Host 同步；Phase 5 起改为 Host 推送）。
+    pub fn new_remote(
+        settings: GameSettings,
+        signaling_url: &str,
+        room_id: &str,
+        display_name: &str,
+    ) -> Result<Self, NetError> {
+        // Remote 端 server 仅占位，seed 用 0；world 不会进入 view（Phase 5 替换）
+        let server = Rc::new(RefCell::new(Server::new(0)));
+        // server_inbox 在 Remote 模式不参与驱动；为保持 Game 字段不可空，造一对空 mpsc
+        let (_net_local, dummy_inbox) = NetEndpoint::new_local_pair();
+        let net = NetEndpoint::new_remote(signaling_url, room_id, display_name)?;
+        Ok(Self::assemble(
+            GameMode::Remote,
+            server,
+            dummy_inbox,
+            net,
+            settings,
+            room_id.to_string(),
+        ))
+    }
+
+    fn assemble(
+        mode: GameMode,
+        server: Rc<RefCell<Server>>,
+        server_inbox: ServerInbox,
+        net: NetEndpoint,
+        settings: GameSettings,
+        room_id: String,
+    ) -> Self {
         let camera = Camera::default();
         let physics = LocalPhysics::new(Vec3::new(8.0, 100.0, 8.0));
         let render_distance = settings.render_distance;
         Self {
+            mode,
             server,
             server_inbox,
             net,
@@ -149,6 +234,10 @@ impl Game {
             current_hit: None,
             last_break_at_ms: 0.0,
             entity_id: 0, // 待 Welcome 填充
+            rtt_ms: None,
+            last_ping_sent_ms: 0.0,
+            pending_pings: HashMap::new(),
+            room_id,
         }
     }
 }

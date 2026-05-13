@@ -153,23 +153,26 @@ VoxWeb/
 │   │       ├── lib.rs          # 模块声明 + re-export
 │   │       ├── block.rs        # BlockID + 硬编码方块表
 │   │       ├── chunk.rs        # Chunk + Position + ChunkPos
+│   │       ├── geometry.rs     # AABB + 玩家碰撞体工具
 │   │       └── protocol.rs     # ClientMessage / ServerMessage / RoomEvent
 │   ├── render/                 # WGPU 渲染（仅 WebGPU 后端）
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs          # Renderer + Vertex
+│   │       ├── lib.rs          # Renderer + 公开 API
 │   │       ├── device.rs       # Surface + Device 与 canvas 绑定
-│   │       ├── graph.rs        # Render Graph 调度
+│   │       ├── graph.rs        # Render Graph 调度框架（trait，当前未接入渲染路径）
 │   │       ├── passes/
-│   │       │   ├── depth.rs    # Depth Pre-Pass（可选）
+│   │       │   ├── mod.rs
 │   │       │   ├── opaque.rs   # 实体方块 Pass
-│   │       │   ├── skybox.rs   # 天空盒 Pass
-│   │       │   ├── transparent.rs # 半透明 Pass
-│   │       │   └── ui.rs       # egui-wgpu Pass
-│   │       ├── chunk_mesh.rs   # 贪婪网格化 + 跨区块面剔除
+│   │       │   ├── skybox.rs   # 天空盒 Pass（Phase 8 实装）
+│   │       │   ├── transparent.rs # 半透明 Pass（Phase 8 实装）
+│   │       │   └── selection.rs   # 选中方块线框 Pass（Phase 3）
+│   │       ├── chunk_mesh.rs   # 朴素逐面网格化 + 跨区块面剔除（贪婪算法 Phase 7）
 │   │       ├── vertex.rs       # u32 压缩格式
 │   │       ├── texture.rs      # 纹理图集
-│   │       └── shaders/        # WGSL 源（内嵌 include_str!）
+│   │       └── shaders/
+│   │           ├── chunk.wgsl      # 实体方块着色器
+│   │           └── selection.wgsl  # 选中线框着色器
 │   ├── server/                 # 世界逻辑（lib only）
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -177,7 +180,7 @@ VoxWeb/
 │   │       ├── world.rs        # World + 玩家表 + tick
 │   │       ├── terrain.rs      # Perlin 地形
 │   │       ├── physics.rs      # 物理仲裁
-│   │       └── persistence.rs  # OPFS flush 触发逻辑（具体读写在 client 异步任务中）
+│   │       └── persistence.rs  # PersistenceManager stub（Phase 5 实装 full API）
 │   ├── net/                    # P2P 网络层
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -189,22 +192,26 @@ VoxWeb/
 │   └── client/                 # 入口（cdylib for wasm）
 │       ├── Cargo.toml
 │       └── src/
-│           ├── lib.rs          # #[wasm_bindgen(start)] + 主循环
-│           ├── app.rs          # AppState 状态机
+│           ├── lib.rs          # #[wasm_bindgen(start)] + 主循环 + HUD 绘制
+│           ├── app.rs          # AppState 状态机 + Game 主结构
 │           ├── camera.rs       # 第一人称相机
 │           ├── input.rs        # 键盘/鼠标输入
-│           ├── physics.rs      # 玩家本地物理（预测）
+│           ├── physics.rs      # 玩家本地物理（Walk/Fly）
 │           ├── raycast.rs      # DDA 射线
-│           ├── prediction.rs   # 客户端预测协调
-│           ├── interp.rs       # 远端玩家插值
+│           ├── prediction.rs   # 客户端预测 + PendingActions rollback
+│           ├── interp.rs       # 远端玩家插值（Phase 5 实装）
+│           ├── mesh_jobs.rs    # 网格化任务队列 + 分帧调度
+│           ├── chunk_loader.rs # 区块滚动加载 / 卸载
+│           ├── hotbar.rs       # 9 格快捷栏
 │           ├── ui/
 │           │   ├── mod.rs
-│           │   ├── lobby.rs    # 大厅
-│           │   ├── hud.rs      # HUD
-│           │   ├── pause.rs    # 暂停菜单
-│           │   ├── chat.rs     # 聊天
-│           │   └── players.rs  # 玩家列表/名牌
-│           └── storage.rs      # OPFS 异步包装（WorldStorage trait + OpfsStorage 实现）
+│           │   ├── lobby.rs    # 大厅 + Connecting UI
+│           │   ├── hud.rs      # HUD 绘制函数
+│           │   ├── pause.rs    # 暂停菜单（Phase 6）
+│           │   ├── chat.rs     # 聊天（Phase 6）
+│           │   ├── players.rs  # 玩家列表/名牌（Phase 6）
+│           │   └── ui_state.rs # UI 状态哈希（防止重复渲染判断）
+│           └── storage.rs      # OPFS 异步包装（Phase 5 实装，当前为 stub）
 └── signaling/                  # 独立部署（TS 项目）
     ├── wrangler.toml
     ├── package.json

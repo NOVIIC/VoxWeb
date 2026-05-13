@@ -106,10 +106,15 @@ wasm-pack test --headless --chrome -p voxweb-client
 ### 2.6 多窗口本地联机测试
 
 打开两个浏览器窗口（或同浏览器两个 Tab）：
-- 窗口 A：访问 `http://localhost:8080?signaling=ws://localhost:8787` → 创建房间 `test01`
-- 窗口 B：同地址 → 加入房间 `test01`
+- 窗口 A：访问 `http://localhost:8080/start?signaling=ws://localhost:8787` → 创建房间（不填则自动生成 6 位），URL 会自动加 `&room=<id>`
+- 窗口 B：复制 A 浏览器地址栏的完整 URL 打开 → 房间号已预填 → 点 Join Room
 
-预期：B 窗口能看到 A 创建的世界，并互相能看到对方移动。
+> URL 参数说明：
+> - `?signaling=ws://host:port`：覆盖 `<meta name="signaling-url">`，**仅当 query 缺失时才回退到 meta**。
+> - `?room=<id>`：进入 Lobby 时自动填入 Room ID 输入框；房主点 Create Room 后也会通过 `history.replaceState` 写回这个参数。
+
+预期：双方都进入 InGame，HUD 出现 `RTT xx.x ms`；`chrome://webrtc-internals` 可见双 DC `open`。
+Phase 4 本期两端各自渲染独立的本地世界（不互相同步），世界同步在 Phase 5 实装。
 
 ---
 

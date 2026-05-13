@@ -10,6 +10,7 @@
 ```
 Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase 5 ─▶ Phase 6 ─▶ Phase 7 ─▶ Phase 8 ─▶ Phase 9 (stretch)
 脚手架      渲染骨架     体素单人     物理交互     P2P 通道     权威同步     多人 UI      渲染优化     多 Pass+存档   后处理/TURN/触屏
+  ✅          ✅          ✅          ✅          ✅
 ```
 
 每个 Phase **可独立验收**：完成时可以演示一个具体的、可观察的功能。后续 Phase 只增不破。
@@ -142,7 +143,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 4 · P2P 通道
+## Phase 4 · P2P 通道 ✅
+
+> 完成日期：2026-05-13 · 详见 [`../PHASE_4_DONE.md`](../PHASE_4_DONE.md)
 
 ### 目标
 让两个浏览器 Tab 之间能传字节。先不接入服务端逻辑，只验证 WebRTC + 信令 + DataChannel 工作正常。
@@ -153,15 +156,15 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`networking/protocol.md`](networking/protocol.md)（消息格式）
 
 ### 任务清单
-- [ ] `signaling/` Cloudflare Workers + Durable Object 完整实现
-- [ ] `wrangler dev --local` 本地跑通
-- [ ] `net::signaling` Rust 端 WebSocket 客户端 + Closure 事件回调
-- [ ] `net::peer` PeerConnection + DataChannel（双通道）
-- [ ] `net::room` 状态机
-- [ ] `net::NetEndpoint::Host` / `::Remote` 实装
-- [ ] 大厅"创建房间" / "加入房间" UI（Phase 1 实装的简化版扩展）
-- [ ] 调试：connecting UI 显示进度
-- [ ] 简单消息 ping-pong：Remote 发 `Ping{client_time_ms}`，Host 回 `Pong`，HUD 显示 RTT
+- [x] `signaling/` Cloudflare Workers + Durable Object 完整实现
+- [x] `wrangler dev --local` 本地跑通
+- [x] `net::signaling` Rust 端 WebSocket 客户端 + Closure 事件回调
+- [x] `net::peer` PeerConnection + DataChannel（双通道）
+- [x] `net::room` 状态机
+- [x] `net::NetEndpoint::Host` / `::Remote` 实装
+- [x] 大厅"创建房间" / "加入房间" UI（Phase 1 实装的简化版扩展）
+- [x] 调试：connecting UI 显示进度
+- [x] 简单消息 ping-pong：Remote 发 `Ping{client_time_ms}`，Host 回 `Pong`，HUD 显示 RTT
 
 ### 验证
 - 同一台机两个 Tab：A 创建房间 abc123，B 加入 abc123

@@ -243,14 +243,13 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::De
 ```rust
 pub mod block;
 pub mod chunk;
+pub mod geometry;
 pub mod protocol;
 
 pub use block::{BlockID, BlockProperties, properties};
-pub use chunk::{Chunk, ChunkPos, Position, CHUNK_X, CHUNK_Y, CHUNK_Z, CHUNK_SIZE};
-pub use protocol::{
-    ClientMessage, ServerMessage, RoomEvent, PlayerSnapshot, AckReason,
-    encode, decode, bincode_config,
-};
+pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
+pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
+pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};
 ```
 
 ---

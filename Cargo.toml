@@ -29,6 +29,7 @@ glam = { version = "0.32", features = ["bytemuck", "serde"] }
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 bytemuck = { version = "1", features = ["derive"] }
 
@@ -55,11 +56,22 @@ web-sys = { version = "0.3", features = [
     "RtcConfiguration",
     "RtcDataChannel",
     "RtcDataChannelInit",
+    "RtcDataChannelEvent",
+    "RtcDataChannelState",
+    "RtcDataChannelType",
     "RtcSessionDescription",
     "RtcSessionDescriptionInit",
     "RtcIceCandidate",
     "RtcIceCandidateInit",
+    "RtcPeerConnectionIceEvent",
+    "RtcPeerConnectionState",
+    "RtcIceConnectionState",
+    "RtcIceGatheringState",
     "RtcSdpType",
+    "CloseEvent",
+    "HtmlMetaElement",
+    "History",
+    "UrlSearchParams",
     "PointerEvent",
     "KeyboardEvent",
     "MouseEvent",

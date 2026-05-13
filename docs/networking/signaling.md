@@ -287,10 +287,10 @@ function validRoomId(s: string): boolean {
 ```toml
 name = "voxweb-signaling"
 main = "src/worker.ts"
-compatibility_date = "2026-04-01"
+compatibility_date = "2025-01-01"
 
 [[durable_objects.bindings]]
-name = "ROOMS"
+name = "ROOM"
 class_name = "Room"
 
 [[migrations]]

@@ -2,3 +2,5 @@
 /dist
 *local*
 /.claude/worktrees
+node_modules
+.wrangler

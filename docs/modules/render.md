@@ -27,23 +27,19 @@
 crates/render/src/
 ├── lib.rs              Renderer 入口 + 公开 API
 ├── device.rs           Surface/Device 与 canvas 绑定
-├── graph.rs            Render Graph 调度框架
+├── graph.rs            Render Graph 调度框架（trait，当前未接入渲染路径）
 ├── passes/
 │   ├── mod.rs
-│   ├── depth.rs        Depth Pre-Pass（可选开关）
 │   ├── opaque.rs       实体方块 Pass
-│   ├── skybox.rs       天空盒 Pass（程序化天空）
-│   ├── transparent.rs  半透明 Pass（水/玻璃）
-│   └── ui.rs           egui-wgpu Pass 容器
-├── chunk_mesh.rs       贪婪网格化算法（详见 features/meshing.md）
+│   ├── skybox.rs       天空盒 Pass（Phase 8 实装）
+│   ├── transparent.rs  半透明 Pass（Phase 8 实装）
+│   └── selection.rs    选中方块线框 Pass（Phase 3）
+├── chunk_mesh.rs       朴素逐面网格化 + 跨区块面剔除（贪婪算法 Phase 7）
 ├── vertex.rs           u32 压缩格式 + 解包工具
 ├── texture.rs          纹理图集
-├── camera.rs           相机 uniform 数据布局（不含相机控制逻辑）
 └── shaders/
-    ├── opaque.wgsl
-    ├── skybox.wgsl
-    ├── transparent.wgsl
-    └── postprocess.wgsl   （v2/stretch）
+    ├── chunk.wgsl      实体方块着色器
+    └── selection.wgsl  选中线框着色器
 ```
 
 ---
@@ -60,23 +56,15 @@ crates/render/src/
 **关键 API**：
 
 ```rust
-pub struct RenderDevice {
-    pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+pub struct DeviceContext {
     pub surface: wgpu::Surface<'static>,
-    pub config: wgpu::SurfaceConfiguration,
-    pub depth_texture: DepthTexture,
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
+    pub surface_format: wgpu::TextureFormat,
 }
 
-impl RenderDevice {
-    /// 异步初始化，需在 wasm-bindgen-futures 的 spawn_local 中调用
-    pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Self, RenderInitError>;
-
-    pub fn resize(&mut self, width: u32, height: u32);
-    pub fn surface_format(&self) -> wgpu::TextureFormat;
-}
+/// 异步初始化，需在 wasm-bindgen-futures 的 spawn_local 中调用
+pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceContext, String>;
 ```
 
 **WebGPU 特定注意**：
@@ -288,40 +276,45 @@ pub struct CameraUniform {
 
 ```rust
 pub struct Renderer {
-    pub device: RenderDevice,
-    pub graph: RenderGraph,
-    pub textures: TextureAtlas,
-    pub camera_buffer: wgpu::Buffer,
-    pub camera_bind_group: wgpu::BindGroup,
-    pub chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>,
-    pub egui_renderer: egui_wgpu::Renderer,
-    pub settings: RenderSettings,
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
+    pub surface: wgpu::Surface<'static>,
+    pub surface_format: wgpu::TextureFormat,
+    // 内部字段：width, height, depth_texture, depth_view,
+    // opaque_pass: OpaquePass, selection_pass: SelectionPass,
+    // chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>
 }
 
 impl Renderer {
-    pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Self, RenderInitError>;
-    pub fn resize(&mut self, w: u32, h: u32);
+    pub async fn new(canvas: &web_sys::HtmlCanvasElement) -> Result<Self, String>;
+    pub fn resize(&mut self, width: u32, height: u32);
 
-    /// 上传或更新一个 chunk 的网格（由 mesh job 完成贪婪算法后调用）
-    pub fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: ChunkMeshCpu);
+    /// 上传或更新一个 chunk 的网格（由 mesh job 完成后调用）
+    pub fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMeshCpu);
 
     /// 卸载远处 chunk 网格
     pub fn drop_chunk_mesh(&mut self, pos: ChunkPos);
 
-    /// 更新相机数据
-    pub fn update_camera(&mut self, uniform: &CameraUniform);
+    /// 查询某个 chunk 是否已有 GPU mesh
+    pub fn has_chunk_mesh(&self, pos: ChunkPos) -> bool;
 
-    /// 渲染一帧（client 主循环每帧调用）
-    pub fn render_frame(&mut self, frame_data: &FrameData, egui_output: egui::FullOutput);
-}
+    /// 取得本帧 surface texture（失败时自动重配 Surface）
+    pub fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture>;
 
-pub struct RenderSettings {
-    pub depth_prepass_enabled: bool,
-    pub render_distance_chunks: u32,
-    pub fov_degrees: f32,
-    pub vsync: bool,                 // 浏览器侧仅作为提示，实际由 RAF 决定
+    /// 渲染世界（OpaquePass）：清屏 + 遍历所有 chunk_meshes 绘制
+    pub fn render_world(&mut self, encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView, view_proj: Mat4, clear_color: [f64; 4]);
+
+    /// 渲染选中方块线框（在 render_world 之后调用）
+    pub fn render_selection(&mut self, encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView, view_proj: Mat4, block_pos: Option<Position>);
+
+    pub fn depth_view(&self) -> &wgpu::TextureView;
+    pub fn loaded_chunk_count(&self) -> usize;
 }
 ```
+
+> **注**：当前 Renderer 未持有 egui renderer / camera buffer / RenderSettings。egui 渲染由 client 自行管理；camera uniform 通过 `render_world` 的 `view_proj` 参数每帧传入。`RenderGraph` trait 在 [graph.rs](graph.rs) 中已定义但渲染路径未使用（直接调用 `render_world`/`render_selection`），待 Phase 8 多 Pass 接入。
 
 ---
 
@@ -331,8 +324,6 @@ pub struct RenderSettings {
 |---|---|---|
 | `Surface` / `Device` / `Queue` | `Renderer::new` 一次 | Tab 关闭 |
 | `depth_texture` | 启动 + 每次 resize | 重建时 |
-| `texture_atlas` | 启动一次 | 程序退出 |
-| `camera_buffer` | 启动一次 | 程序退出 |
 | `chunk_mesh_gpu` | `upload_chunk_mesh` | `drop_chunk_mesh`（玩家走远）/ chunk 修改时（重建） |
 | Pass pipelines | 各 Pass `new` 一次 | 程序退出 |
 

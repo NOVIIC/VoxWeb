@@ -38,7 +38,7 @@
 
 ```
 crates/client/src/
-├── lib.rs              wasm 入口 + 主循环
+├── lib.rs              wasm 入口 + 主循环 + HUD 绘制 + 事件监听
 ├── app.rs              AppState 状态机 + App / Game 主结构
 ├── camera.rs           第一人称相机
 ├── input.rs            键盘/鼠标输入管理
@@ -48,15 +48,16 @@ crates/client/src/
 ├── raycast.rs          [Phase 3 ✅] DDA 射线
 ├── hotbar.rs           [Phase 3 ✅] 9 格快捷栏 + 方块标签
 ├── prediction.rs       [Phase 3 ✅] 挖放 PendingActions（rollback）；[Phase 5] 完整输入历史+协调
-├── interp.rs           [Phase 5] 远端玩家位置插值
-├── storage.rs          [Phase 5] OPFS 异步包装（`WorldStorage` trait + `OpfsStorage` 实现）
+├── interp.rs           [Phase 5] 远端玩家位置插值（当前为 stub）
+├── storage.rs          [Phase 5] OPFS 异步包装（当前为 stub；`WorldStorage` trait + `OpfsStorage` 占位）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
-    ├── lobby.rs        [Phase 2] 大厅：单机模式按钮 + 种子（Phase 4 加 Host/Join）
-    ├── hud.rs          [Phase 1+] HUD：FPS / 坐标 / 玩家列表 / 准星
-    ├── pause.rs        [Phase 6] 暂停菜单
-    ├── chat.rs         [Phase 6] 聊天框 + 消息历史
-    └── players.rs      [Phase 6] 玩家名牌（3D billboard）+ 玩家列表 widget
+    ├── lobby.rs        [Phase 2] 大厅 + Connecting UI（单机/Host/Remote 入口 + 连接进度）
+    ├── hud.rs          [Phase 1+] HUD 绘制函数（供 lib.rs 调用）
+    ├── pause.rs        [Phase 6] 暂停菜单（当前 stub）
+    ├── chat.rs         [Phase 6] 聊天框 + 消息历史（当前 stub）
+    ├── players.rs      [Phase 6] 玩家名牌（3D billboard）+ 玩家列表 widget（当前 stub）
+    └── ui_state.rs     UI 状态哈希（防止重复渲染判断）
 ```
 
 ---

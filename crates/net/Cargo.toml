@@ -13,9 +13,13 @@ web-sys.workspace = true
 js-sys.workspace = true
 
 serde.workspace = true
+serde_json.workspace = true
 bincode.workspace = true
 futures-channel.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+glam.workspace = true
 
 [lints]
 workspace = true

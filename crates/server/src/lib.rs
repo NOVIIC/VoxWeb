@@ -23,6 +23,9 @@ pub struct Server {
     /// 玩家位置表：entity_id → 脚底世界坐标。Phase 3 仅用于挖放范围/重叠仲裁。
     /// Phase 5 会扩展为完整 PlayerSnapshot（含 yaw/pitch）并参与 PlayerTick 广播。
     pub players: HashMap<u32, Vec3>,
+    /// 当前实时时钟（毫秒，performance.now() 量级）。Host 每帧由主循环更新；
+    /// `Pong` 响应时携带，配合客户端的 `Ping.client_time_ms` 计算 RTT。
+    pub current_time_ms: u64,
 }
 
 /// Phase 3 单玩家固定 entity_id；Phase 5 由 add_player 动态分配。
@@ -39,7 +42,13 @@ impl Server {
             tick: 0,
             seed,
             players: HashMap::new(),
+            current_time_ms: 0,
         }
+    }
+
+    /// 由 Host 主循环每帧更新（performance.now() 毫秒）；Pong 中带回。
+    pub fn set_clock(&mut self, ms: u64) {
+        self.current_time_ms = ms;
     }
 
     /// 每帧 tick（60Hz）：推进物理、标记 dirty chunks、持久化触发。
@@ -122,6 +131,13 @@ impl Server {
                     }]
                 }
             }
+            ClientMessage::Ping { client_time_ms } => {
+                // Phase 4：心跳 + RTT 探测。server_time_ms 由 Host 主循环每帧通过 set_clock 更新。
+                vec![ServerMessage::Pong {
+                    client_time_ms,
+                    server_time_ms: self.current_time_ms,
+                }]
+            }
             _ => vec![],
         }
     }
@@ -180,10 +196,21 @@ mod handle_message_tests {
     }
 
     #[test]
-    fn ping_message_returns_empty_vec() {
+    fn ping_returns_pong_with_server_clock() {
         let mut server = Server::new(0);
-        let replies = server.handle_message(1, ClientMessage::Ping { client_time_ms: 0 });
-        assert!(replies.is_empty(), "Phase 3 Ping handler 未实装，应返回空");
+        server.set_clock(12345);
+        let replies = server.handle_message(1, ClientMessage::Ping { client_time_ms: 7 });
+        assert_eq!(replies.len(), 1);
+        match &replies[0] {
+            ServerMessage::Pong {
+                client_time_ms,
+                server_time_ms,
+            } => {
+                assert_eq!(*client_time_ms, 7);
+                assert_eq!(*server_time_ms, 12345);
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
     }
 
     /// 把 chunk(0,0) 的一柱方块设置好，便于挖放测试。

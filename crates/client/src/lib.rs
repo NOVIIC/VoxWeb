@@ -26,20 +26,29 @@ use web_sys::HtmlCanvasElement;
 
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::Position;
-use voxweb_core::protocol::{ClientMessage, ServerMessage};
+use voxweb_core::protocol::{ClientMessage, RoomEvent, ServerMessage};
 use voxweb_render::Renderer;
 
-use crate::app::{AppState, Game, GameSettings};
+use crate::app::{AppState, Game, GameMode, GameSettings};
 use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
 use crate::mesh_jobs::MeshPriority;
 use crate::prediction::{PendingAction, PendingKind};
 use crate::raycast::raycast;
-use crate::ui::lobby::{LobbyAction, LobbyState, draw_lobby};
+use crate::ui::lobby::{
+    ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
+    validate_room_id,
+};
 
 /// 玩家眼睛到目标方块的最大射程（与 server::physics::MAX_REACH 对齐）。
 const MAX_REACH: f32 = 6.0;
+
+/// Ping 间隔（毫秒）。
+const PING_INTERVAL_MS: f64 = 5000.0;
+
+/// 信令服务 URL meta tag 名称。
+const SIGNALING_META_NAME: &str = "signaling-url";
 
 /// 全局 App：跨 state 持有 renderer / egui / input；InGame 时持有 Game。
 struct App {
@@ -55,6 +64,13 @@ struct App {
 
     state: AppState,
     lobby_state: LobbyState,
+    /// 当前正在 / 已 / 失败的连接尝试的房间号 & 模式（仅 Host/Remote 时有效）。
+    connecting_mode: GameMode,
+    connecting_room_id: String,
+    connecting_error: Option<String>,
+    /// 断开后的提示语，配合 AppState::Disconnected 显示。
+    disconnect_reason: Option<String>,
+
     game: Option<Game>,
 
     /// 上一帧 performance.now()（毫秒）
@@ -102,6 +118,14 @@ pub async fn start() -> Result<(), JsValue> {
     let input = Rc::new(RefCell::new(InputState::default()));
     let egui_events: Rc<RefCell<Vec<egui::Event>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // ?room=abc123 → 预填 Lobby 输入框，方便分享链接直接落到正确的房间号
+    let mut lobby_state = LobbyState::default();
+    if let Some(initial_room) = read_query_param("room")
+        && !initial_room.is_empty()
+    {
+        lobby_state.room_id_input = initial_room;
+    }
+
     let app = Rc::new(RefCell::new(App {
         canvas: canvas.clone(),
         renderer,
@@ -110,7 +134,11 @@ pub async fn start() -> Result<(), JsValue> {
         input: input.clone(),
         egui_events: egui_events.clone(),
         state: AppState::Lobby,
-        lobby_state: LobbyState::default(),
+        lobby_state,
+        connecting_mode: GameMode::Local,
+        connecting_room_id: String::new(),
+        connecting_error: None,
+        disconnect_reason: None,
         game: None,
         last_time_ms: now_ms(),
         fps_frames: 0,
@@ -203,12 +231,15 @@ fn install_event_listeners(
     }
 
     // —— 键盘 ——
+    // InGame：用 e.code() 映射物理键到 KeyCode 给物理/相机/hotbar；
+    // Lobby/Connecting/...：用 e.key() 转 egui::Event::Text / Event::Key，让 TextEdit 收到输入。
     {
         let input_clone = input.clone();
         let app_clone = app.clone();
+        let egui_events_clone = egui_events.clone();
         let on_keydown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
-            // Lobby 时让 egui 接管文本输入（不消费 WASD）
             if app_clone.borrow().state != AppState::InGame {
+                forward_keydown_to_egui(&e, &egui_events_clone);
                 return;
             }
             if let Some(key) = map_key(&e.code()) {
@@ -225,8 +256,10 @@ fn install_event_listeners(
     {
         let input_clone = input.clone();
         let app_clone = app.clone();
+        let egui_events_clone = egui_events.clone();
         let on_keyup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
             if app_clone.borrow().state != AppState::InGame {
+                forward_keyup_to_egui(&e, &egui_events_clone);
                 return;
             }
             if let Some(key) = map_key(&e.code()) {
@@ -343,6 +376,99 @@ fn map_pointer_button(button: i16) -> Option<egui::PointerButton> {
     }
 }
 
+/// 在 Lobby / Connecting 等 InGame 之外的状态下，把 keydown 事件转 egui Event。
+/// - 可识别的功能键（Backspace / Enter / 箭头键 / Tab / Esc / Home / End …）→ Event::Key{pressed=true}
+/// - 单字符 + 无 Ctrl/Alt/Meta → Event::Text，让 TextEdit 接收
+fn forward_keydown_to_egui(
+    e: &web_sys::KeyboardEvent,
+    egui_events: &Rc<RefCell<Vec<egui::Event>>>,
+) {
+    let modifiers = egui::Modifiers {
+        alt: e.alt_key(),
+        ctrl: e.ctrl_key(),
+        shift: e.shift_key(),
+        mac_cmd: e.meta_key(),
+        command: e.ctrl_key() || e.meta_key(),
+    };
+    let key_str = e.key();
+
+    if let Some(egui_key) = map_web_key_to_egui(&key_str) {
+        egui_events.borrow_mut().push(egui::Event::Key {
+            key: egui_key,
+            physical_key: None,
+            pressed: true,
+            repeat: e.repeat(),
+            modifiers,
+        });
+        // 阻止浏览器默认行为：Tab 切换焦点、Backspace 后退、空格滚动等
+        if matches!(
+            egui_key,
+            egui::Key::Backspace
+                | egui::Key::Tab
+                | egui::Key::ArrowUp
+                | egui::Key::ArrowDown
+                | egui::Key::ArrowLeft
+                | egui::Key::ArrowRight
+                | egui::Key::Space
+        ) {
+            e.prevent_default();
+        }
+    } else if key_str.chars().count() == 1
+        && !modifiers.ctrl
+        && !modifiers.alt
+        && !modifiers.mac_cmd
+    {
+        // 单个可见字符：作为文本输入
+        let c = key_str.chars().next().unwrap();
+        if !c.is_control() {
+            egui_events.borrow_mut().push(egui::Event::Text(key_str));
+        }
+    }
+}
+
+/// 同上的 keyup 版本：只发 Key{pressed=false}（egui 用它跟踪按住状态）。
+fn forward_keyup_to_egui(e: &web_sys::KeyboardEvent, egui_events: &Rc<RefCell<Vec<egui::Event>>>) {
+    let modifiers = egui::Modifiers {
+        alt: e.alt_key(),
+        ctrl: e.ctrl_key(),
+        shift: e.shift_key(),
+        mac_cmd: e.meta_key(),
+        command: e.ctrl_key() || e.meta_key(),
+    };
+    if let Some(egui_key) = map_web_key_to_egui(&e.key()) {
+        egui_events.borrow_mut().push(egui::Event::Key {
+            key: egui_key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+    }
+}
+
+/// `KeyboardEvent.key`（如 "Backspace", "ArrowLeft"）→ egui::Key。
+/// 单字符键（如 "a", "1"）返回 None，由 Text 事件处理。
+fn map_web_key_to_egui(key: &str) -> Option<egui::Key> {
+    use egui::Key;
+    Some(match key {
+        "Backspace" => Key::Backspace,
+        "Delete" => Key::Delete,
+        "Enter" => Key::Enter,
+        "Tab" => Key::Tab,
+        "Escape" => Key::Escape,
+        "ArrowLeft" => Key::ArrowLeft,
+        "ArrowRight" => Key::ArrowRight,
+        "ArrowUp" => Key::ArrowUp,
+        "ArrowDown" => Key::ArrowDown,
+        "Home" => Key::Home,
+        "End" => Key::End,
+        "PageUp" => Key::PageUp,
+        "PageDown" => Key::PageDown,
+        " " => Key::Space,
+        _ => return None,
+    })
+}
+
 /// 把 web_sys::KeyboardEvent.code() 映射到 winit::KeyCode（输入层使用统一枚举）。
 fn map_key(code: &str) -> Option<winit::keyboard::KeyCode> {
     use winit::keyboard::KeyCode;
@@ -390,7 +516,8 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
     let state = app.borrow().state.clone();
     match state {
         AppState::InGame => render_game_frame(app, dt, cw, ch),
-        // Loading / Lobby / 其它态：渲染大厅 UI（其它态待后续 Phase）
+        AppState::Connecting => render_connecting_frame(app, cw, ch),
+        // Loading / Lobby / Disconnected / EscMenu / ChatOpen 暂时全部走大厅
         _ => render_lobby_frame(app, cw, ch),
     }
 }
@@ -443,10 +570,47 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
         (act, jobs, ppp, full_output.textures_delta)
     };
 
-    // —— 处理动作（开始游戏）——
-    if let Some(LobbyAction::StartSinglePlayer { seed }) = action {
-        start_single_player(app, seed);
-        // 进入 InGame 后下一帧才走 game 路径；本帧仍渲染 lobby（避免 game 未初始化的纹理上传）
+    // —— 处理动作 ——
+    match action {
+        Some(LobbyAction::StartSinglePlayer { seed }) => {
+            start_single_player(app, seed);
+        }
+        Some(LobbyAction::CreateRoom { room_id, seed }) => {
+            // 空房间号 → 自动生成 6 位
+            let final_room = if room_id.is_empty() {
+                let g = generate_room_id();
+                {
+                    let mut a = app.borrow_mut();
+                    a.lobby_state.room_id_input = g.clone();
+                    a.lobby_state.last_generated_room = Some(g.clone());
+                }
+                g
+            } else {
+                match validate_room_id(&room_id) {
+                    Ok(()) => {
+                        {
+                            let mut a = app.borrow_mut();
+                            a.lobby_state.last_generated_room = None;
+                        }
+                        room_id
+                    }
+                    Err(err) => {
+                        app.borrow_mut().lobby_state.error_message = Some(err);
+                        return Ok(());
+                    }
+                }
+            };
+            start_host(app, &final_room, seed);
+        }
+        Some(LobbyAction::JoinRoom { room_id }) => {
+            // validate_room_id 已在 UI 内做过；这里再保底
+            if let Err(e) = validate_room_id(&room_id) {
+                app.borrow_mut().lobby_state.error_message = Some(e);
+                return Ok(());
+            }
+            start_remote(app, &room_id);
+        }
+        None => {}
     }
 
     // —— 上传 egui 纹理 + 渲染 ——
@@ -571,13 +735,366 @@ fn random_seed() -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// 从 `<meta name="signaling-url">` 读取信令服务 URL；
+/// 若 URL 携带 `?signaling=...` query 参数，则优先用 query（方便本地开发切换地址）。
+/// 未配置时返回 None。
+fn signaling_url() -> Option<String> {
+    // 1) ?signaling= 优先
+    if let Some(from_query) = read_query_param("signaling")
+        && !from_query.is_empty()
+    {
+        return Some(from_query);
+    }
+
+    // 2) <meta name="signaling-url">
+    let window = web_sys::window()?;
+    let document = window.document()?;
+    let selector = format!("meta[name=\"{SIGNALING_META_NAME}\"]");
+    let el = document.query_selector(&selector).ok()??;
+    let meta = el.dyn_into::<web_sys::HtmlMetaElement>().ok()?;
+    let content = meta.content();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+/// 读取 `window.location.search` 中的一个 query 参数（已 URL 解码）。
+fn read_query_param(key: &str) -> Option<String> {
+    let window = web_sys::window()?;
+    let search = window.location().search().ok()?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params.get(key)
+}
+
+/// 用 history.replaceState 在不刷新页面的情况下更新 URL 上的 `?room=` 参数，
+/// 保留其它已有 query（如 ?signaling=）。失败静默，不影响功能。
+fn set_room_in_url(room_id: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(history) = window.history() else {
+        return;
+    };
+    let search = window.location().search().unwrap_or_default();
+    let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) else {
+        return;
+    };
+    params.set("room", room_id);
+    let new_search: String = params.to_string().into();
+    let new_url = if new_search.is_empty() {
+        "?".to_string()
+    } else {
+        format!("?{new_search}")
+    };
+    let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
+}
+
+fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
+    let seed = seed.unwrap_or_else(random_seed);
+    let Some(url) = signaling_url() else {
+        app.borrow_mut().lobby_state.error_message =
+            Some("未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into());
+        return;
+    };
+    log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}");
+
+    let settings = GameSettings::default();
+    let display = "Host".to_string();
+    let game_result = Game::new_host(seed, settings, &url, room_id, &display);
+    let mut a = app.borrow_mut();
+    match game_result {
+        Ok(mut game) => {
+            game.net.send_client_message(ClientMessage::Hello {
+                display_name: display.clone(),
+                version: 1,
+            });
+            game.camera.position = game.physics.eye_position();
+            game.camera.pitch = -0.4;
+
+            a.game = Some(game);
+            a.state = AppState::Connecting;
+            a.connecting_mode = GameMode::Host;
+            a.connecting_room_id = room_id.to_string();
+            a.connecting_error = None;
+            // 把房间号写回 URL（history.replaceState），方便用户直接复制 URL 分享
+            set_room_in_url(room_id);
+        }
+        Err(e) => {
+            log::warn!("[host] new_host failed: {e:?}");
+            a.lobby_state.error_message = Some(format!("Failed to host: {e:?}"));
+        }
+    }
+}
+
+fn start_remote(app: &Rc<RefCell<App>>, room_id: &str) {
+    let Some(url) = signaling_url() else {
+        app.borrow_mut().lobby_state.error_message =
+            Some("未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into());
+        return;
+    };
+    log::info!("启动 Remote：room={room_id}, signaling={url}");
+
+    let settings = GameSettings::default();
+    let display = "Player".to_string();
+    let game_result = Game::new_remote(settings, &url, room_id, &display);
+    let mut a = app.borrow_mut();
+    match game_result {
+        Ok(mut game) => {
+            // DC open 后再 flush 出去
+            game.net.send_client_message(ClientMessage::Hello {
+                display_name: display.clone(),
+                version: 1,
+            });
+            game.camera.position = game.physics.eye_position();
+            game.camera.pitch = -0.4;
+
+            a.game = Some(game);
+            a.state = AppState::Connecting;
+            a.connecting_mode = GameMode::Remote;
+            a.connecting_room_id = room_id.to_string();
+            a.connecting_error = None;
+            // 与 Host 一致：把当前房间号写回 URL，刷新后仍可重新加入
+            set_room_in_url(room_id);
+        }
+        Err(e) => {
+            log::warn!("[remote] new_remote failed: {e:?}");
+            a.lobby_state.error_message = Some(format!("Failed to join: {e:?}"));
+        }
+    }
+}
+
+// ============================================================
+// Connecting 帧（Host/Remote 协商中）
+// ============================================================
+
+fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 1. 推进网络状态机（与 InGame 复用 poll_net 路径）——
+    poll_net(app);
+
+    // —— 2. 拉 connecting 视图渲染参数 ——
+    let (mode, room_id, progress_label, error) = {
+        let a = app.borrow();
+        let game = a.game.as_ref();
+        let progress = game
+            .map(|g| g.net.session().progress_label().to_string())
+            .unwrap_or_else(|| "Initializing…".to_string());
+        (
+            a.connecting_mode,
+            a.connecting_room_id.clone(),
+            progress,
+            a.connecting_error.clone(),
+        )
+    };
+
+    // —— 3. 跑 egui ——
+    let (cancel, paint_jobs, pixels_per_point, textures_delta) = {
+        let a = app.borrow_mut();
+        let events: Vec<egui::Event> = std::mem::take(&mut *a.egui_events.borrow_mut());
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cw as f32, ch as f32),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut act: Option<ConnectingAction> = None;
+        let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
+            act = draw_connecting(ui.ctx(), mode, &room_id, &progress_label, error.as_deref());
+        });
+        let ppp = full_output.pixels_per_point;
+        let jobs = a.egui_ctx.tessellate(full_output.shapes, ppp);
+        (act, jobs, ppp, full_output.textures_delta)
+    };
+
+    if matches!(cancel, Some(ConnectingAction::Cancel)) {
+        // 直接丢掉 game，回 Lobby
+        let mut a = app.borrow_mut();
+        a.game = None;
+        a.state = AppState::Lobby;
+        a.connecting_error = None;
+        return Ok(());
+    }
+
+    // —— 4. 渲染（纯 egui + 暗色清屏）——
+    paint_egui_only(app, paint_jobs, pixels_per_point, textures_delta, cw, ch);
+    Ok(())
+}
+
+/// 复用 lobby/connecting 的"清屏 + egui Pass" 渲染路径。
+fn paint_egui_only(
+    app: &Rc<RefCell<App>>,
+    paint_jobs: Vec<egui::epaint::ClippedPrimitive>,
+    pixels_per_point: f32,
+    textures_delta: egui::TexturesDelta,
+    cw: u32,
+    ch: u32,
+) {
+    let mut a = app.borrow_mut();
+    let device = a.renderer.device.clone();
+    let queue = a.renderer.queue.clone();
+    for (id, image_delta) in &textures_delta.set {
+        a.egui_renderer
+            .update_texture(&device, &queue, *id, image_delta);
+    }
+    for id in &textures_delta.free {
+        a.egui_renderer.free_texture(id);
+    }
+
+    let Some(surface_texture) = a.renderer.acquire_frame() else {
+        return;
+    };
+    let view = surface_texture
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("connecting_frame"),
+    });
+
+    // 清屏
+    {
+        let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("connecting_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.05,
+                        g: 0.07,
+                        b: 0.10,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+
+    let screen_descriptor = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [cw, ch],
+        pixels_per_point,
+    };
+    let extra_cmds = a.egui_renderer.update_buffers(
+        &device,
+        &queue,
+        &mut encoder,
+        &paint_jobs,
+        &screen_descriptor,
+    );
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("connecting_egui"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let mut pass = pass.forget_lifetime();
+        a.egui_renderer
+            .render(&mut pass, &paint_jobs, &screen_descriptor);
+    }
+
+    queue.submit(
+        extra_cmds
+            .into_iter()
+            .chain(std::iter::once(encoder.finish())),
+    );
+    surface_texture.present();
+}
+
+/// 推进 Game.net 状态机：每帧调用一次。
+/// 在 Host 模式下注入 server.handle_message 闭包，处理 peer 来的 ClientMessage。
+fn poll_net(app: &Rc<RefCell<App>>) {
+    let now = now_ms();
+    let events: Vec<RoomEvent> = {
+        let mut a = app.borrow_mut();
+        let Some(game) = a.game.as_mut() else {
+            return;
+        };
+        // Host：每帧把 performance.now() 同步给 server.current_time_ms（Pong 用）
+        if game.mode == GameMode::Host {
+            game.server.borrow_mut().set_clock(now as u64);
+            let server_rc = game.server.clone();
+            let mut handler = |entity_id: u32, msg: ClientMessage| -> Vec<ServerMessage> {
+                server_rc.borrow_mut().handle_message(entity_id, msg)
+            };
+            game.net.poll(Some(&mut handler))
+        } else {
+            game.net.poll(None)
+        }
+    };
+    // 应用 RoomEvent
+    for ev in events {
+        apply_room_event(app, ev);
+    }
+}
+
+fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
+    let mut a = app.borrow_mut();
+    match ev {
+        RoomEvent::Connected => {
+            // Host：信令注册成功就视为可进入 InGame；Remote：等 DC open 才 Connected
+            if a.state == AppState::Connecting {
+                a.state = AppState::InGame;
+                a.request_pointer_lock_next = true;
+                log::info!("[net] Connected → InGame");
+            }
+        }
+        RoomEvent::Disconnected { reason } => {
+            log::warn!("[net] Disconnected: {reason}");
+            a.disconnect_reason = Some(reason.clone());
+            a.connecting_error = Some(reason);
+            // 在 Connecting / InGame 都直接回大厅
+            a.state = AppState::Lobby;
+            a.game = None;
+        }
+        RoomEvent::SignalingError(msg) => {
+            log::warn!("[net] signaling error: {msg}");
+            a.connecting_error = Some(msg);
+        }
+        RoomEvent::PeerCount(n) => {
+            log::info!("[net] peer count: {n}");
+        }
+    }
+}
+
 // ============================================================
 // InGame 帧
 // ============================================================
 
 fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 0. 推进网络状态机（Host/Remote 协商 + Pong 处理） ——
+    poll_net(app);
+
+    // 当前 GameMode（决定后续是否跑 server tick / chunk_loader）
+    let mode = app
+        .borrow()
+        .game
+        .as_ref()
+        .map(|g| g.mode)
+        .unwrap_or(GameMode::Local);
+
     // —— 1. drain Local 通道（Client→Server）→ Server::handle_message → 推回 Server→Client ——
-    {
+    //   Remote 模式不跑这步（server 仅占位，server_inbox 也是 dummy）
+    if mode != GameMode::Remote {
         let mut a = app.borrow_mut();
         let Some(game) = a.game.as_mut() else {
             return Ok(());
@@ -611,6 +1128,27 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         }
         for msg in msgs {
             apply_server_message(game, msg);
+        }
+    }
+
+    // —— 2b. 5s Ping，记下发出时刻供 Pong 对齐 ——
+    {
+        let mut a = app.borrow_mut();
+        let Some(game) = a.game.as_mut() else {
+            return Ok(());
+        };
+        let now = now_ms();
+        if game.entity_id != 0 && now - game.last_ping_sent_ms >= PING_INTERVAL_MS {
+            let client_time_ms = now as u64;
+            game.pending_pings.insert(client_time_ms, now);
+            // 上限 16 个待办，避免长期不通时无限增长
+            if game.pending_pings.len() > 16 {
+                let oldest_key = *game.pending_pings.keys().min().unwrap();
+                game.pending_pings.remove(&oldest_key);
+            }
+            game.net
+                .send_client_message(ClientMessage::Ping { client_time_ms });
+            game.last_ping_sent_ms = now;
         }
     }
 
@@ -760,10 +1298,13 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         let pos = game.map(|g| g.camera.position).unwrap_or_default();
         let loaded_chunks = game.map(|g| g.chunk_loader.loaded.len()).unwrap_or(0);
         let mesh_pending = game.map(|g| g.mesh_jobs.len()).unwrap_or(0);
-        let mode = game.map(|g| g.physics.mode).unwrap_or(CameraMode::Walk);
+        let phys_mode = game.map(|g| g.physics.mode).unwrap_or(CameraMode::Walk);
         let on_ground = game.map(|g| g.physics.on_ground).unwrap_or(false);
         let hotbar_items = game.map(|g| g.hotbar.items).unwrap_or([BlockID::AIR; 9]);
         let hotbar_selected = game.map(|g| g.hotbar.selected).unwrap_or(0);
+        let game_mode = game.map(|g| g.mode).unwrap_or(GameMode::Local);
+        let rtt_ms = game.and_then(|g| g.rtt_ms);
+        let room_id = game.map(|g| g.room_id.clone()).unwrap_or_default();
         let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
             draw_hud(
                 ui.ctx(),
@@ -775,10 +1316,13 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
                     pointer_locked,
                     loaded_chunks,
                     mesh_pending,
-                    mode,
+                    mode: phys_mode,
                     on_ground,
                     hotbar_items,
                     hotbar_selected,
+                    game_mode,
+                    rtt_ms,
+                    room_id: room_id.clone(),
                 },
             );
         });
@@ -993,6 +1537,16 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
         }
+        ServerMessage::Pong {
+            client_time_ms,
+            server_time_ms: _,
+        } => {
+            // 与待办 Ping 对齐计算 RTT
+            if let Some(sent_ms) = game.pending_pings.remove(&client_time_ms) {
+                let rtt = (now_ms() - sent_ms) as f32;
+                game.rtt_ms = Some(rtt);
+            }
+        }
         _ => {
             // Phase 5+ 才处理 PlayerTick / PeerJoined / Chat 等
         }
@@ -1015,6 +1569,10 @@ struct HudData {
     on_ground: bool,
     hotbar_items: [BlockID; 9],
     hotbar_selected: usize,
+    /// Phase 4：当前网络模式 + 房间号 + RTT。
+    game_mode: GameMode,
+    rtt_ms: Option<f32>,
+    room_id: String,
 }
 
 fn draw_hud(ctx: &egui::Context, data: HudData) {
@@ -1059,6 +1617,25 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             "CHUNKS {}  MESH_Q {}",
                             data.loaded_chunks, data.mesh_pending
                         ),
+                    );
+                    // Phase 4：网络模式 + RTT + 房间号
+                    let mode_str = match data.game_mode {
+                        GameMode::Local => "LOCAL",
+                        GameMode::Host => "HOST",
+                        GameMode::Remote => "REMOTE",
+                    };
+                    let rtt_str = match data.rtt_ms {
+                        Some(rtt) => format!("{rtt:>5.1} ms"),
+                        None => "  --  ".to_string(),
+                    };
+                    let room_str = if data.room_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ROOM {}", data.room_id)
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 200, 160),
+                        format!("NET {mode_str}  RTT {rtt_str}{room_str}"),
                     );
                 });
         });

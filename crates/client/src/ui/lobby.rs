@@ -1,27 +1,48 @@
-//! 大厅 UI：Phase 2 仅"单机模式"按钮 + 可选种子输入。
-//! Phase 4 起补"创建房间 / 加入房间"按钮。
+//! 大厅 UI：
+//! - 单机模式（Phase 2）
+//! - 创建房间 / 加入房间（Phase 4）
+//!
+//! 还提供"Connecting…"视图：[`draw_connecting`]。
+
+use crate::app::GameMode;
 
 /// 大厅按钮触发的动作。lib.rs 主循环消费。
 #[derive(Clone, Debug)]
 pub enum LobbyAction {
     /// 用户点了"单机模式"。seed 为 None 则随机生成。
     StartSinglePlayer { seed: Option<u64> },
+    /// 用户点了"创建房间"。`room_id` 空时主循环自动生成 6 位随机字符。
+    CreateRoom { room_id: String, seed: Option<u64> },
+    /// 用户点了"加入房间"。
+    JoinRoom { room_id: String },
+}
+
+/// Connecting 视图触发的动作。
+#[derive(Clone, Debug)]
+pub enum ConnectingAction {
+    /// 用户点了 Cancel。
+    Cancel,
 }
 
 /// 大厅 UI 持久状态（输入框文本等）。
 #[derive(Default)]
 pub struct LobbyState {
     pub seed_input: String,
+    pub room_id_input: String,
+    /// 简单错误提示（join 时校验失败、create 时空字段自动生成的回填等）。
+    pub error_message: Option<String>,
+    /// info 区显示的最近一次自动生成的房间号（让用户能记住分享）。
+    pub last_generated_room: Option<String>,
 }
 
 /// 绘制大厅 UI。返回触发的动作（点击按钮时）。
 pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAction> {
     let mut action = None;
 
-    // 主面板（egui 0.34 起 CentralPanel::show 被标记 deprecated，但根面板用法无更好替代，保留）
+    // 主面板
     #[allow(deprecated)]
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(80.0);
+        ui.add_space(60.0);
         ui.vertical_centered(|ui| {
             ui.heading(
                 egui::RichText::new("VoxWeb")
@@ -31,10 +52,10 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.add_space(8.0);
             ui.colored_label(
                 egui::Color32::from_rgb(160, 170, 180),
-                "Browser Voxel Sandbox (Phase 3)",
+                "Browser Voxel Sandbox (Phase 4)",
             );
 
-            ui.add_space(48.0);
+            ui.add_space(40.0);
 
             // —— 单机模式按钮 ——
             let btn = egui::Button::new(
@@ -42,14 +63,78 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     .size(20.0)
                     .color(egui::Color32::from_rgb(230, 240, 245)),
             )
-            .min_size(egui::vec2(240.0, 48.0))
+            .min_size(egui::vec2(260.0, 44.0))
             .fill(egui::Color32::from_rgb(60, 90, 120));
             if ui.add(btn).clicked() {
                 let seed = parse_seed(&state.seed_input);
                 action = Some(LobbyAction::StartSinglePlayer { seed });
             }
 
-            ui.add_space(16.0);
+            ui.add_space(20.0);
+
+            // —— Room ID 输入 ——
+            ui.horizontal(|ui| {
+                ui.add_space(120.0);
+                ui.label(
+                    egui::RichText::new("Room ID").color(egui::Color32::from_rgb(180, 190, 200)),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.room_id_input)
+                        .desired_width(160.0)
+                        .hint_text("e.g. abc123"),
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // —— Create / Join 按钮 ——
+            ui.horizontal(|ui| {
+                ui.add_space(120.0);
+                let create = egui::Button::new(
+                    egui::RichText::new("Create Room")
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(230, 240, 245)),
+                )
+                .min_size(egui::vec2(120.0, 36.0))
+                .fill(egui::Color32::from_rgb(90, 60, 120));
+                if ui.add(create).clicked() {
+                    let room_id = state.room_id_input.trim().to_string();
+                    let seed = parse_seed(&state.seed_input);
+                    state.error_message = None;
+                    action = Some(LobbyAction::CreateRoom { room_id, seed });
+                }
+                let join = egui::Button::new(
+                    egui::RichText::new("Join Room")
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(230, 240, 245)),
+                )
+                .min_size(egui::vec2(120.0, 36.0))
+                .fill(egui::Color32::from_rgb(60, 120, 90));
+                if ui.add(join).clicked() {
+                    let room_id = state.room_id_input.trim().to_string();
+                    if let Err(msg) = validate_room_id(&room_id) {
+                        state.error_message = Some(msg);
+                    } else {
+                        state.error_message = None;
+                        action = Some(LobbyAction::JoinRoom { room_id });
+                    }
+                }
+            });
+
+            // —— 提示信息：自动生成的房间号 / 错误 ——
+            if let Some(room) = &state.last_generated_room {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 200, 160),
+                    format!("Generated room id: {room} (share with friends)"),
+                );
+            }
+            if let Some(err) = &state.error_message {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::from_rgb(220, 130, 130), err);
+            }
+
+            ui.add_space(24.0);
 
             // —— 种子输入（折叠区）——
             egui::CollapsingHeader::new("Advanced / Seed")
@@ -64,12 +149,6 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                         );
                     });
                 });
-
-            ui.add_space(80.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(120, 130, 140),
-                "Phase 4: Create/Join room (coming soon)",
-            );
         });
     });
 
@@ -79,9 +158,58 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
         .show(ctx, |ui| {
             ui.colored_label(
                 egui::Color32::from_rgb(100, 110, 120),
-                "VoxWeb 0.1.0 · Phase 3",
+                "VoxWeb 0.1.0 · Phase 4",
             );
         });
+
+    action
+}
+
+/// Connecting 视图：等待信令 + WebRTC 协商时显示进度。
+pub fn draw_connecting(
+    ctx: &egui::Context,
+    mode: GameMode,
+    room_id: &str,
+    progress_label: &str,
+    error: Option<&str>,
+) -> Option<ConnectingAction> {
+    let mut action = None;
+
+    #[allow(deprecated)]
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.add_space(160.0);
+        ui.vertical_centered(|ui| {
+            let title = match mode {
+                GameMode::Host => format!("Hosting room {room_id}…"),
+                GameMode::Remote => format!("Joining room {room_id}…"),
+                GameMode::Local => "Loading…".to_string(),
+            };
+            ui.heading(
+                egui::RichText::new(title)
+                    .size(28.0)
+                    .color(egui::Color32::from_rgb(230, 240, 245)),
+            );
+            ui.add_space(12.0);
+            ui.colored_label(egui::Color32::from_rgb(180, 190, 200), progress_label);
+
+            if let Some(msg) = error {
+                ui.add_space(12.0);
+                ui.colored_label(egui::Color32::from_rgb(220, 130, 130), msg);
+            }
+
+            ui.add_space(40.0);
+            let btn = egui::Button::new(
+                egui::RichText::new("Cancel")
+                    .size(16.0)
+                    .color(egui::Color32::from_rgb(230, 240, 245)),
+            )
+            .min_size(egui::vec2(160.0, 36.0))
+            .fill(egui::Color32::from_rgb(100, 70, 70));
+            if ui.add(btn).clicked() {
+                action = Some(ConnectingAction::Cancel);
+            }
+        });
+    });
 
     action
 }
@@ -93,6 +221,36 @@ fn parse_seed(input: &str) -> Option<u64> {
         return None;
     }
     trimmed.parse::<u64>().ok()
+}
+
+/// 校验房间号：4-12 字符，仅 [a-z0-9_-]。
+pub fn validate_room_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Room ID cannot be empty".into());
+    }
+    let len = id.chars().count();
+    if !(4..=12).contains(&len) {
+        return Err("Room ID must be 4-12 characters".into());
+    }
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !ok {
+        return Err("Room ID may only contain a-z, 0-9, _, -".into());
+    }
+    Ok(())
+}
+
+/// 生成 6 位 [a-z0-9] 随机房间号。失败时返回 "voxweb"（不应发生）。
+pub fn generate_room_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut buf = [0u8; 6];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return "voxweb".to_string();
+    }
+    buf.iter()
+        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 #[cfg(test)]
@@ -115,5 +273,34 @@ mod tests {
     fn parse_seed_invalid_is_none() {
         assert_eq!(parse_seed("not_a_number"), None);
         assert_eq!(parse_seed("-1"), None); // 负数不是合法 u64
+    }
+
+    #[test]
+    fn room_id_valid() {
+        assert!(validate_room_id("abc123").is_ok());
+        assert!(validate_room_id("a-b_c").is_ok());
+    }
+
+    #[test]
+    fn room_id_too_short() {
+        assert!(validate_room_id("ab").is_err());
+    }
+
+    #[test]
+    fn room_id_too_long() {
+        assert!(validate_room_id("abcdefghijklm").is_err());
+    }
+
+    #[test]
+    fn room_id_bad_chars() {
+        assert!(validate_room_id("ABC123").is_err());
+        assert!(validate_room_id("a b c d").is_err());
+    }
+
+    #[test]
+    fn generated_room_id_valid_format() {
+        let id = generate_room_id();
+        assert!(validate_room_id(&id).is_ok(), "got {id}");
+        assert_eq!(id.len(), 6);
     }
 }
