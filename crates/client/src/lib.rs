@@ -1088,7 +1088,15 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110))
                 .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| {
-                    ui.colored_label(egui::Color32::from_rgb(230, 235, 240), msg);
+                    // 用 Extend 模式强制按文本自然宽度撑开，避免暂停→返回时上一帧
+                    // 残留的小 available_width 让长提示被换行/截断
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(msg)
+                                .color(egui::Color32::from_rgb(230, 235, 240)),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                 });
         });
 
