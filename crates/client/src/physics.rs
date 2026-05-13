@@ -31,6 +31,13 @@ pub const HORIZ_ACC: f32 = 12.0;
 pub const FLY_SPEED: f32 = 12.0;
 /// 地面探测距离（脚底下方多少米内有方块算作 on_ground）。
 const GROUND_PROBE: f32 = 0.05;
+/// 单个 sub-step 上限（秒）。让单步最大位移 = TERMINAL_VELOCITY / 60 ≈ 1.3m，
+/// 小于玩家 AABB 高度（1.8m），保证不会一次性穿透 1 格厚的地板。
+const MAX_SUBSTEP_DT: f32 = 1.0 / 60.0;
+/// 单帧物理总时长上限（秒）。tab 切到后台时 RAF 被节流到 ~1Hz，回前台首帧 dt 可达数秒；
+/// 超过该值视为"非正常间隔"，按上限折算，避免一次 step 拆出几百个 sub-step 卡死帧。
+/// 与 FrameClock.accumulator 上限一致，让物理与 server.tick 在恢复时步调对齐。
+const MAX_FRAME_DT: f32 = 0.25;
 
 /// 客户端玩家物理体。`feet_position` 为脚底中心；`eye_position()` = 该值 + EYE_OFFSET。
 pub struct LocalPhysics {
@@ -71,6 +78,10 @@ impl LocalPhysics {
     /// 每帧物理步进。
     /// `get_block` 是世界坐标 → BlockID 的查询闭包（chunk 未加载返回 AIR 即可）。
     /// `dt` 为渲染帧步长（秒）。
+    ///
+    /// 内部会按 [`MAX_SUBSTEP_DT`] 拆分 sub-step：正常 60Hz 帧拆出 1 步、行为与之前一致；
+    /// tab 后台导致 dt 过大时拆出多步，每步独立 AABB 碰撞检测，
+    /// 避免单帧重力位移大于玩家 AABB 高度从而穿透地板。
     pub fn step(
         &mut self,
         get_block: &dyn Fn(i32, i32, i32) -> BlockID,
@@ -78,9 +89,16 @@ impl LocalPhysics {
         input: &InputState,
         dt: f32,
     ) {
-        match self.mode {
-            CameraMode::Fly => self.step_fly(camera, input, dt),
-            CameraMode::Walk => self.step_walk(get_block, camera, input, dt),
+        // 1) 总时长上限：超大 dt 视为"暂停后恢复"，按上限补一段物理，剩余时间丢弃。
+        let mut remaining = dt.clamp(0.0, MAX_FRAME_DT);
+        // 2) 拆分 sub-step：每步 ≤ MAX_SUBSTEP_DT，最后一步取余数。
+        while remaining > 0.0 {
+            let step_dt = remaining.min(MAX_SUBSTEP_DT);
+            match self.mode {
+                CameraMode::Fly => self.step_fly(camera, input, step_dt),
+                CameraMode::Walk => self.step_walk(get_block, camera, input, step_dt),
+            }
+            remaining -= step_dt;
         }
     }
 
@@ -448,5 +466,34 @@ mod tests {
             y_before,
             p.feet_position.y
         );
+    }
+
+    #[test]
+    fn step_with_huge_dt_does_not_tunnel_through_floor() {
+        // 回归测试：浏览器切换到其他 tab 时 RAF 被节流，下一帧 dt 可达数秒。
+        // 没有 sub-step 时，重力把 disp.y 推到远超玩家 AABB 高度（1.8m），
+        // 单次 AABB 碰撞检测会"跨越"整层地板，玩家穿透到虚空连续下坠。
+        let getter = floor_at_y64();
+        let mut p = LocalPhysics::new(Vec3::new(0.5, 70.0, 0.5));
+        let camera = Camera::default();
+        let input = InputState::default();
+        // 先稳定落地
+        for _ in 0..(60 * 5) {
+            p.step(&getter, &camera, &input, 1.0 / 60.0);
+        }
+        assert!(p.on_ground, "前置：玩家应当先落地");
+        let y_landed = p.feet_position.y;
+
+        // 模拟 tab 后台 10 秒（RAF 节流后单次回调 dt=10s）
+        p.step(&getter, &camera, &input, 10.0);
+
+        // 玩家应仍贴在地面上，不应穿透到 STONE 层（y=64）以下
+        assert!(
+            p.feet_position.y >= 64.0,
+            "玩家穿透地板掉入虚空：feet.y = {}（着陆时 {}）",
+            p.feet_position.y,
+            y_landed
+        );
+        assert!(p.on_ground, "玩家应仍在地面上，而不是悬空下坠");
     }
 }
