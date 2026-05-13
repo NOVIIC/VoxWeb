@@ -54,7 +54,7 @@ pub fn player_aabb(position: Vec3) -> Aabb {
 ```rust
 pub enum CameraMode {
     Walk,    // 受重力，碰撞
-    Fly,     // 调试用，无重力，无碰撞
+    Fly,     // 调试用，无重力，无碰撞；WASD 仅沿水平面，Space/Shift 控制升降
 }
 ```
 
@@ -220,27 +220,28 @@ fn check_ground(world: &WorldView, position: Vec3) -> bool {
 
 ## 五、Fly 模式物理
 
-简化版：
+简化版（实际实装见 [`crates/client/src/physics.rs::step_fly`](../../crates/client/src/physics.rs)）：
 ```rust
-fn tick_fly(&mut self, camera: &mut Camera, input: &InputManager, dt: f32) {
+fn tick_fly(&mut self, camera: &Camera, input: &InputState, dt: f32) {
     let mut dir = Vec3::ZERO;
-    let f = camera.forward();
+    // WASD 沿水平面（不含 pitch），避免视角朝下时按 W 反而往地里钻
+    let f = camera.forward_horizontal();
     let r = camera.right();
     let u = Vec3::Y;
-    if input.key_held(KeyCode::W) { dir += f; }
-    if input.key_held(KeyCode::S) { dir -= f; }
-    if input.key_held(KeyCode::A) { dir -= r; }
-    if input.key_held(KeyCode::D) { dir += r; }
-    if input.key_held(KeyCode::Space) { dir += u; }
-    if input.key_held(KeyCode::ShiftLeft) { dir -= u; }
+    if input.forward { dir += f; }
+    if input.backward { dir -= f; }
+    if input.left { dir -= r; }
+    if input.right { dir += r; }
+    if input.jump_held { dir += u; }   // Space 上升
+    if input.sneak { dir -= u; }       // Shift 下降
     if dir.length_squared() > 0.0 { dir = dir.normalize(); }
-    camera.position += dir * FLY_SPEED * dt;
+    self.feet_position += dir * FLY_SPEED * dt;
     self.velocity = Vec3::ZERO;
     self.on_ground = false;
 }
 ```
 
-`FLY_SPEED = 12.0 m/s`，按 Ctrl 加速到 25.0（v2）。
+`FLY_SPEED = 12.0 m/s`。垂直方向单独由 Space/Shift 控制，让"看哪里"和"飞哪里"解耦——观察俯视地形时按 W 仍只前进，需要下降时按 Shift。
 
 ---
 

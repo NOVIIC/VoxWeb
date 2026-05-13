@@ -19,7 +19,16 @@
 
 ## 二、UI 状态路由
 
-每帧 `client::ui::draw` 按 `AppState` 决定渲染什么：
+每帧 `client::ui::draw` 按 `AppState` 决定渲染什么。Phase 3 的实际枚举为全部 unit variant，参见 [`crates/client/src/app.rs`](../../crates/client/src/app.rs)：
+
+```rust
+pub enum AppState {
+    Loading, Lobby, Connecting, InGame,
+    EscMenu, ChatOpen, Disconnected,
+}
+```
+
+Phase 6 起会把 `EscMenu` / `ChatOpen` 升级为 `InGame` 的子状态位（`InGame { paused, chat_open }`）。当前下面的路由示意是 Phase 6 终态：
 
 ```rust
 pub fn draw(app: &mut App, ctx: &egui::Context) {
@@ -234,18 +243,39 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 最近 5 条消息浮窗，5 秒后渐隐。聊天框打开时显示完整历史。详见下文。
 
-### 右下角：Hotbar（v2 完整）
+### 屏幕底部中央：Hotbar（Phase 3 ✅ · 9 格）
 
-本期简化：屏幕底部中央显示当前手持方块名称。
+横向 9 格，每格 54×36，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格上行显示槽位号 1-9，下行显示方块标签（`STONE` / `DIRT` / ...）；选中格金色高亮（240, 200, 80, 220），文字反色为黑；非选中格深灰底（60, 70, 80, 200）+ 浅色文字。
+
 ```rust
-egui::Area::new("hotbar".into())
-    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -20.0))
-    .interactable(false)
+egui::Area::new(egui::Id::new("hud_hotbar"))
+    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
     .show(ctx, |ui| {
-        ui.label(format!("[{}] {}", app.hotbar.selected + 1,
-            properties(app.hotbar.items[app.hotbar.selected]).display_name));
+        egui::Frame::default().fill(BG_HALF_ALPHA).inner_margin(8).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (i, block) in hotbar_items.iter().enumerate() {
+                    let selected = i == hotbar_selected;
+                    egui::Frame::default().fill(cell_bg(selected)).show(ui, |ui| {
+                        // ⚠️ 必须用 allocate_ui_with_layout 显式分配尺寸，
+                        // 不能用 set_min_size + vertical_centered（vertical_centered
+                        // 会取走 horizontal 父级的全部剩余宽度，9 格全叠成 1 格）
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(54.0, 36.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| { ui.colored_label(cell_fg(selected),
+                                       format!("{}\n{}", i + 1, block_label(*block))); },
+                        );
+                    });
+                }
+            });
+        });
     });
 ```
+
+切换：1-9 数字键（`InputState::hotbar_request` 边沿）。鼠标滚轮切换 + 图标渲染留给 Phase 6（egui ImageButton + 纹理图集裁剪）。
+
+> **历史坑**：早期实现用 `set_min_size + vertical_centered` 组合，导致 9 个 Frame 均摊到完整屏幕宽，只剩第 1 格可见（commit 95b262a 修复）。新代码不要再用这两个 API 嵌套在 horizontal 内。
 
 ---
 

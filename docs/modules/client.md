@@ -325,28 +325,43 @@ impl Camera {
 
 ### 6.2 `input.rs`
 
+Phase 3 实装是**扁平 InputState**：每帧累加按键 / 鼠标事件，按"持续"vs"边沿"两类语义存储；帧末 `reset_delta()` 清掉所有边沿，保留持续按下状态。WASM 侧浏览器事件经 `lib.rs::map_key`（`KeyboardEvent.code` → `winit::keyboard::KeyCode`）路由到 `on_key_down/up`。
+
 ```rust
-pub struct InputManager {
-    keys: HashSet<KeyCode>,
-    mouse_buttons: [ButtonState; 3],     // Left, Right, Middle
-    mouse_delta: Vec2,                   // 当前帧累积
-    chat_text_buffer: String,            // 聊天输入时切换接收
+pub struct InputState {
+    // —— WASD 持续按下 ——
+    pub forward: bool, pub backward: bool, pub left: bool, pub right: bool,
+    // —— 跳跃 / 蹲伏 ——
+    pub jump_held: bool,         // 持续：Fly 上升 / Walk 见 jump_just_pressed
+    pub jump_just_pressed: bool, // 边沿：Walk 起跳触发
+    pub sneak: bool,             // 持续：Fly 下降 / 后续 Walk 蹲伏
+    // —— 鼠标按键 ——
+    pub break_held: bool, pub break_just_pressed: bool,    // 0 = 左
+    pub place_held: bool, pub place_just_pressed: bool,    // 2 = 右；1 中键忽略
+    // —— 边沿事件 ——
+    pub hotbar_request: Option<u8>,  // Digit1..=Digit9 → Some(0..=8)
+    pub fly_toggle_pending: bool,    // 双击空格 250ms 内触发
+    pub chat_open: bool, pub esc_menu: bool,
+    // —— 鼠标移动 ——
+    pub mouse_dx: f32, pub mouse_dy: f32,
+    pub pointer_locked: bool,
+    // —— 内部：双击空格判定时间戳（performance.now() ms）——
+    last_space_press_at_ms: Option<f64>,
 }
 
-#[derive(Copy, Clone)]
-pub struct ButtonState { pub held: bool, pub just_pressed: bool, pub just_released: bool }
-
-impl InputManager {
-    pub fn handle_keyboard(&mut self, ev: &KeyEvent);
-    pub fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState);
-    pub fn handle_mouse_motion(&mut self, dx: f32, dy: f32);
-    pub fn end_frame(&mut self);         // 清掉 just_pressed/just_released 与 mouse_delta
-    pub fn key_held(&self, k: KeyCode) -> bool;
-    pub fn button(&self, b: MouseButton) -> ButtonState;
+impl InputState {
+    pub fn on_key_down(&mut self, key: KeyCode, now_ms: f64);
+    pub fn on_key_up(&mut self, key: KeyCode);
+    pub fn on_mouse_down(&mut self, button: u16);  // 0/1/2 = 左/中/右
+    pub fn on_mouse_up(&mut self, button: u16);
+    pub fn on_mouse_move(&mut self, dx: f32, dy: f32);
+    /// 帧末调用：清边沿（mouse_dx/dy / *_just_pressed / hotbar_request / fly_toggle_pending / chat_open / esc_menu），
+    /// 保留持续状态（forward..right / *_held / sneak / pointer_locked）
+    pub fn reset_delta(&mut self);
 }
 ```
 
-**指针锁**：进入 InGame 时调用 `canvas.request_pointer_lock()`（必须由用户手势触发，故"开始游戏"按钮的点击事件中发起）。ESC 释放。
+**指针锁**：进入 InGame 时调用 `canvas.request_pointer_lock()`（必须由用户手势触发，故"开始游戏"按钮的点击事件中发起）。`pointerlockchange` 监听器写回 `pointer_locked`，主循环只在 `pointer_locked=true` 时消费 `mouse_dx/dy` 和 WASD（避免后台移动）。ESC 释放。
 
 ### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`（[Phase 2]）
 

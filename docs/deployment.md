@@ -79,6 +79,8 @@ cd signaling && wrangler dev --local --port 8787
 # http://localhost:8080/start.html?signaling=ws://localhost:8787
 ```
 
+> **trunk serve 走 release profile**：当前 [`trunk.toml`](../trunk.toml) 写死 `[build].release = true`（commit 5100739），`trunk serve` 也输出 release 优化包。代价是首次构建慢（≈ 60s）、增量改动 30s+；收益是 60Hz 体素物理 / 网格化在 dev profile 下太慢，强制 release 才能复现真实手感。如需超快迭代调试纯逻辑，临时把 `release = false` 即可。
+
 > ⚠️ 在 `trunk serve` 下访问"干净 URL" `/start` 不会自动重写到 `/start.html`（trunk 的内置 server 没有 try_files）。本地开发请用 `/start.html`；生产 Caddy 配置了 `try_files`，`/start` 可直接命中。
 
 ### 2.4 增量检查

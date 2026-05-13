@@ -122,6 +122,8 @@ const missing = required.filter(k => !checks[k]());
 
 **特殊处理**：若 **仅 `webrtc` 缺失** 而其他必备项都满足 → 提供"仅单机模式"按钮，wasm 启动后强制走 Local-Only 路径，禁用大厅"创建/加入房间"。其他必备项缺失 → 拒绝加载 wasm，显示降级页面（纯 HTML/CSS）。
 
+**移动设备拦截（commit 34ebd73）**：即便 API 全部满足，UA 命中 `Mobi|Android|iPhone|iPad|iPod` 或"Macintosh + maxTouchPoints > 2"（iPad 桌面模式）也会拒绝加载 wasm，提示"VoxWeb 暂不支持触屏操作，请使用桌面浏览器"。理由：当前无虚拟摇杆 / 触屏挖放按钮（[`roadmap.md`](roadmap.md) Phase 9.3 stretch），即使强行加载也无法操作。降级页面会把 `mobile` 行排在最前，便于用户立即理解。
+
 **最低浏览器版本**（取所有必备项交集）：
 
 | 浏览器 | 最低版本 | 缺什么 |
