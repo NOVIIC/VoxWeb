@@ -1360,8 +1360,8 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         )
     };
 
-    // —— 5. ChunkLoader 滚动 ——
-    {
+    // —— 5. ChunkLoader 滚动（仅 Local / Host；Remote 由 ChunkSnapshot / BlockUpdate 驱动） ——
+    if mode != GameMode::Remote {
         let mut a = app.borrow_mut();
         let App {
             ref mut renderer,
