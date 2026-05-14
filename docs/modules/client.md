@@ -114,29 +114,33 @@ pub async fn start() -> Result<(), JsValue> {
 
 ```rust
 pub enum AppState {
-    Loading,                              // [Phase 0+]
-    Lobby,                                // [Phase 2+] 大厅，未联网
-    Connecting { progress: ConnectingProgress },  // [Phase 4+] 信令 + ICE 阶段
-    InGame,                               // [Phase 2+]（Phase 6 加 paused / chat_open 状态位）
-    EscMenu,                              // [Phase 6]
-    ChatOpen,                             // [Phase 6]
-    Disconnected { reason: String },      // [Phase 4+]
-}
-
-// [Phase 4+]
-pub struct ConnectingProgress {
-    pub stage: ConnectingStage,
-    pub error: Option<String>,
-}
-
-pub enum ConnectingStage {
-    SignalingHandshake,
-    PeerOfferAnswer,
-    IceGathering,
-    DataChannelOpening,
-    SnapshotReceiving { received: u32, total: u32 },
+    Loading,            // [Phase 0+] 初始占位，实际未使用
+    Lobby,              // [Phase 2+] 大厅
+    Connecting,         // [Phase 4+] 网络协商 + 区块预载
+    InGame,             // [Phase 2+] 游戏中
+    EscMenu,            // [Phase 6]
+    ChatOpen,           // [Phase 6]
+    Disconnected,       // [Phase 4+]
 }
 ```
+
+Connecting 期间不携带子状态结构体——进度信息由 `RoomSession::loading_steps()`（网络步骤）和 `App::preload_state`（区块预载步骤）联合提供。
+
+### 区块预载
+
+`PreloadState` 追踪出生点周围 chunk 的加载进度（Phase 5+）：
+
+```rust
+pub struct PreloadState {
+    pub total: usize,     // 期望加载的 chunk 总数 = (2*render_distance+1)^2
+    pub received: usize,  // 已存在于 world.chunks 中的 chunk 数
+    pub meshed: usize,    // 已有 GPU mesh 的 chunk 数
+    pub active: bool,     // 预载进行中
+}
+```
+
+预载完成条件：`received >= total && mesh_jobs.is_empty()`。
+用 `received` 而非 `meshed` 判完成是因为全空气 chunk mesh 后顶点为空，不产生 GPU 记录。`mesh_jobs.is_empty()` 确保所有已入队 chunk 都被处理过。
 
 ### App / Game 主结构
 
@@ -150,14 +154,21 @@ struct App {
     egui_renderer: egui_wgpu::Renderer,
 
     input: Rc<RefCell<InputState>>,
-    /// 浏览器 mouse 事件累加器：每帧 drain 到 egui RawInput.events
     egui_events: Rc<RefCell<Vec<egui::Event>>>,
 
     state: AppState,
-    lobby_state: LobbyState,           // [Phase 2] 大厅输入框文本等
-    game: Option<Game>,                // [Phase 2] InGame 时存在
+    lobby_state: LobbyState,
 
-    // 帧计时 / FPS / 一次性的 InGame 指针锁请求
+    // —— Connecting 阶段 ——
+    connecting_mode: GameMode,          // Host / Remote / Local
+    connecting_room_id: String,
+    connecting_error: Option<String>,
+    preload_state: Option<PreloadState>, // [Phase 5+] 区块预载进度
+
+    disconnect_reason: Option<String>,
+
+    game: Option<Game>,
+
     last_time_ms: f64,
     fps_frames: u32, fps_accum: f32, fps_display: f32,
     request_pointer_lock_next: bool,
@@ -212,19 +223,33 @@ pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 
 ### Phase 2 主循环（Lobby / InGame 二态）
 
-`render_frame` 按 `app.state` 分流到两个分支。Loading / 未启用态全部 fall back 到 Lobby。
+`render_frame` 按 `app.state` 分流：
 
 ```rust
 fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
-    let dt = update_clock(app);            // 计算 dt + 滚动 FPS
-    let (cw, ch) = sync_canvas_size(...);  // 同步 canvas client size + Renderer.resize
+    let dt = update_clock(app);
+    let (cw, ch) = sync_canvas_size(...);
 
     match app.borrow().state.clone() {
         AppState::InGame => render_game_frame(app, dt, cw, ch),
-        _ => render_lobby_frame(app, cw, ch),   // Loading / Lobby / 后续未启用态
+        AppState::Connecting => render_connecting_frame(app, cw, ch),  // [Phase 4+]
+        _ => render_lobby_frame(app, cw, ch),
     }
 }
 ```
+
+#### `render_connecting_frame`（Phase 4+）
+
+专用于 `Connecting` 状态：
+1. `poll_net(app)` — 推进网络状态机（信令+WebRTC 协商）
+2. **drain Server→Client inbox** — Remote 端收 Welcome / ChunkSnapshot / BlockUpdate 等消息（[Phase 5+]）
+3. **区块预载**（[Phase 5+]）：若 `preload_state.active`：
+   - Host/Local：调 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成出生点周围 chunk 并入队网格化
+   - Remote：仅运行 `mesh_jobs.run_until_budget(16ms)`（chunk 由上一步的 inbox drain 喂入）
+   - 统计 `received`（存在于 `world.chunks`）和 `meshed`（有 GPU mesh）
+   - 完成条件 `received >= total && mesh_jobs.is_empty()` → `state = InGame`
+4. 构建步骤列表：`RoomSession::loading_steps()`（网络步骤）+ 区块预载步骤
+5. 渲染 UI：`draw_connecting(steps)` + 暗色清屏 + egui pass
 
 #### `render_lobby_frame`
 
@@ -540,12 +565,18 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 ## 八、状态切换流程
 
 ### Lobby → Connecting → InGame
-1. 用户在大厅点击"创建房间"或"加入房间"
-2. `app.state = Connecting { stage: SignalingHandshake }`
-3. spawn `NetEndpoint::host(url, room).await` 或 `::join(...).await`
-4. 完成后初始化 `server`（Host/Local-Only）或仅 `WorldView`（Remote）
-5. Remote：等收到 `Welcome` + 全部 `ChunkSnapshot` → `app.state = InGame`
-6. Host：收到 `peer_id` 后立即 `InGame`（自己的 chunks 由本地 server 生成）
+1. 用户在大厅点击"单人模式"/"创建房间"/"加入房间"
+2. 创建 `Game` 实例（`new_local` / `new_host` / `new_remote`）
+3. `app.state = Connecting`，开启 `render_connecting_frame` 循环
+4. **网络协商**（仅 Host/Remote）：信令 → 注册 → offer/answer → DataChannel open
+   - Host：信令注册成功后即视为网络 Connected
+   - Remote：等 DataChannel 打开后才 Connected
+   - Local：跳过此步，直接进入区块预载
+5. **区块预载**（[Phase 5+] 全部三种模式）：网络 Connected 后启动，加载出生点周围 `(2*render_distance+1)^2` 个 chunk：
+   - Host/Local：本地 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成 + 入队，每帧 `mesh_jobs.run_until_budget(16ms)` 网格化
+   - Remote：等 Host 发来的 `ChunkSnapshot` 消息到达（inbox drain 在每帧 `poll_net` 之后），入队网格化
+   - 完成条件：`received >= total && mesh_jobs.is_empty()` → `state = InGame`
+6. 进入 InGame 后请求指针锁
 
 ### InGame → EscMenu
 - ESC 键按下 → `paused = true`，释放指针锁

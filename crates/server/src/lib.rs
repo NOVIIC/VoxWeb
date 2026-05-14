@@ -99,7 +99,7 @@ pub struct Server {
 pub const FIRST_ENTITY_ID: EntityId = 1;
 
 /// Phase 3 出生点（与 client::start_single_player 一致）。
-const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
+pub const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
 
 /// 初始 ChunkSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
 const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
@@ -370,8 +370,10 @@ impl Server {
                     return true; // 首次广播
                 };
                 let moved = p.position.distance_squared(last_pos) > DELTA_POS_THRESHOLD_SQ;
-                let turned = (p.yaw - p.last_broadcast_yaw.unwrap_or(0.0)).abs() > DELTA_ANGLE_THRESHOLD
-                    || (p.pitch - p.last_broadcast_pitch.unwrap_or(0.0)).abs() > DELTA_ANGLE_THRESHOLD;
+                let turned = (p.yaw - p.last_broadcast_yaw.unwrap_or(0.0)).abs()
+                    > DELTA_ANGLE_THRESHOLD
+                    || (p.pitch - p.last_broadcast_pitch.unwrap_or(0.0)).abs()
+                        > DELTA_ANGLE_THRESHOLD;
                 moved || turned
             })
             .map(|(eid, p)| {

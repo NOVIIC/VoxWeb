@@ -314,6 +314,33 @@ Idle ──connect()──▶ SignalingConnect ──WS open──▶ AwaitRegis
                                    Disconnected
 ```
 
+### 加载步骤（Phase 5+）
+
+为支持加载界面列表式显示，新增两个类型和 `loading_steps()` 方法：
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepStatus { Pending, InProgress, Done }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadingStep {
+    pub label: String,
+    pub status: StepStatus,
+}
+```
+
+`RoomSession::loading_steps()` 返回网络协商的 5 个步骤及各自状态（信令 → 注册 → offer → answer → DC），按当前 `RoomSession` 状态推导每步是 Pending / InProgress / Done。
+
+```rust
+impl RoomSession {
+    /// 返回网络连接相关的加载步骤列表。
+    /// 区块预载步骤由客户端自行追加。
+    pub fn loading_steps(&self) -> Vec<LoadingStep>;
+}
+```
+
+旧 `progress_label()` 单行文本方法已移除。Local 模式的 `RoomSession` 始终为 `Idle`，`loading_steps()` 返回空列表——客户端只追加区块预载那一步。
+
 ---
 
 ## 七、`transport.rs` — 通道选择与路由
@@ -371,7 +398,7 @@ Idle ──connect()──▶ SignalingConnect ──WS open──▶ AwaitRegis
 
 ```rust
 pub use lib::{NetEndpoint, NetError, InboundEnvelope, NetMessage, PeerId};
-pub use room::RoomSession;
+pub use room::{LoadingStep, RoomSession, StepStatus};
 pub use transport::{ChannelKind};
 
 // 不公开：SignalingClient / PeerConnection / DataChannel 等内部细节

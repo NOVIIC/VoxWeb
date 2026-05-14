@@ -5,6 +5,7 @@
 //! 还提供"Connecting…"视图：[`draw_connecting`]。
 
 use crate::app::GameMode;
+use voxweb_net::{LoadingStep, StepStatus};
 
 /// 大厅按钮触发的动作。lib.rs 主循环消费。
 #[derive(Clone, Debug)]
@@ -165,19 +166,19 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
     action
 }
 
-/// Connecting 视图：等待信令 + WebRTC 协商时显示进度。
+/// Connecting 视图：等待信令 + WebRTC 协商 + 区块预载时显示进度列表。
 pub fn draw_connecting(
     ctx: &egui::Context,
     mode: GameMode,
     room_id: &str,
-    progress_label: &str,
+    steps: &[LoadingStep],
     error: Option<&str>,
 ) -> Option<ConnectingAction> {
     let mut action = None;
 
     #[allow(deprecated)]
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(160.0);
+        ui.add_space(120.0);
         ui.vertical_centered(|ui| {
             let title = match mode {
                 GameMode::Host => format!("Hosting room {room_id}…"),
@@ -189,15 +190,36 @@ pub fn draw_connecting(
                     .size(28.0)
                     .color(egui::Color32::from_rgb(230, 240, 245)),
             );
-            ui.add_space(12.0);
-            ui.colored_label(egui::Color32::from_rgb(180, 190, 200), progress_label);
+            ui.add_space(24.0);
+
+            // —— 步骤列表 ——
+            for step in steps {
+                let (icon, color) = match step.status {
+                    StepStatus::Done => ("✓", egui::Color32::from_rgb(100, 200, 120)),
+                    StepStatus::InProgress => ("⟳", egui::Color32::from_rgb(220, 200, 100)),
+                    StepStatus::Pending => ("○", egui::Color32::from_rgb(120, 130, 140)),
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(40.0);
+                    ui.colored_label(color, egui::RichText::new(icon).size(16.0));
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 190, 200),
+                        egui::RichText::new(&step.label).size(16.0),
+                    );
+                });
+                ui.add_space(4.0);
+            }
 
             if let Some(msg) = error {
                 ui.add_space(12.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 130, 130), msg);
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 130, 130),
+                    egui::RichText::new(msg).size(15.0),
+                );
             }
 
-            ui.add_space(40.0);
+            ui.add_space(32.0);
             let btn = egui::Button::new(
                 egui::RichText::new("Cancel")
                     .size(16.0)

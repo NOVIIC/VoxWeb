@@ -24,7 +24,7 @@ use voxweb_core::protocol::{
 };
 
 pub use peer::{PeerConnection, PeerEvent, PeerState};
-pub use room::{NegotiationProgress, RoomSession};
+pub use room::{LoadingStep, NegotiationProgress, RoomSession, StepStatus};
 pub use signaling::{IceServerConfig, Role, SignalingClient, SignalingEvent};
 pub use transport::ChannelKind;
 

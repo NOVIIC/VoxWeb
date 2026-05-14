@@ -31,7 +31,7 @@ use voxweb_core::chunk::Position;
 use voxweb_core::protocol::{ClientMessage, EntityId, PROTOCOL_VERSION, RoomEvent, ServerMessage};
 use voxweb_render::Renderer;
 
-use crate::app::{AppState, Game, GameMode, GameSettings, RemotePlayerState};
+use crate::app::{AppState, Game, GameMode, GameSettings, PreloadState, RemotePlayerState};
 use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
@@ -84,6 +84,9 @@ struct App {
 
     /// 标志：下次 InGame 渲染前请求一次指针锁（点击 Lobby 按钮触发）
     request_pointer_lock_next: bool,
+
+    /// 区块预载状态（Connecting 状态下使用，网络协商完成后开始加载出生点周围区块）。
+    preload_state: Option<PreloadState>,
 }
 
 #[wasm_bindgen(start)]
@@ -147,6 +150,7 @@ pub async fn start() -> Result<(), JsValue> {
         fps_accum: 0.0,
         fps_display: 0.0,
         request_pointer_lock_next: false,
+        preload_state: None,
     }));
 
     install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
@@ -714,15 +718,26 @@ fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>) {
     let settings = GameSettings::default();
     let mut game = Game::new_local(seed, settings, "Player");
 
-    // Phase 5：add_player 已经在 Game::new_local 内做掉，不再发 Hello。
     // 相机 yaw/pitch 用默认值（physics 驱动 position）
     game.camera.position = game.physics.eye_position();
     game.camera.pitch = -0.4;
 
+    let rd = game.settings.render_distance as i32;
+    let total = ((2 * rd + 1) * (2 * rd + 1)) as usize;
+
     let mut a = app.borrow_mut();
     a.game = Some(game);
-    a.state = AppState::InGame;
-    a.request_pointer_lock_next = true;
+    a.connecting_mode = GameMode::Local;
+    a.connecting_room_id = String::new();
+    a.connecting_error = None;
+    a.preload_state = Some(PreloadState {
+        total,
+        received: 0,
+        meshed: 0,
+        active: true,
+    });
+    a.state = AppState::Connecting;
+    log::info!("[local] 进入加载界面，开始区块预载 (total={total})");
 }
 
 /// 用 getrandom 生成一个 u64 随机种子。失败时退化为 0。
@@ -870,22 +885,136 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
     // —— 1. 推进网络状态机（与 InGame 复用 poll_net 路径）——
     poll_net(app);
 
-    // —— 2. 拉 connecting 视图渲染参数 ——
-    let (mode, room_id, progress_label, error) = {
+    // —— 1b. drain Server→Client inbox（Remote 端收 ChunkSnapshot / Welcome 等）——
+    {
+        let mut a = app.borrow_mut();
+        if let Some(game) = a.game.as_mut() {
+            let mut msgs = Vec::new();
+            while let Some(msg) = game.net.try_recv_server_message() {
+                msgs.push(msg);
+            }
+            for msg in msgs {
+                apply_server_message(game, msg);
+            }
+        }
+    }
+
+    // —— 2. 区块预载（网络协商完成后，加载出生点周围区块）——
+    {
+        let mut a = app.borrow_mut();
+        let App {
+            ref mut renderer,
+            ref mut game,
+            ref mut preload_state,
+            ref mut state,
+            ref mut request_pointer_lock_next,
+            ..
+        } = *a;
+
+        if let Some(preload) = preload_state {
+            if preload.active {
+                if let Some(game) = game {
+                    let mode = game.mode;
+
+                    // Host/Local：首帧及后续帧生成+入队（update 内部在 last_center 未变时跳过）
+                    if mode != GameMode::Remote {
+                        let mut server_mut = game.server.borrow_mut();
+                        game.chunk_loader.update(
+                            voxweb_server::DEFAULT_SPAWN,
+                            &mut server_mut,
+                            &mut game.mesh_jobs,
+                            renderer,
+                        );
+                        drop(server_mut);
+                    }
+
+                    // 运行网格化（预载期间用 16ms 预算，比正常 4ms 更大）
+                    let server_ref = game.server.borrow();
+                    game.mesh_jobs
+                        .run_until_budget(16.0, &server_ref, renderer, &now_ms);
+
+                    // 统计已接收和已网格化的区块数
+                    let spawn_center =
+                        crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                    let r = game.chunk_loader.render_distance;
+                    let mut received = 0usize;
+                    let mut meshed = 0usize;
+                    for dx in -r..=r {
+                        for dz in -r..=r {
+                            let pos = voxweb_core::ChunkPos::new(
+                                spawn_center.x + dx,
+                                spawn_center.z + dz,
+                            );
+                            if server_ref.world.chunks.contains_key(&pos) {
+                                received += 1;
+                                if renderer.has_chunk_mesh(pos) {
+                                    meshed += 1;
+                                }
+                            }
+                        }
+                    }
+                    drop(server_ref);
+
+                    preload.received = received;
+                    preload.meshed = meshed;
+
+                    // 完成条件：所有区块已接收 且 网格化队列为空（空 chunk 已被处理但不上传 mesh）
+                    if received >= preload.total && game.mesh_jobs.is_empty() {
+                        preload.active = false;
+                        *state = AppState::InGame;
+                        *request_pointer_lock_next = true;
+                        log::info!(
+                            "[preload] 区块预载完成 (received={received} meshed={meshed} total={}) → InGame",
+                            preload.total
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // —— 3. 构建步骤列表（网络步骤 + 区块预载步骤）——
+    let (mode, room_id, steps, error) = {
         let a = app.borrow();
+        let mode = a.connecting_mode;
         let game = a.game.as_ref();
-        let progress = game
-            .map(|g| g.net.session().progress_label().to_string())
-            .unwrap_or_else(|| "Initializing…".to_string());
+        // Local 模式跳过网络步骤（无网络协商）
+        let mut steps = if mode == GameMode::Local {
+            Vec::new()
+        } else {
+            game.map(|g| g.net.session().loading_steps())
+                .unwrap_or_default()
+        };
+
+        // 追加区块预载步骤
+        let chunk_status = match &a.preload_state {
+            Some(preload) if preload.active => voxweb_net::StepStatus::InProgress,
+            Some(_) => voxweb_net::StepStatus::Done,
+            None => voxweb_net::StepStatus::Pending,
+        };
+        let chunk_label = match &a.preload_state {
+            Some(preload) if preload.active => {
+                format!(
+                    "Loading spawn chunks ({}/{})",
+                    preload.received, preload.total
+                )
+            }
+            _ => "Loading spawn chunks".to_string(),
+        };
+        steps.push(voxweb_net::LoadingStep {
+            label: chunk_label,
+            status: chunk_status,
+        });
+
         (
             a.connecting_mode,
             a.connecting_room_id.clone(),
-            progress,
+            steps,
             a.connecting_error.clone(),
         )
     };
 
-    // —— 3. 跑 egui ——
+    // —— 4. 跑 egui ——
     let (cancel, paint_jobs, pixels_per_point, textures_delta) = {
         let a = app.borrow_mut();
         let events: Vec<egui::Event> = std::mem::take(&mut *a.egui_events.borrow_mut());
@@ -899,7 +1028,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
         };
         let mut act: Option<ConnectingAction> = None;
         let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
-            act = draw_connecting(ui.ctx(), mode, &room_id, &progress_label, error.as_deref());
+            act = draw_connecting(ui.ctx(), mode, &room_id, &steps, error.as_deref());
         });
         let ppp = full_output.pixels_per_point;
         let jobs = a.egui_ctx.tessellate(full_output.shapes, ppp);
@@ -910,12 +1039,13 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
         // 直接丢掉 game，回 Lobby
         let mut a = app.borrow_mut();
         a.game = None;
+        a.preload_state = None;
         a.state = AppState::Lobby;
         a.connecting_error = None;
         return Ok(());
     }
 
-    // —— 4. 渲染（纯 egui + 暗色清屏）——
+    // —— 5. 渲染（纯 egui + 暗色清屏）——
     paint_egui_only(app, paint_jobs, pixels_per_point, textures_delta, cw, ch);
     Ok(())
 }
@@ -1146,17 +1276,30 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
     let mut a = app.borrow_mut();
     match ev {
         RoomEvent::Connected => {
-            // Host：信令注册成功就视为可进入 InGame；Remote：等 DC open 才 Connected
+            // 网络连接完成，启动区块预载（不再直接进 InGame）
             if a.state == AppState::Connecting {
-                a.state = AppState::InGame;
-                a.request_pointer_lock_next = true;
-                log::info!("[net] Connected → InGame");
+                if let Some(ref game) = a.game {
+                    let rd = game.settings.render_distance as i32;
+                    let total = ((2 * rd + 1) * (2 * rd + 1)) as usize;
+                    a.preload_state = Some(PreloadState {
+                        total,
+                        received: 0,
+                        meshed: 0,
+                        active: true,
+                    });
+                    log::info!("[net] Connected → 开始区块预载 (total={total})");
+                } else {
+                    // 无 game（不应发生），直接进 InGame 兜底
+                    a.state = AppState::InGame;
+                    a.request_pointer_lock_next = true;
+                }
             }
         }
         RoomEvent::Disconnected { reason } => {
             log::warn!("[net] Disconnected: {reason}");
             a.disconnect_reason = Some(reason.clone());
             a.connecting_error = Some(reason);
+            a.preload_state = None;
             // 在 Connecting / InGame 都直接回大厅
             a.state = AppState::Lobby;
             a.game = None;

@@ -4,6 +4,24 @@
 //! 主要供 UI 显示进度（"Connecting…"、"Waiting for host…"）。
 //! 真正的协商驱动逻辑在 [`crate::NetEndpoint::poll`] 中。
 
+/// 加载步骤状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepStatus {
+    /// 尚未开始。
+    Pending,
+    /// 正在进行中。
+    InProgress,
+    /// 已完成。
+    Done,
+}
+
+/// 一条加载步骤（供 UI 列表渲染）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadingStep {
+    pub label: String,
+    pub status: StepStatus,
+}
+
 /// 协商各子步骤是否完成（用于 UI 显示更精细的进度条）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NegotiationProgress {
@@ -67,25 +85,126 @@ impl RoomSession {
         }
     }
 
-    /// 一句话进度描述（给 UI 用）。
-    pub fn progress_label(&self) -> &'static str {
+    /// 返回网络连接相关的加载步骤列表（信令 → 注册 → offer → answer → DC）。
+    /// 区块预载步骤由客户端追加，不在此列。
+    pub fn loading_steps(&self) -> Vec<LoadingStep> {
+        let steps: &[&str] = &[
+            "Connecting to signaling server…",
+            "Registering with room…",
+            "Exchanging offer…",
+            "Exchanging answer…",
+            "Establishing data channel…",
+        ];
+
         match self {
-            RoomSession::Idle => "Idle",
-            RoomSession::SignalingConnect => "Connecting to signaling server…",
-            RoomSession::AwaitRegistered => "Registering with room…",
+            RoomSession::Idle => steps
+                .iter()
+                .map(|&label| LoadingStep {
+                    label: label.to_string(),
+                    status: StepStatus::Pending,
+                })
+                .collect(),
+
+            RoomSession::SignalingConnect => steps
+                .iter()
+                .enumerate()
+                .map(|(i, &label)| LoadingStep {
+                    label: label.to_string(),
+                    status: if i == 0 {
+                        StepStatus::InProgress
+                    } else {
+                        StepStatus::Pending
+                    },
+                })
+                .collect(),
+
+            RoomSession::AwaitRegistered => steps
+                .iter()
+                .enumerate()
+                .map(|(i, &label)| LoadingStep {
+                    label: label.to_string(),
+                    status: if i == 0 {
+                        StepStatus::Done
+                    } else if i == 1 {
+                        StepStatus::InProgress
+                    } else {
+                        StepStatus::Pending
+                    },
+                })
+                .collect(),
+
             RoomSession::Negotiating(p) => {
-                if !p.offer_exchanged {
-                    "Exchanging offer…"
+                let offer_done = p.offer_exchanged || p.answer_exchanged || p.data_channel_opened;
+                let answer_done = p.answer_exchanged || p.data_channel_opened;
+                let dc_done = p.data_channel_opened;
+                let in_progress_idx = if !p.offer_exchanged {
+                    2
                 } else if !p.answer_exchanged {
-                    "Exchanging answer…"
+                    3
                 } else if !p.data_channel_opened {
-                    "Establishing data channel…"
+                    4
                 } else {
-                    "Almost there…"
-                }
+                    5 // 全部完成，无 InProgress
+                };
+
+                steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &label)| {
+                        let status = match i {
+                            0 | 1 => StepStatus::Done,
+                            2 => {
+                                if offer_done {
+                                    StepStatus::Done
+                                } else if i == in_progress_idx {
+                                    StepStatus::InProgress
+                                } else {
+                                    StepStatus::Pending
+                                }
+                            }
+                            3 => {
+                                if answer_done {
+                                    StepStatus::Done
+                                } else if i == in_progress_idx {
+                                    StepStatus::InProgress
+                                } else {
+                                    StepStatus::Pending
+                                }
+                            }
+                            4 => {
+                                if dc_done {
+                                    StepStatus::Done
+                                } else if i == in_progress_idx {
+                                    StepStatus::InProgress
+                                } else {
+                                    StepStatus::Pending
+                                }
+                            }
+                            _ => StepStatus::Pending,
+                        };
+                        LoadingStep {
+                            label: label.to_string(),
+                            status,
+                        }
+                    })
+                    .collect()
             }
-            RoomSession::Connected => "Connected",
-            RoomSession::Disconnected { .. } => "Disconnected",
+
+            RoomSession::Connected => steps
+                .iter()
+                .map(|&label| LoadingStep {
+                    label: label.to_string(),
+                    status: StepStatus::Done,
+                })
+                .collect(),
+
+            RoomSession::Disconnected { .. } => steps
+                .iter()
+                .map(|&label| LoadingStep {
+                    label: label.to_string(),
+                    status: StepStatus::Done,
+                })
+                .collect(),
         }
     }
 }
@@ -112,14 +231,77 @@ mod tests {
     }
 
     #[test]
-    fn progress_labels_distinct() {
+    fn loading_steps_idle_all_pending() {
+        let s = RoomSession::Idle;
+        let steps = s.loading_steps();
+        assert_eq!(steps.len(), 5);
+        assert!(steps.iter().all(|s| s.status == StepStatus::Pending));
+    }
+
+    #[test]
+    fn loading_steps_signaling_connect() {
+        let s = RoomSession::SignalingConnect;
+        let steps = s.loading_steps();
+        assert_eq!(steps[0].status, StepStatus::InProgress);
+        assert_eq!(steps[1].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn loading_steps_await_registered() {
+        let s = RoomSession::AwaitRegistered;
+        let steps = s.loading_steps();
+        assert_eq!(steps[0].status, StepStatus::Done);
+        assert_eq!(steps[1].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn loading_steps_negotiating_offer() {
+        let s = RoomSession::Negotiating(NegotiationProgress::default());
+        let steps = s.loading_steps();
+        // 0: 信令 Done, 1: 注册 Done, 2: offer InProgress, 3-4: Pending
+        assert_eq!(steps[0].status, StepStatus::Done);
+        assert_eq!(steps[1].status, StepStatus::Done);
+        assert_eq!(steps[2].status, StepStatus::InProgress);
+        assert_eq!(steps[3].status, StepStatus::Pending);
+        assert_eq!(steps[4].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn loading_steps_negotiating_answer() {
         let mut s = RoomSession::Negotiating(NegotiationProgress::default());
-        assert_eq!(s.progress_label(), "Exchanging offer…");
         s.mark_offer_exchanged();
-        assert_eq!(s.progress_label(), "Exchanging answer…");
+        let steps = s.loading_steps();
+        assert_eq!(steps[2].status, StepStatus::Done);
+        assert_eq!(steps[3].status, StepStatus::InProgress);
+        assert_eq!(steps[4].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn loading_steps_negotiating_dc() {
+        let mut s = RoomSession::Negotiating(NegotiationProgress::default());
+        s.mark_offer_exchanged();
         s.mark_answer_exchanged();
-        assert_eq!(s.progress_label(), "Establishing data channel…");
+        let steps = s.loading_steps();
+        assert_eq!(steps[2].status, StepStatus::Done);
+        assert_eq!(steps[3].status, StepStatus::Done);
+        assert_eq!(steps[4].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn loading_steps_all_done() {
+        let mut s = RoomSession::Negotiating(NegotiationProgress::default());
+        s.mark_offer_exchanged();
+        s.mark_answer_exchanged();
         s.mark_dc_open();
-        assert_eq!(s.progress_label(), "Almost there…");
+        let steps = s.loading_steps();
+        assert!(steps.iter().all(|s| s.status == StepStatus::Done));
+    }
+
+    #[test]
+    fn loading_steps_connected() {
+        let s = RoomSession::Connected;
+        let steps = s.loading_steps();
+        assert_eq!(steps.len(), 5);
+        assert!(steps.iter().all(|s| s.status == StepStatus::Done));
     }
 }

@@ -272,7 +272,11 @@ mod tests {
         let blocks = vec![BlockID::AIR; CHUNK_SIZE];
         let bytes = encode_chunk(&blocks).expect("encode");
         // 全 AIR 压缩后应极小（1 palette + 1 run）
-        assert!(bytes.len() < 30, "all-air should be <30B, got {}", bytes.len());
+        assert!(
+            bytes.len() < 30,
+            "all-air should be <30B, got {}",
+            bytes.len()
+        );
         let decoded = decode_chunk(&bytes).expect("decode");
         assert_eq!(decoded, blocks);
     }
@@ -281,7 +285,11 @@ mod tests {
     fn compress_all_stone_roundtrip() {
         let blocks = vec![BlockID::STONE; CHUNK_SIZE];
         let bytes = encode_chunk(&blocks).expect("encode");
-        assert!(bytes.len() < 30, "all-stone should be <30B, got {}", bytes.len());
+        assert!(
+            bytes.len() < 30,
+            "all-stone should be <30B, got {}",
+            bytes.len()
+        );
         let decoded = decode_chunk(&bytes).expect("decode");
         assert_eq!(decoded, blocks);
     }

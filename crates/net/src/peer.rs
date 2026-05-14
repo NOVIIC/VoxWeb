@@ -143,12 +143,9 @@ impl PeerConnection {
             let inbox_clone = inbox.clone();
             let on_buf_low = Closure::<dyn FnMut(JsValue)>::new(move |_evt: JsValue| {
                 paused_flag.set(false);
-                inbox_clone
-                    .borrow_mut()
-                    .push_back(PeerEvent::BufferFreed);
+                inbox_clone.borrow_mut().push_back(PeerEvent::BufferFreed);
             });
-            reliable_dc
-                .set_onbufferedamountlow(Some(on_buf_low.as_ref().unchecked_ref()));
+            reliable_dc.set_onbufferedamountlow(Some(on_buf_low.as_ref().unchecked_ref()));
             closures.push(on_buf_low.into_js_value());
         }
 

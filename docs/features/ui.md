@@ -34,7 +34,7 @@ Phase 6 起会把 `EscMenu` / `ChatOpen` 升级为 `InGame` 的子状态位（`I
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     match &app.state {
         AppState::Lobby => lobby::draw(app, ctx),
-        AppState::Connecting { progress } => connecting::draw(app, ctx, progress),
+        AppState::Connecting => connecting::draw(app, ctx),
         AppState::Disconnected { reason } => disconnected::draw(app, ctx, reason),
         AppState::InGame { paused, chat_open } => {
             // 总是显示 HUD
@@ -150,26 +150,52 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 ---
 
-## 四、`ui/connecting.rs` — 连接中
+## 四、`ui/lobby.rs` — 连接中视图
 
-显示信令进度：
+`draw_connecting()` 负责 Connecting 状态下的加载界面（[Phase 4+ 网络协商] + [Phase 5+ 区块预载]）。
+
+函数签名：
+```rust
+pub fn draw_connecting(
+    ctx: &egui::Context,
+    mode: GameMode,
+    room_id: &str,
+    steps: &[LoadingStep],  // 来自 RoomSession::loading_steps() + 区块预载步骤
+    error: Option<&str>,
+) -> Option<ConnectingAction>;
+```
+
+每步的 `StepStatus` 决定显示样式：
+- `Done` → `✓` 绿色
+- `InProgress` → `⟳` 黄色
+- `Pending` → `○` 灰色
 
 ```
 ┌──────────────────────────────────────────────┐
 │                                              │
-│           正在加入房间 abc123...               │
+│          Joining room abc123…                 │
 │                                              │
-│   [✓] 连接信令服务                             │
-│   [✓] 找到主机                                │
-│   [⠋] 协商 ICE 候选                           │
-│   [ ] 建立数据通道                            │
-│   [ ] 接收世界数据 (12/49 chunks)             │
+│     ✓  Connecting to signaling server…        │
+│     ✓  Registering with room…                 │
+│     ⟳  Exchanging offer…                     │
+│     ○  Exchanging answer…                     │
+│     ○  Establishing data channel…             │
+│     ○  Loading spawn chunks (0/169)           │
 │                                              │
-│            [取消]                             │
+│               [Cancel]                        │
 └──────────────────────────────────────────────┘
 ```
 
-异常时显示错误 + 重试 / 返回大厅按钮。
+步骤列表组成：
+1. 前 5 步来自 `RoomSession::loading_steps()`（网络协商）
+2. 最后一步"Loading spawn chunks"由客户端根据 `App::preload_state` 追加
+   - 网络 Connected 后状态从 `Pending` 变为 `InProgress`
+   - 进行中时显示 `(received/total)` 计数
+   - 完成后状态变为 `Done` → 进入 InGame
+
+Local 模式跳过网络步骤，仅显示区块预载那一步。
+
+异常时显示错误 + Cancel 按钮返回大厅。
 
 ---
 

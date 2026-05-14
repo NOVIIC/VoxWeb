@@ -23,6 +23,19 @@ use crate::physics::LocalPhysics;
 use crate::prediction::{InputHistory, PendingActions};
 use crate::raycast::RaycastHit;
 
+/// 区块预载进度（进入游戏前的最后一项加载步骤）。
+#[derive(Clone, Debug, Default)]
+pub struct PreloadState {
+    /// 出生点渲染范围内预期的总区块数。
+    pub total: usize,
+    /// 已生成/接收到的区块数（存在于 world.chunks 中）。
+    pub received: usize,
+    /// 已完成 GPU 网格化的区块数。
+    pub meshed: usize,
+    /// 预载阶段是否进行中。
+    pub active: bool,
+}
+
 /// 应用全局状态。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AppState {
