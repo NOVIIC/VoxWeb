@@ -40,6 +40,12 @@ pub struct PlayerEntity {
     pub last_input_tick: u32,
     /// 加入时的 server tick 计数。
     pub joined_at_tick: u32,
+    /// Delta 广播：上次广播时的位置（None 表示尚未广播过，需全量发送）
+    pub last_broadcast_position: Option<Vec3>,
+    /// Delta 广播：上次广播时的 yaw
+    pub last_broadcast_yaw: Option<f32>,
+    /// Delta 广播：上次广播时的 pitch
+    pub last_broadcast_pitch: Option<f32>,
 }
 
 impl PlayerEntity {
@@ -51,6 +57,9 @@ impl PlayerEntity {
             pitch: 0.0,
             last_input_tick: 0,
             joined_at_tick,
+            last_broadcast_position: None,
+            last_broadcast_yaw: None,
+            last_broadcast_pitch: None,
         }
     }
 
@@ -94,6 +103,13 @@ const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
 
 /// 初始 ChunkSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
 const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
+
+/// Delta 广播：位置变化距离平方阈值（0.01m² ≈ 0.1m 位移）。
+const DELTA_POS_THRESHOLD_SQ: f32 = 0.0001;
+/// Delta 广播：朝向变化角度阈值（弧度，约 0.5°）。
+const DELTA_ANGLE_THRESHOLD: f32 = 0.0087;
+/// Delta 广播：每 N tick 强制全量发送（0.5s @ 60Hz）。
+const FULL_BROADCAST_INTERVAL: u32 = 30;
 
 impl Server {
     /// 根据种子创建世界。Phase 5 不再自动注册玩家：
@@ -195,6 +211,11 @@ impl Server {
     /// Host 调用方走 `NetEndpoint::host_route_outbox`。
     pub fn drain_outbox(&mut self) -> Vec<OutboundMessage> {
         self.outbox.drain(..).collect()
+    }
+
+    /// 流控阻塞的消息重新入队（下帧重试发送）。
+    pub fn reenqueue_outbox(&mut self, msgs: Vec<OutboundMessage>) {
+        self.outbox.extend(msgs);
     }
 
     /// Phase 8 持久化层用的占位。Phase 5 不消费，留方法签名以免后续 API churn。
@@ -323,17 +344,46 @@ impl Server {
         }
     }
 
-    /// 把所有当前在场玩家打包成 PlayerTick，enqueue 到 `Recipient::All`。
+    /// 每 tick 向所有玩家广播 PlayerTick（delta 模式）。
+    ///
+    /// **Delta 规则**：
+    /// - 位置变化 < 0.01m 且朝向变化 < 0.5° 的玩家不包含在本 tick 的 players 列表中
+    /// - 每 [`FULL_BROADCAST_INTERVAL`] tick 强制全量发送一次（防止丢包导致远端冻结）
+    /// - 新玩家（`last_broadcast_position.is_none()`）始终包含
+    ///
     /// 频率：60Hz（由 `tick()` 末尾调用）。
     pub fn broadcast_tick(&mut self) {
         if self.players.is_empty() {
             return;
         }
+
+        let force_full = self.tick % FULL_BROADCAST_INTERVAL == 0;
+
         let players: Vec<PlayerSnapshot> = self
             .players
-            .iter()
-            .map(|(eid, p)| p.to_snapshot(*eid))
+            .iter_mut()
+            .filter(|(_, p)| {
+                if force_full {
+                    return true;
+                }
+                let Some(last_pos) = p.last_broadcast_position else {
+                    return true; // 首次广播
+                };
+                let moved = p.position.distance_squared(last_pos) > DELTA_POS_THRESHOLD_SQ;
+                let turned = (p.yaw - p.last_broadcast_yaw.unwrap_or(0.0)).abs() > DELTA_ANGLE_THRESHOLD
+                    || (p.pitch - p.last_broadcast_pitch.unwrap_or(0.0)).abs() > DELTA_ANGLE_THRESHOLD;
+                moved || turned
+            })
+            .map(|(eid, p)| {
+                p.last_broadcast_position = Some(p.position);
+                p.last_broadcast_yaw = Some(p.yaw);
+                p.last_broadcast_pitch = Some(p.pitch);
+                p.to_snapshot(*eid)
+            })
             .collect();
+
+        // 如果 delta 过滤后没有玩家需要广播（极端情况：所有人完全静止超过 0.5s），
+        // 仍发一个 PlayerTick 以维持 server_time_ms 时钟同步
         self.enqueue(
             Recipient::All,
             ServerMessage::PlayerTick {
@@ -354,7 +404,7 @@ impl Server {
                 let Some(chunk) = self.world.chunks.get(&pos) else {
                     continue;
                 };
-                let bytes = match voxweb_core::protocol::encode(&chunk.blocks) {
+                let bytes = match voxweb_core::chunk::encode_chunk(&chunk.blocks) {
                     Ok(b) => b,
                     Err(e) => {
                         log::warn!("[server] encode chunk {pos:?} failed: {e}");

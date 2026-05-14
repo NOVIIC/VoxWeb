@@ -102,52 +102,66 @@ DataChannel 双通道 OPEN
 
 加入新成员时 Host 把渲染距离内所有 chunks 发给该成员。
 
+### palette+RLE 压缩编码
+
+Chunk 发送前通过 `encode_chunk()` 压缩为 palette+RLE 格式（定义在 `crates/core/src/chunk.rs`）：
+
+```rust
+struct CompressedChunk {
+    palette: Vec<BlockID>,      // 本 chunk 出现的所有不同 BlockID（按首次出现顺序）
+    runs: Vec<(u16, u32)>,      // (palette_index, run_length) 连续相同方块的 run
+}
+```
+
+编码后整体做 bincode 序列化，作为 `ChunkSnapshot.payload`。
+
+| Chunk 内容 | 压缩前 (raw bincode Vec<u16>) | 压缩后 (palette+RLE) |
+|---|---|---|
+| 全 AIR | ~131 KB | < 20 B |
+| 全 STONE | ~131 KB | < 20 B |
+| 典型地形（草/泥/石/空气） | ~131 KB | 2-5 KB |
+| 高多样性建筑 | ~131 KB | 8-20 KB |
+
+典型地形压缩比约 **30x-60x**，初始快照（169 chunk）从 ~22 MB 降至 ~0.5 MB。
+
 ### 分片规则
 
 ```
-单个 chunk payload（bincode 序列化后）≈ 50KB（典型，65536 块大量 AIR 经 RLE 优化前）
+单个 chunk 压缩后 payload 远小于原始 131KB
 DataChannel SCTP 用户消息上限 ≈ 16KB（不同浏览器实现略异，保守 14KB）
 
 → payload 切片为 ≤ 14336 字节
 → 每片附 (frag_index, frag_total) header
-→ 接收端按 ChunkPos 维度组装，齐了就 deserialize
+→ 接收端按 ChunkPos 维度组装，齐了就 decode_chunk 解压
 ```
 
-> **优化建议**：发送前可对 chunk.blocks 做简单 RLE（连续相同 BlockID 压缩）。本期可选；不做时单 chunk 130KB（65536×2 字节），分 10 片左右。
+典型地形 chunk 压缩后仅 2-5 KB，**大多数 chunk 不需分片**（frag_total=1）。
 
 ### 接收端组装
 
-```rust
-pub struct ChunkAssembler {
-    fragments: HashMap<ChunkPos, Vec<Option<Vec<u8>>>>,
-}
+ChunkAssembler 只负责拼字节，不关心编码格式。组装完成后调用 `decode_chunk()` 解压为 `Vec<BlockID>`。
 
-impl ChunkAssembler {
-    pub fn ingest(&mut self, msg: ChunkSnapshot) -> Option<(ChunkPos, Chunk)> {
-        let entry = self.fragments.entry(msg.pos)
-            .or_insert_with(|| vec![None; msg.frag_total as usize]);
-        entry[msg.frag_index as usize] = Some(msg.payload);
-        if entry.iter().all(|x| x.is_some()) {
-            let bytes: Vec<u8> = entry.drain(..).flatten().flatten().collect();
-            self.fragments.remove(&msg.pos);
-            let chunk: Chunk = core::decode(&bytes).ok()?;
-            Some((msg.pos, chunk))
-        } else { None }
-    }
+```rust
+// 组装器入口不变；解码层从 protocol::decode → chunk::decode_chunk
+if let Some(full) = assembler.ingest(pos, frag_index, frag_total, payload) {
+    let blocks = voxweb_core::chunk::decode_chunk(&full)?;
+    // blocks.len() == CHUNK_SIZE (65536)
 }
 ```
 
 ### 流量控制
 
 - 浏览器 SCTP 自带流控（`bufferedAmount`）
-- Host 在 `bufferedAmount > THRESHOLD` 时暂停发送下一片，等 `bufferedamountlow` 事件触发后继续
-- 阈值建议 1MB
+- Reliable DataChannel 设置 `bufferedAmountLowThreshold = 256 KB`
+- `PeerConnection::send()` 发送后检查 `bufferedAmount`，超过 **1 MB 高水位**时设置暂停标志
+- 暂停后该 peer 的 reliable 消息被推迟到下帧发送，等待 `onbufferedamountlow` 事件清除暂停标志
+- `host_route_outbox()` 返回流控阻塞的未发送消息，由 `flush_server_outbox()` 重新入队 server.outbox
 
 ---
 
 ## 六、运行时双向流
 
-### 6.1 玩家移动（unreliable）
+### 6.1 玩家移动（unreliable，delta 广播）
 
 ```
 Remote                          Host
@@ -162,6 +176,15 @@ Remote                          Host
    client.prediction.reconcile_self(snapshot)   ← 与本地预测对比
    client.interp.ingest_tick(snapshot)         ← 远端玩家入插值缓冲
 ```
+
+**Delta 广播规则**（`Server::broadcast_tick`）：
+
+- 位置变化 < 0.01m（约 0.1m 位移）且朝向变化 < 0.5° 的玩家**不包含**在本 tick 的 `players` 列表中
+- 每 30 tick（0.5s @ 60Hz）强制全量广播一次，防止丢包导致远端玩家冻结
+- 新加入玩家（首次广播）始终包含
+- 即使所有玩家都静止，仍发送空的 `PlayerTick` 以维持 `server_time_ms` 时钟同步
+
+**效果**：静止或缓慢移动的玩家消耗零带宽；多数场景节省 50-80% PlayerTick 带宽。
 
 详见 [`prediction.md`](prediction.md)。
 
@@ -235,15 +258,16 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 | `Hello` | 30-60 字节 | 名字最多 32 字符 |
 | `Welcome` | 16 字节 | |
 | `PlayerInput` | 24 字节 | varint 后 |
-| `PlayerTick`（4 玩家） | ~120 字节 | 每玩家 ~24 字节 + header |
-| `PlayerTick`（8 玩家） | ~220 字节 | 同上 |
+| `PlayerTick`（4 玩家，delta） | ~30-120 字节 | delta 模式下多数 tick 只含 0-2 个玩家 |
+| `PlayerTick`（8 玩家，全量） | ~220 字节 | 每 0.5s 强制全量 |
 | `Break/Place` | 16-20 字节 | |
 | `BlockUpdate` | 16 字节 | |
-| `ChunkSnapshot` 单片 | ≤ 14KB | 分片上限 |
+| `ChunkSnapshot`（典型地形 chunk） | 2-5 KB | palette+RLE 压缩后；通常不需分片 |
+| `ChunkSnapshot`（高多样性 chunk） | 8-20 KB | 可能需要 1-2 片 |
 | `Chat`（短消息） | 30-100 字节 | |
 | `ActionAck` | 12 字节 | |
 
-60Hz × 8 玩家广播带宽 ≈ 220 × 60 = 13KB/s out（Host 单向）。家用上行（5Mbps = 625KB/s）足够支撑 30+ 玩家。
+初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB）。
 
 ---
 
@@ -265,7 +289,7 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 ## 十一、Future Work（v2/v3）
 
 - 操作日志同步（让 Remote 重放 BlockUpdate 历史，避免重复全量同步）
-- Delta 玩家广播（仅广播位置变化的玩家）
 - 区块按需请求（Remote 走远后请求新 chunk，而非加入时一次性发全部）
 - 端到端加密（双重保险）
 - 更复杂的 Welcome 流程（双向能力协商，如纹理包版本）
+- ~~Delta 玩家广播~~ ✅ 已实现（见 §六.1）

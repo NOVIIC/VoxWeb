@@ -1,4 +1,11 @@
 //! 区块数据结构、世界坐标、区块坐标。
+//!
+//! ## Chunk 网络压缩格式（palette + RLE）
+//!
+//! ChunkSnapshot 发送前用 [`encode_chunk`] 压缩，接收端用 [`decode_chunk`] 解压。
+//! 格式：`{ palette: Vec<BlockID>, runs: Vec<(palette_index: u16, run_length: u32)> }`
+//! 遍历 blocks 按顺序扫描连续相同 BlockID 的 run，记录其 palette 下标和长度。
+//! 典型地形（草/泥/石/空气 4 种方块）从 131KB 压缩到 2-5KB。
 
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +125,84 @@ pub fn index(lx: usize, ly: usize, lz: usize) -> usize {
     (ly << 8) | (lz << 4) | lx
 }
 
+// —— Chunk 网络压缩（palette + RLE）——
+
+/// palette+RLE 压缩格式。bincode 序列化后作为 ChunkSnapshot 的 payload。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompressedChunk {
+    /// 本 chunk 中出现的所有不同 BlockID（按首次出现顺序排列）
+    palette: Vec<BlockID>,
+    /// 按顺序排列的 run：(palette_index, run_length)
+    runs: Vec<(u16, u32)>,
+}
+
+/// 将 Chunk 的 blocks 数组编码为 palette+RLE 压缩字节。
+///
+/// 算法：遍历 65536 个方块，将连续相同 BlockID 合并为一个 run；
+/// 每个 BlockID 查找/插入 palette，记录 (palette_index, run_length)。
+pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String> {
+    if blocks.len() != CHUNK_SIZE {
+        return Err(format!(
+            "encode_chunk: expected {CHUNK_SIZE} blocks, got {}",
+            blocks.len()
+        ));
+    }
+
+    let mut palette: Vec<BlockID> = Vec::new();
+    let mut runs: Vec<(u16, u32)> = Vec::new();
+
+    let mut cursor = 0usize;
+    while cursor < CHUNK_SIZE {
+        let current = blocks[cursor];
+        // 扫描连续相同方块的 run
+        let mut run_len: u32 = 1;
+        while cursor + (run_len as usize) < CHUNK_SIZE
+            && blocks[cursor + (run_len as usize)] == current
+        {
+            run_len += 1;
+        }
+        // palette 下标
+        let pi = match palette.iter().position(|b| *b == current) {
+            Some(i) => i as u16,
+            None => {
+                let i = palette.len() as u16;
+                palette.push(current);
+                i
+            }
+        };
+        runs.push((pi, run_len));
+        cursor += run_len as usize;
+    }
+
+    let compressed = CompressedChunk { palette, runs };
+    crate::protocol::encode(&compressed).map_err(|e| format!("encode_chunk bincode: {e}"))
+}
+
+/// 将 `encode_chunk` 的压缩字节还原为 `Vec<BlockID>`（长度恒为 CHUNK_SIZE）。
+pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<BlockID>, String> {
+    let compressed: CompressedChunk =
+        crate::protocol::decode(bytes).map_err(|e| format!("decode_chunk bincode: {e}"))?;
+
+    let mut blocks: Vec<BlockID> = Vec::with_capacity(CHUNK_SIZE);
+    for (pi, run_len) in &compressed.runs {
+        let block = compressed
+            .palette
+            .get(*pi as usize)
+            .ok_or_else(|| format!("decode_chunk: palette index {pi} out of range"))?;
+        for _ in 0..*run_len {
+            blocks.push(*block);
+        }
+    }
+
+    if blocks.len() != CHUNK_SIZE {
+        return Err(format!(
+            "decode_chunk: expected {CHUNK_SIZE} blocks, got {}",
+            blocks.len()
+        ));
+    }
+    Ok(blocks)
+}
+
 // —— 测试 ——
 
 #[cfg(test)]
@@ -178,5 +263,92 @@ mod tests {
         assert_eq!(chunk.get(3, 100, 5), BlockID::STONE);
         // 未改位置仍是 AIR
         assert_eq!(chunk.get(3, 100, 6), BlockID::AIR);
+    }
+
+    // —— palette+RLE 压缩 roundtrip ——
+
+    #[test]
+    fn compress_all_air_roundtrip() {
+        let blocks = vec![BlockID::AIR; CHUNK_SIZE];
+        let bytes = encode_chunk(&blocks).expect("encode");
+        // 全 AIR 压缩后应极小（1 palette + 1 run）
+        assert!(bytes.len() < 30, "all-air should be <30B, got {}", bytes.len());
+        let decoded = decode_chunk(&bytes).expect("decode");
+        assert_eq!(decoded, blocks);
+    }
+
+    #[test]
+    fn compress_all_stone_roundtrip() {
+        let blocks = vec![BlockID::STONE; CHUNK_SIZE];
+        let bytes = encode_chunk(&blocks).expect("encode");
+        assert!(bytes.len() < 30, "all-stone should be <30B, got {}", bytes.len());
+        let decoded = decode_chunk(&bytes).expect("decode");
+        assert_eq!(decoded, blocks);
+    }
+
+    #[test]
+    fn compress_layered_terrain_roundtrip() {
+        // 模拟典型地形：底部石头、中层泥土、顶部草、其余空气
+        let mut blocks = vec![BlockID::AIR; CHUNK_SIZE];
+        for y in 0..64 {
+            for x in 0..16 {
+                for z in 0..16 {
+                    let idx = index(x, y, z);
+                    blocks[idx] = BlockID::STONE;
+                }
+            }
+        }
+        for y in 64..70 {
+            for x in 0..16 {
+                for z in 0..16 {
+                    let idx = index(x, y, z);
+                    blocks[idx] = BlockID::DIRT;
+                }
+            }
+        }
+        for x in 0..16 {
+            for z in 0..16 {
+                let idx = index(x, 70, z);
+                blocks[idx] = BlockID::GRASS;
+            }
+        }
+        let bytes = encode_chunk(&blocks).expect("encode");
+        // 典型地形压缩后应 < 2KB
+        assert!(
+            bytes.len() < 2048,
+            "layered terrain should be <2KB, got {}",
+            bytes.len()
+        );
+        let decoded = decode_chunk(&bytes).expect("decode");
+        assert_eq!(decoded, blocks);
+    }
+
+    #[test]
+    fn compress_interleaved_blocks_roundtrip() {
+        // 交替方块：偶数索引用 STONE，奇数索引用 DIRT（最差情况，无法合并 run）
+        let mut blocks = vec![BlockID::AIR; CHUNK_SIZE];
+        for i in 0..CHUNK_SIZE {
+            blocks[i] = if i % 2 == 0 {
+                BlockID::STONE
+            } else {
+                BlockID::DIRT
+            };
+        }
+        let bytes = encode_chunk(&blocks).expect("encode");
+        // 交替时压缩率很差，但不应超过原始 131KB 太多
+        assert!(bytes.len() < 200_000);
+        let decoded = decode_chunk(&bytes).expect("decode");
+        assert_eq!(decoded, blocks);
+    }
+
+    #[test]
+    fn encode_wrong_block_count() {
+        let short = vec![BlockID::AIR; 100];
+        assert!(encode_chunk(&short).is_err());
+    }
+
+    #[test]
+    fn decode_corrupt_bytes() {
+        assert!(decode_chunk(b"garbage data not valid").is_err());
     }
 }

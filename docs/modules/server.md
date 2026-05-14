@@ -200,30 +200,33 @@ fn handle_player_input(&mut self, entity: EntityId, msg: PlayerInput) {
 
 ### 玩家广播
 
-每个 `tick()` 末尾，把所有玩家的当前位置打包成 `PlayerTick` 广播：
+每个 `tick()` 末尾，收集玩家位置打包成 `PlayerTick` 广播。采用 **delta 模式**减少带宽：
 
 ```rust
 fn broadcast_tick(&mut self) {
-    let players: Vec<PlayerSnapshot> = self.world.players.values()
-        .map(|p| PlayerSnapshot {
-            entity_id: p.entity_id,
-            position: p.position,
-            yaw: p.yaw,
-            pitch: p.pitch,
-        }).collect();
+    // delta 过滤：仅包含位置变化 > 0.01m 或朝向变化 > 0.5° 的玩家
+    // 每 30 tick（0.5s）强制全量广播一次，防止丢包导致远端冻结
+    // 新玩家（last_broadcast_position.is_none()）始终包含
+    let force_full = self.tick % 30 == 0;
+    let players: Vec<PlayerSnapshot> = self.players.iter_mut()
+        .filter(|(_, p)| force_full || p.has_changed_since_last_broadcast())
+        .map(|(eid, p)| {
+            p.record_broadcast();
+            p.to_snapshot(*eid)
+        })
+        .collect();
 
-    self.outbox.push_back(OutboundMessage {
-        recipient: Recipient::All,
-        message: ServerMessage::PlayerTick {
-            tick: self.world.current_tick,
-            players,
-            server_time_ms: now_ms(),
-        },
+    self.enqueue(Recipient::All, ServerMessage::PlayerTick {
+        tick: self.tick,
+        players,
+        server_time_ms: self.current_time_ms,
     });
 }
 ```
 
-通过 unreliable channel 发送（详见 [`networking/protocol.md`](../networking/protocol.md)）。
+`PlayerEntity` 新增字段：`last_broadcast_position: Option<Vec3>`, `last_broadcast_yaw: Option<f32>`, `last_broadcast_pitch: Option<f32>`。
+
+通过 unreliable channel 发送（详见 [`networking/protocol.md`](../networking/protocol.md) §六.1）。
 
 ---
 
@@ -375,16 +378,17 @@ match msg {
 伪代码：
 ```rust
 fn send_initial_snapshot(&mut self, recipient: EntityId) {
-    let player = &self.world.players[&recipient];
-    let center = player.position.to_chunk_pos();
+    let center = DEFAULT_SPAWN.to_chunk_pos();
     for dx in -RD..=RD {
         for dz in -RD..=RD {
             let pos = ChunkPos { x: center.x + dx, z: center.z + dz };
-            let chunk = self.world.get_or_generate(pos);
-            let payload = encode_chunk_payload(chunk);
-            // 切片为 ≤ 14KB（留出 header 余量）
+            self.world.ensure_chunk_generated(pos);
+            let chunk = self.world.chunks.get(&pos);
+            // palette+RLE 压缩：典型地形 ~131KB → ~2-5KB
+            let payload = voxweb_core::chunk::encode_chunk(&chunk.blocks)?;
+            // 切片为 ≤ 14KB（大多数 chunk 压缩后不需分片，frag_total=1）
             for (i, frag) in payload.chunks(MAX_FRAG).enumerate() {
-                self.outbox.push_back(reply_to(recipient, ChunkSnapshot {
+                self.enqueue(Recipient::One(recipient), ChunkSnapshot {
                     pos, frag_index: i as u16, frag_total: total as u16, payload: frag.to_vec(),
                 }));
             }
@@ -393,7 +397,7 @@ fn send_initial_snapshot(&mut self, recipient: EntityId) {
 }
 ```
 
-> 流量控制：分片之间通过 reliable channel 发送，浏览器自动 backpressure；如果担心拥塞可在 client 网络层做发送窗口（v2）。
+> 流量控制：reliable DC 设 `bufferedAmountLowThreshold=256KB`；发送后检查 `bufferedAmount`，超过 1MB 暂停，`onbufferedamountlow` 恢复。阻塞的消息自动重入队下帧发送（`host_route_outbox` 返回 unsent → `reenqueue_outbox`）。
 
 ---
 

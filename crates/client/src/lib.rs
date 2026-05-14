@@ -1127,7 +1127,11 @@ fn flush_server_outbox(game: &mut Game) {
             }
         }
         GameMode::Host => {
-            game.net.host_route_outbox(outbox, &game.server_inbox);
+            let unsent = game.net.host_route_outbox(outbox, &game.server_inbox);
+            // 流控阻塞的消息重新入队，下帧再试
+            if !unsent.is_empty() {
+                game.server.borrow_mut().reenqueue_outbox(unsent);
+            }
         }
         GameMode::Remote => {
             log::warn!(
@@ -1661,10 +1665,8 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 .chunk_assembler
                 .ingest(pos, frag_index, frag_total, payload)
             {
-                let blocks: Result<Vec<voxweb_core::block::BlockID>, _> =
-                    voxweb_core::protocol::decode(&full);
-                match blocks {
-                    Ok(blocks) if blocks.len() == voxweb_core::chunk::CHUNK_SIZE => {
+                match voxweb_core::chunk::decode_chunk(&full) {
+                    Ok(blocks) => {
                         let chunk = voxweb_core::chunk::Chunk { blocks };
                         game.server.borrow_mut().world.chunks.insert(pos, chunk);
                         // 自己 + 相邻 8 个 chunk 都重 mesh
@@ -1676,9 +1678,6 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                                 );
                             }
                         }
-                    }
-                    Ok(_) => {
-                        log::warn!("[client] ChunkSnapshot {pos:?} wrong block count after decode");
                     }
                     Err(e) => {
                         log::warn!("[client] ChunkSnapshot {pos:?} decode failed: {e}");

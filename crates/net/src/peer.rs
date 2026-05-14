@@ -70,6 +70,8 @@ pub enum PeerEvent {
     StateChanged(PeerState),
     /// 异步操作失败（构造 RTC / setLocal / setRemote / addIce / createOffer / createAnswer）。
     NegotiationError(String),
+    /// Reliable DataChannel 的 `bufferedAmount` 降到阈值以下，可恢复发送。
+    BufferFreed,
 }
 
 /// 与某个对等端的 P2P 连接。
@@ -82,6 +84,8 @@ pub struct PeerConnection {
     unreliable: Rc<RefCell<Option<RtcDataChannel>>>,
     reliable_open: Rc<Cell<bool>>,
     unreliable_open: Rc<Cell<bool>>,
+    /// Reliable DC 的发送缓冲区是否因超过阈值而暂停（等待 BufferFreed 事件）。
+    reliable_paused: Rc<Cell<bool>>,
     inbox: Rc<RefCell<VecDeque<PeerEvent>>>,
 
     /// 保活所有 JS 闭包（onicecandidate / oniceconnectionstatechange / ondatachannel / DC 各事件）。
@@ -91,6 +95,13 @@ pub struct PeerConnection {
 impl PeerConnection {
     /// Host 侧：主动 `createDataChannel("reliable")` + `createDataChannel("unreliable")`。
     /// 构造完后调用方应在某帧调用 `start_offer()` 发起协商。
+    /// Reliable DC 的 `bufferedAmountLowThreshold`（字节）。
+    /// 当 `bufferedAmount` 从高于降到低于此值时触发 `onbufferedamountlow`。
+    const BUFFERED_LOW_THRESHOLD: u32 = 256 * 1024; // 256 KB
+
+    /// `bufferedAmount` 超过此值暂停发送（字节）。
+    const BUFFERED_HIGH_WATER: u32 = 1024 * 1024; // 1 MB
+
     pub fn create_offerer(peer_id: u32, ice_servers: &[IceServerConfig]) -> Result<Self, NetError> {
         let rtc = make_rtc(ice_servers)?;
 
@@ -99,6 +110,7 @@ impl PeerConnection {
         let unreliable: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
         let reliable_open = Rc::new(Cell::new(false));
         let unreliable_open = Rc::new(Cell::new(false));
+        let reliable_paused = Rc::new(Cell::new(false));
         let inbox: Rc<RefCell<VecDeque<PeerEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
 
         let mut closures = install_pc_handlers(
@@ -116,12 +128,29 @@ impl PeerConnection {
             init.set_ordered(true);
             rtc.create_data_channel_with_data_channel_dict("reliable", &init)
         };
+        reliable_dc.set_buffered_amount_low_threshold(Self::BUFFERED_LOW_THRESHOLD);
+
         let unreliable_dc = {
             let init = RtcDataChannelInit::new();
             init.set_ordered(false);
             init.set_max_retransmits(0);
             rtc.create_data_channel_with_data_channel_dict("unreliable", &init)
         };
+
+        // onbufferedamountlow：reliable DC 缓冲区降到阈值以下 → 恢复发送
+        {
+            let paused_flag = reliable_paused.clone();
+            let inbox_clone = inbox.clone();
+            let on_buf_low = Closure::<dyn FnMut(JsValue)>::new(move |_evt: JsValue| {
+                paused_flag.set(false);
+                inbox_clone
+                    .borrow_mut()
+                    .push_back(PeerEvent::BufferFreed);
+            });
+            reliable_dc
+                .set_onbufferedamountlow(Some(on_buf_low.as_ref().unchecked_ref()));
+            closures.push(on_buf_low.into_js_value());
+        }
 
         attach_dc_handlers(
             &reliable_dc,
@@ -153,6 +182,7 @@ impl PeerConnection {
             unreliable,
             reliable_open,
             unreliable_open,
+            reliable_paused,
             inbox,
             _closures: closures,
         })
@@ -170,6 +200,7 @@ impl PeerConnection {
         let unreliable: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
         let reliable_open = Rc::new(Cell::new(false));
         let unreliable_open = Rc::new(Cell::new(false));
+        let reliable_paused = Rc::new(Cell::new(false));
         let inbox: Rc<RefCell<VecDeque<PeerEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
 
         let mut closures = install_pc_handlers(
@@ -243,6 +274,7 @@ impl PeerConnection {
             unreliable,
             reliable_open,
             unreliable_open,
+            reliable_paused,
             inbox,
             _closures: closures,
         })
@@ -269,6 +301,9 @@ impl PeerConnection {
     }
 
     /// 同步发送字节。DC 未 open / 已关闭 → 静默丢弃（unreliable 语义即可；reliable 由调用方在 open 后再发）。
+    ///
+    /// Reliable 通道：发送后检查 `bufferedAmount`，超过高水位则设置 `reliable_paused`，
+    /// 后续发送将跳过直到 `onbufferedamountlow` 触发。
     pub fn send(&self, channel: ChannelKind, bytes: &[u8]) -> Result<(), NetError> {
         let slot = match channel {
             ChannelKind::Reliable => &self.reliable,
@@ -285,9 +320,35 @@ impl PeerConnection {
         let Some(dc) = borrowed.as_ref() else {
             return Err(NetError::DataChannelClosed);
         };
+        // Reliable 通道：若已暂停则跳过此次发送
+        if channel == ChannelKind::Reliable && self.reliable_paused.get() {
+            return Err(NetError::DataChannelClosed);
+        }
         dc.send_with_u8_array(bytes)
             .map_err(|_| NetError::DataChannelClosed)?;
+        // Reliable 通道：发送后检查 bufferedAmount 是否超过高水位
+        if channel == ChannelKind::Reliable {
+            let buffered = dc.buffered_amount();
+            if buffered >= Self::BUFFERED_HIGH_WATER {
+                self.reliable_paused.set(true);
+            }
+        }
         Ok(())
+    }
+
+    /// 查询 Reliable DataChannel 当前缓冲区积压字节数。
+    /// DC 未就绪时返回 0。
+    pub fn buffered_amount(&self) -> u32 {
+        self.reliable
+            .borrow()
+            .as_ref()
+            .map(|dc| dc.buffered_amount())
+            .unwrap_or(0)
+    }
+
+    /// Reliable 通道是否因流控暂停。
+    pub fn is_reliable_paused(&self) -> bool {
+        self.reliable_paused.get()
     }
 
     /// Host 端：发起 createOffer → setLocalDescription → 推 OfferReady。

@@ -88,6 +88,8 @@ opfs:/voxweb/
 
 ## 四、Chunk 压缩格式（palette + RLE）
 
+> 此格式同时用于 **OPFS 磁盘存储**（本节）和 **ChunkSnapshot 网络传输**（[`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。网络侧已实装 `encode_chunk` / `decode_chunk`（`crates/core/src/chunk.rs`）；磁盘侧延后至 Phase 8。
+
 未压缩的 `Chunk` 在内存中是 `Vec<BlockID>`，长度 65536，每个 `BlockID` 2 字节 = **128 KB/chunk**。万级 chunk 直接 dump 会撑爆 OPFS 配额。
 
 实际格式（bincode 2.x，little-endian + varint）：

@@ -150,7 +150,7 @@ trunk serve                     # localhost:8080
 | Remote 世界数据宿主 | 复用 `Server.world` 作纯数据宿主 | 不引入 `WorldView`；Remote 模式 tick/handle_message 不被驱动，Server.struct 加文档注释 |
 | OPFS 持久化 | 整体延后到 Phase 8 | Phase 5 工作量大（11 步）；OPFS 独立可验证 |
 | 位置误差中等阈值处理 | Phase 5 忽略中间误差（> SOFTERROR、< HARDERROR） | Phase 7 加 soft-blend 动画器 |
-| ChunkSnapshot 编码 | 直接 bincode `Vec<BlockID>`（~65KB/chunk） | Phase 8 加 palette+RLE 压缩（~2-5KB/chunk） |
+| ChunkSnapshot 编码 | palette+RLE 压缩 `encode_chunk` / `decode_chunk`（~2-5 KB/chunk，30-60x 压缩比） | 替换 Phase 5 临时使用的 bincode `Vec<BlockID>` 直编（~131 KB/chunk） |
 | 玩家身体渲染 | 实心立方体 PlayerPass，无 yaw 朝向 | 极简方案；视觉区分依靠 entity_id → 颜色 |
 | Hello 处置 | 从 handle_message 中抽出，由 net 层调用 add_player | entity_id 分配需要 &mut Server + 同时建立 peer_id↔entity_id 映射，时序耦合在 net 闭包中更干净 |
 | 并发玩家目标 | 4 人（1 Host + 3 Remote） | 可覆盖 Host→3 fanout 路径 |
@@ -163,10 +163,15 @@ trunk serve                     # localhost:8080
 
 - Remote 端 `server.world.chunks` 在 Welcome 时清空占位 chunks，但 `mesh_jobs.run_until_budget` 可能同时持有 `&Server`——ChunkSnapshot 写入 chunks 的时序与 mesh_jobs 无锁竞争（RefCell borrow 动态检查兜底）
 - PlayerTick 的 `server_clock_offset_ms` 没有 EMA 滤波，网络抖动可能导致轻微视觉振动（Phase 7 加）
-- ChunkSnapshot 分片没有流量控制；SCTP+RefCell backpressure 自然限速（监控手测）
 - OPFS 持久化未覆盖：关 Tab 再开房间世界重生成（Phase 8）
 - LRU + pinned chunk 驱逐未覆盖（Phase 8）
 - 玩家身体不随 yaw 旋转（Phase 8 可扩展为 capsule/arm）
+
+### 已在 Phase 5 内补齐的优化（原列在 Phase 8 / Future Work）
+
+- **ChunkSnapshot palette+RLE 压缩**：`encode_chunk` / `decode_chunk`（`crates/core/src/chunk.rs`），典型地形 ~131KB → ~2-5KB（30-60x）
+- **PlayerTick Delta 广播**：仅发送位置/朝向变化的玩家，每 0.5s 强制全量一次（`crates/server/src/lib.rs`）
+- **bufferedAmount 流控**：Reliable DC 高水位 1MB 暂停 + `onbufferedamountlow` 恢复 + 未发送消息自动重入队（`crates/net/src/peer.rs` + `host_route_outbox`）
 
 ---
 

@@ -326,8 +326,15 @@ impl NetEndpoint {
     /// - 走 peer DC 的部分调 [`PeerConnection::send`] 序列化发送；
     /// - 走本地 Host 的部分通过 `local_inbox.send_server_message` 喂回 client 主循环。
     ///
+    /// 返回因流控（reliable DC `bufferedAmount` 过高）未能发送的消息，
+    /// 调用方应将其重新入队到下帧发送。
+    ///
     /// 仅 Host 模式生效；Local / Remote 调用是 no-op。
-    pub fn host_route_outbox(&mut self, msgs: Vec<OutboundMessage>, local_inbox: &ServerInbox) {
+    pub fn host_route_outbox(
+        &mut self,
+        msgs: Vec<OutboundMessage>,
+        local_inbox: &ServerInbox,
+    ) -> Vec<OutboundMessage> {
         let NetEndpoint::Host {
             peers,
             peer_to_entity,
@@ -335,8 +342,10 @@ impl NetEndpoint {
             ..
         } = self
         else {
-            return;
+            return Vec::new();
         };
+
+        let mut unsent: Vec<OutboundMessage> = Vec::new();
 
         for msg in msgs {
             let plan = plan_route(&msg, peer_to_entity, *host_self_entity_id);
@@ -354,6 +363,20 @@ impl NetEndpoint {
             };
             let channel = transport::channel_for_server_message(&msg.message);
 
+            // 流控检查：若任一目标 peer 的 reliable DC 因 bufferedAmount 暂停，整条消息推迟
+            if let Some(_b) = &bytes {
+                if channel == crate::transport::ChannelKind::Reliable {
+                    let any_paused = plan
+                        .peers_to_send
+                        .iter()
+                        .any(|pid| peers.get(pid).map_or(false, |pc| pc.is_reliable_paused()));
+                    if any_paused {
+                        unsent.push(msg);
+                        continue;
+                    }
+                }
+            }
+
             if let Some(b) = bytes {
                 for pid in &plan.peers_to_send {
                     if let Some(pc) = peers.get(pid)
@@ -369,6 +392,8 @@ impl NetEndpoint {
                 local_inbox.send_server_message(msg.message);
             }
         }
+
+        unsent
     }
 
     /// 每帧推进网络状态机。
@@ -571,6 +596,9 @@ fn poll_host(
                 PeerEvent::NegotiationError(msg) => {
                     log::warn!("[net/host] peer {peer_id} negotiation error: {msg}");
                 }
+                PeerEvent::BufferFreed => {
+                    // reliable DC 缓冲区降到阈值以下；下帧 flush_server_outbox 会重试发送
+                }
             }
         }
     }
@@ -718,6 +746,9 @@ fn poll_remote(
                 }
                 PeerEvent::NegotiationError(msg) => {
                     log::warn!("[net/remote] negotiation error: {msg}");
+                }
+                PeerEvent::BufferFreed => {
+                    // Remote 不发送大块数据，忽略
                 }
             }
         }

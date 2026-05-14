@@ -135,6 +135,23 @@ impl Chunk {
 
 **索引选择理由**：`y` 在最高位 → 同层方块在内存上连续，利于水平遍历（贪婪网格化按层扫描时缓存命中）。
 
+### Chunk 网络压缩（palette + RLE）
+
+`encode_chunk` / `decode_chunk` 用于 ChunkSnapshot 网络传输（详见 [`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。
+
+```rust
+/// 将 blocks 数组编码为 palette+RLE 压缩字节。
+/// 算法：扫描连续相同 BlockID 合并为 run；记录 (palette_index, run_length)。
+pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String>;
+
+/// 将 encode_chunk 的压缩字节还原为 Vec<BlockID>（长度恒为 CHUNK_SIZE）。
+pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<BlockID>, String>;
+```
+
+内部格式：`CompressedChunk { palette: Vec<BlockID>, runs: Vec<(u16, u32)> }` → bincode 序列化。
+
+典型地形（草/泥/石/空气 4 种方块）从 ~131 KB 压缩到 2-5 KB（**30-60x**）。
+
 ### 边界检查
 
 `get`/`set` 必须做断言或 `Result` 返回，禁止越界。建议：内部函数用断言（debug 期捕捉），公开 API 用 `Option`/`Result`。
