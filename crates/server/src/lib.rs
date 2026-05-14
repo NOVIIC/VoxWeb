@@ -156,6 +156,23 @@ impl Server {
             },
         );
 
+        // 把已在场的所有玩家告知新玩家，否则远端客户端不知道 Host 等人的存在
+        let existing: Vec<(EntityId, String)> = self
+            .players
+            .iter()
+            .filter(|(ex, _)| **ex != eid)
+            .map(|(ex, p)| (*ex, p.display_name.clone()))
+            .collect();
+        for (existing_eid, name) in existing {
+            self.enqueue(
+                Recipient::One(eid),
+                ServerMessage::PeerJoined {
+                    entity_id: existing_eid,
+                    display_name: name,
+                },
+            );
+        }
+
         // 初始快照：以出生点 (chunk 0,0) 为中心扩 INITIAL_SNAPSHOT_RADIUS 圈。
         let spawn_chunk = ChunkPos::new(
             (DEFAULT_SPAWN.x as i32).div_euclid(CHUNK_X as i32),

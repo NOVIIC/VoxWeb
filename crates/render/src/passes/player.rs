@@ -14,20 +14,20 @@ use wgpu::util::DeviceExt;
 /// 玩家 AABB box 顶点（36 个，12 个三角形）。
 /// 以玩家脚底 (0, 0, 0) 为原点，尺寸 0.6×1.8×0.6。
 const CUBE_VERTICES: &[[f32; 3]] = &[
-    // +Y (top, y=1.8)
-    [-0.3, 1.8, -0.3],
-    [0.3, 1.8, -0.3],
-    [0.3, 1.8, 0.3],
-    [-0.3, 1.8, -0.3],
-    [0.3, 1.8, 0.3],
+    // +Y (top, y=1.8) — CCW from +Y
     [-0.3, 1.8, 0.3],
-    // -Y (bottom, y=0)
+    [0.3, 1.8, 0.3],
+    [0.3, 1.8, -0.3],
+    [-0.3, 1.8, 0.3],
+    [0.3, 1.8, -0.3],
+    [-0.3, 1.8, -0.3],
+    // -Y (bottom, y=0) — CCW from -Y
     [-0.3, 0.0, 0.3],
+    [0.3, 0.0, -0.3],
     [0.3, 0.0, 0.3],
-    [0.3, 0.0, -0.3],
     [-0.3, 0.0, 0.3],
-    [0.3, 0.0, -0.3],
     [-0.3, 0.0, -0.3],
+    [0.3, 0.0, -0.3],
     // +Z (front)
     [-0.3, 0.0, 0.3],
     [0.3, 0.0, 0.3],
@@ -287,7 +287,7 @@ impl PlayerPass {
     }
 }
 
-/// WGSL shader。
+/// WGSL shader。6 面法线按 vertex_index 硬编码，避免非正方体尺寸下 infer_normal 误判。
 const PLAYER_SHADER: &str = r#"
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -301,17 +301,17 @@ struct VertexOutput {
     @location(1) color: vec3<f32>,
 };
 
-// 用本顶点坐标推断 cube 的面法线。因为 cube 是轴对齐的，
-// 坐标绝对值最大的轴对应法线方向。
-fn infer_normal(v: vec3<f32>) -> vec3<f32> {
-    let ax = abs(v);
-    if ax.x >= ax.y && ax.x >= ax.z {
-        return vec3<f32>(sign(v.x), 0.0, 0.0);
+// 36 个顶点按 6 面排列，每面 6 顶点（2 个三角形）。
+// 0-5:+Y  6-11:-Y  12-17:+Z  18-23:-Z  24-29:+X  30-35:-X
+fn face_normal(vi: u32) -> vec3<f32> {
+    switch vi / 6u {
+        case 0u: { return vec3<f32>( 0.0,  1.0,  0.0); } // +Y
+        case 1u: { return vec3<f32>( 0.0, -1.0,  0.0); } // -Y
+        case 2u: { return vec3<f32>( 0.0,  0.0,  1.0); } // +Z
+        case 3u: { return vec3<f32>( 0.0,  0.0, -1.0); } // -Z
+        case 4u: { return vec3<f32>( 1.0,  0.0,  0.0); } // +X
+        default: { return vec3<f32>(-1.0,  0.0,  0.0); } // -X
     }
-    if ax.y >= ax.z {
-        return vec3<f32>(0.0, sign(v.y), 0.0);
-    }
-    return vec3<f32>(0.0, 0.0, sign(v.z));
 }
 
 @vertex
@@ -319,11 +319,12 @@ fn vs_main(
     @location(0) vert_pos: vec3<f32>,
     @location(1) inst_pos: vec3<f32>,
     @location(2) inst_color: vec3<f32>,
+    @builtin(vertex_index) vi: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
     let world_pos = vert_pos + inst_pos;
     out.clip_position = globals.view_proj * vec4<f32>(world_pos, 1.0);
-    out.world_normal = infer_normal(vert_pos);
+    out.world_normal = face_normal(vi);
     out.color = inst_color;
     return out;
 }
