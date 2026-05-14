@@ -357,7 +357,7 @@ impl Server {
             return;
         }
 
-        let force_full = self.tick % FULL_BROADCAST_INTERVAL == 0;
+        let force_full = self.tick.is_multiple_of(FULL_BROADCAST_INTERVAL);
 
         let players: Vec<PlayerSnapshot> = self
             .players

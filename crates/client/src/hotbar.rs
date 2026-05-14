@@ -90,8 +90,10 @@ mod tests {
 
     #[test]
     fn select_out_of_range_ignored() {
-        let mut h = Hotbar::default();
-        h.selected = 3;
+        let mut h = Hotbar {
+            selected: 3,
+            ..Hotbar::default()
+        };
         h.select(99);
         assert_eq!(h.selected, 3, "越界请求应不改变选中");
     }

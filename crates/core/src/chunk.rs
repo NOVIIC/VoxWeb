@@ -335,8 +335,8 @@ mod tests {
     fn compress_interleaved_blocks_roundtrip() {
         // 交替方块：偶数索引用 STONE，奇数索引用 DIRT（最差情况，无法合并 run）
         let mut blocks = vec![BlockID::AIR; CHUNK_SIZE];
-        for i in 0..CHUNK_SIZE {
-            blocks[i] = if i % 2 == 0 {
+        for (i, block) in blocks.iter_mut().enumerate() {
+            *block = if i % 2 == 0 {
                 BlockID::STONE
             } else {
                 BlockID::DIRT

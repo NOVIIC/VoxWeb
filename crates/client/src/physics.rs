@@ -383,10 +383,8 @@ mod tests {
     fn axis_split_lets_player_slide_along_wall() {
         // 在 x=1 处摆一面墙（y=65 位置有块）
         let getter = |x: i32, y: i32, _z: i32| {
-            if x == 1 && y == 65 {
+            if (x == 1 && y == 65) || y == 64 {
                 BlockID::STONE
-            } else if y == 64 {
-                BlockID::STONE // 地面
             } else {
                 BlockID::AIR
             }
@@ -429,9 +427,11 @@ mod tests {
         let getter = |_x: i32, _y: i32, _z: i32| BlockID::AIR;
         let mut p = LocalPhysics::new(Vec3::new(0.0, 100.0, 0.0));
         p.mode = CameraMode::Fly;
-        let mut camera = Camera::default();
-        camera.yaw = 0.0; // 朝 +X
-        camera.pitch = -1.2; // 大角度俯视
+        let camera = Camera {
+            yaw: 0.0,
+            pitch: -1.2,
+            ..Camera::default()
+        };
         let mut input = InputState::default();
         input.forward = true;
         let y_before = p.feet_position.y;

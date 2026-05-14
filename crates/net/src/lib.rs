@@ -364,16 +364,16 @@ impl NetEndpoint {
             let channel = transport::channel_for_server_message(&msg.message);
 
             // 流控检查：若任一目标 peer 的 reliable DC 因 bufferedAmount 暂停，整条消息推迟
-            if let Some(_b) = &bytes {
-                if channel == crate::transport::ChannelKind::Reliable {
-                    let any_paused = plan
-                        .peers_to_send
-                        .iter()
-                        .any(|pid| peers.get(pid).map_or(false, |pc| pc.is_reliable_paused()));
-                    if any_paused {
-                        unsent.push(msg);
-                        continue;
-                    }
+            if let Some(_b) = &bytes
+                && channel == crate::transport::ChannelKind::Reliable
+            {
+                let any_paused = plan
+                    .peers_to_send
+                    .iter()
+                    .any(|pid| peers.get(pid).is_some_and(|pc| pc.is_reliable_paused()));
+                if any_paused {
+                    unsent.push(msg);
+                    continue;
                 }
             }
 

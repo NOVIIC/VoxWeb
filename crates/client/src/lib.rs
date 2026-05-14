@@ -911,64 +911,59 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
             ..
         } = *a;
 
-        if let Some(preload) = preload_state {
-            if preload.active {
-                if let Some(game) = game {
-                    let mode = game.mode;
+        if let Some(preload) = preload_state
+            && preload.active
+            && let Some(game) = game
+        {
+            let mode = game.mode;
 
-                    // Host/Local：首帧及后续帧生成+入队（update 内部在 last_center 未变时跳过）
-                    if mode != GameMode::Remote {
-                        let mut server_mut = game.server.borrow_mut();
-                        game.chunk_loader.update(
-                            voxweb_server::DEFAULT_SPAWN,
-                            &mut server_mut,
-                            &mut game.mesh_jobs,
-                            renderer,
-                        );
-                        drop(server_mut);
-                    }
+            // Host/Local：首帧及后续帧生成+入队（update 内部在 last_center 未变时跳过）
+            if mode != GameMode::Remote {
+                let mut server_mut = game.server.borrow_mut();
+                game.chunk_loader.update(
+                    voxweb_server::DEFAULT_SPAWN,
+                    &mut server_mut,
+                    &mut game.mesh_jobs,
+                    renderer,
+                );
+                drop(server_mut);
+            }
 
-                    // 运行网格化（预载期间用 16ms 预算，比正常 4ms 更大）
-                    let server_ref = game.server.borrow();
-                    game.mesh_jobs
-                        .run_until_budget(16.0, &server_ref, renderer, &now_ms);
+            // 运行网格化（预载期间用 16ms 预算，比正常 4ms 更大）
+            let server_ref = game.server.borrow();
+            game.mesh_jobs
+                .run_until_budget(16.0, &server_ref, renderer, &now_ms);
 
-                    // 统计已接收和已网格化的区块数
-                    let spawn_center =
-                        crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
-                    let r = game.chunk_loader.render_distance;
-                    let mut received = 0usize;
-                    let mut meshed = 0usize;
-                    for dx in -r..=r {
-                        for dz in -r..=r {
-                            let pos = voxweb_core::ChunkPos::new(
-                                spawn_center.x + dx,
-                                spawn_center.z + dz,
-                            );
-                            if server_ref.world.chunks.contains_key(&pos) {
-                                received += 1;
-                                if renderer.has_chunk_mesh(pos) {
-                                    meshed += 1;
-                                }
-                            }
+            // 统计已接收和已网格化的区块数
+            let spawn_center = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+            let r = game.chunk_loader.render_distance;
+            let mut received = 0usize;
+            let mut meshed = 0usize;
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    let pos = voxweb_core::ChunkPos::new(spawn_center.x + dx, spawn_center.z + dz);
+                    if server_ref.world.chunks.contains_key(&pos) {
+                        received += 1;
+                        if renderer.has_chunk_mesh(pos) {
+                            meshed += 1;
                         }
                     }
-                    drop(server_ref);
-
-                    preload.received = received;
-                    preload.meshed = meshed;
-
-                    // 完成条件：所有区块已接收 且 网格化队列为空（空 chunk 已被处理但不上传 mesh）
-                    if received >= preload.total && game.mesh_jobs.is_empty() {
-                        preload.active = false;
-                        *state = AppState::InGame;
-                        *request_pointer_lock_next = true;
-                        log::info!(
-                            "[preload] 区块预载完成 (received={received} meshed={meshed} total={}) → InGame",
-                            preload.total
-                        );
-                    }
                 }
+            }
+            drop(server_ref);
+
+            preload.received = received;
+            preload.meshed = meshed;
+
+            // 完成条件：所有区块已接收 且 网格化队列为空（空 chunk 已被处理但不上传 mesh）
+            if received >= preload.total && game.mesh_jobs.is_empty() {
+                preload.active = false;
+                *state = AppState::InGame;
+                *request_pointer_lock_next = true;
+                log::info!(
+                    "[preload] 区块预载完成 (received={received} meshed={meshed} total={}) → InGame",
+                    preload.total
+                );
             }
         }
     }

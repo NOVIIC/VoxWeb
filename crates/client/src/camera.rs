@@ -94,9 +94,11 @@ mod tests {
 
     #[test]
     fn forward_horizontal_strips_pitch() {
-        let mut c = Camera::default();
-        c.yaw = 0.0; // 朝 +X
-        c.pitch = -0.5; // 朝下
+        let c = Camera {
+            yaw: 0.0,
+            pitch: -0.5,
+            ..Camera::default()
+        };
         let fh = c.forward_horizontal();
         assert!(fh.y.abs() < 1e-6);
         assert!((fh.x - 1.0).abs() < 1e-6);
