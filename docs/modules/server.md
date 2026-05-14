@@ -30,7 +30,8 @@
 | **Phase 2 ✅** | `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk`；`TerrainGenerator`（已在 Phase 1 stub）；`Server::handle_message` 仅 `Hello → Welcome` 占位 + `Break/Place` 无校验直改 |
 | **Phase 3 ✅** | `physics::validate_break/place`（6m 射程 + AABB overlap）；`Server::players` 最小 tracker（feat Hello 插入 + PlayerInput 更新）；Break/Place 调 validate → ActionAck + BlockUpdate 闭环 |
 | **Phase 4 ✅** | Server 不变；`net` 层新增 Host/Remote 角色以 P2P 转发 ClientMessage/ServerMessage；Server 通过 `handle_message` 闭包被 `NetEndpoint::poll` 驱动处理 peer 消息 |
-| Phase 5 | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`take_dirty_chunks` / `ChunkStorage` trait |
+| Phase 5 ✅ | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`outbox` + `Recipient` 路由；OPFS 持久化整体延后至 Phase 8 |
+| Phase 8 | 补 Phase 5 延后的持久化全套（chunk encode/decode、OpfsStorage、PersistenceManager、LRU、迁移框架、配额 UI） |
 
 下面 §3 起描述的是**完整设计**；每节遇到 Phase 3+ 才引入的字段会用 `> Phase N` 注明。
 
@@ -167,7 +168,7 @@ impl Server {
                 └─ 都没有？terrain::generate(seed, pos) → 插入
 ```
 
-**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`（Phase 5）。
+**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`（Phase 8）。
 
 ### 玩家位置更新
 

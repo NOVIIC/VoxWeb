@@ -177,7 +177,7 @@ const missing = required.filter(k => !checks[k]());
 ### 3.4 OPFS
 
 - **配额**：通常磁盘 60% 上限（chromium）；隐身模式下大幅缩水至几十 MB；可调 `navigator.storage.persist()` 申请持久存储以避免自动清理
-- **同步 API 仅 Worker 内可用**：`FileSystemSyncAccessHandle.write()`，主线程只有 async 路径；Phase 5 走 async（Variant A），Phase 8 视情况升级到 Worker（Variant B）
+- **同步 API 仅 Worker 内可用**：`FileSystemSyncAccessHandle.write()`，主线程只有 async 路径；Phase 8 默认走 async（Variant A），视情况升级到 Worker（Variant B）
 - **`removeEntry({recursive:true})`**：Chromium / Firefox 较新版本支持；旧 Safari 需逐文件 `removeEntry` 自实现递归删
 - **大目录性能**：单目录 ≥ 10k 文件时 OPFS 内部 SQLite-like 索引仍可承担；但 `entries()` 异步迭代会拖到 100-300 ms，需要 loading UI 遮蔽
 - **DevTools 入口**：

@@ -26,9 +26,9 @@
 |---|---|
 | **Phase 2 ✅** | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
 | **Phase 3 ✅** | Walk 模式 + `physics.rs` + `raycast.rs`；挖放 hotbar；PendingActions rollback；server validate_break/place 闭环；选中方块线框 SelectionPass；PlayerInput 上报 |
-| Phase 4 | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote` |
-| Phase 5 | `prediction.rs`（输入历史+协调）/ `interp.rs` 实装；`storage.rs` OPFS 最小可用版（启动 prime + 按需 load + 1s flush）；远端玩家身体渲染 |
-| Phase 6 | `ui::chat / players / pause` 完整；EscMenu / ChatOpen 状态 |
+| Phase 4 ✅ | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote`（Ping-Pong 闭环） |
+| Phase 5 ✅ | `prediction.rs`（InputHistory + reconcile_self）/ `interp.rs`（PlayerInterp 100ms 延迟）/ `chunk_assembler.rs`（ChunkSnapshot 分片组装）；远端玩家身体渲染（PlayerPass）；outbox+Recipient 路由；OPFS 持久化整体延后至 Phase 8 |
+| Phase 8 | 补 `storage.rs` OPFS 完整实现（`WorldStorage` trait + `OpfsStorage` + prime + 按需 load + 1s flush + pagehide） |
 
 下面 §4 起的 `App` 完整结构是**Phase 5+ 终态**。Phase 2 实际仅需子集，标注见 §4。
 
@@ -48,8 +48,9 @@ crates/client/src/
 ├── raycast.rs          [Phase 3 ✅] DDA 射线
 ├── hotbar.rs           [Phase 3 ✅] 9 格快捷栏 + 方块标签
 ├── prediction.rs       [Phase 3 ✅] 挖放 PendingActions（rollback）；[Phase 5] 完整输入历史+协调
-├── interp.rs           [Phase 5] 远端玩家位置插值（当前为 stub）
-├── storage.rs          [Phase 5] OPFS 异步包装（当前为 stub；`WorldStorage` trait + `OpfsStorage` 占位）
+├── interp.rs           [Phase 5 ✅] 远端玩家位置插值（PlayerInterp, 100ms 延迟）
+├── chunk_assembler.rs  [Phase 5 ✅] ChunkSnapshot 分片接收与组装
+├── storage.rs          [Phase 8] OPFS 异步包装（`WorldStorage` trait + `OpfsStorage`；当前为 stub）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
     ├── lobby.rs        [Phase 2] 大厅 + Connecting UI（单机/Host/Remote 入口 + 连接进度）
@@ -179,9 +180,13 @@ pub struct Game {
     pub entity_id: u32,                // [Phase 2] 由 Welcome 填充
 
     // —— 以下为后续 Phase 引入 ——
-    pub interp: PlayerInterp,          // [Phase 5]
-    pub world_view: WorldView,         // [Phase 5] Remote 模式用；Local 直接 borrow server.world
-    pub storage: OpfsStorage,          // [Phase 5] 实现 WorldStorage trait
+    pub interp: PlayerInterp,          // [Phase 5 ✅]
+    pub chunk_assembler: ChunkAssembler, // [Phase 5 ✅]
+    pub remote_players: HashMap<EntityId, RemotePlayerState>, // [Phase 5 ✅]
+    pub input_history: InputHistory,   // [Phase 5 ✅]
+    pub server_clock_offset_ms: i64,   // [Phase 5 ✅]
+    pub world_view: WorldView,         // [Phase N] Remote 模式用独立数据宿主（Phase 5 暂复用 Server.world）
+    pub storage: OpfsStorage,          // [Phase 8] 实现 WorldStorage trait
     pub chat: ChatHistory,             // [Phase 6]
 }
 
@@ -453,7 +458,7 @@ Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, norm
 ### 6.11 `prediction.rs`（[Phase 3 ✅]/[Phase 5 完整]，详见 [`networking/prediction.md`](../networking/prediction.md)）
 Phase 3 已实装 `PendingActions`：挖放操作乐观记录 + ActionAck 协调（commit/rollback）。Phase 5 补输入历史缓冲 + PlayerTick 协调（位置预测）。
 
-### 6.12 `interp.rs`（[Phase 5]）
+### 6.11 `interp.rs`（[Phase 5 ✅]）
 
 远端玩家位置插值缓冲区：
 
@@ -477,7 +482,7 @@ impl PlayerInterp {
 }
 ```
 
-### 6.12 `storage.rs`（[Phase 5]）
+### 6.12 `storage.rs`（[Phase 8]，Phase 5 仅保留 stub 签名）
 
 ```rust
 #[async_trait::async_trait(?Send)]

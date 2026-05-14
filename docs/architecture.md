@@ -180,7 +180,7 @@ VoxWeb/
 │   │       ├── world.rs        # World + 玩家表 + tick
 │   │       ├── terrain.rs      # Perlin 地形
 │   │       ├── physics.rs      # 物理仲裁
-│   │       └── persistence.rs  # PersistenceManager stub（Phase 5 实装 full API）
+│   │       └── persistence.rs  # PersistenceManager（Phase 8 实装 full API；Phase 5 仅 dirty_chunks 标记）
 │   ├── net/                    # P2P 网络层
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -211,7 +211,7 @@ VoxWeb/
 │           │   ├── chat.rs     # 聊天（Phase 6）
 │           │   ├── players.rs  # 玩家列表/名牌（Phase 6）
 │           │   └── ui_state.rs # UI 状态哈希（防止重复渲染判断）
-│           └── storage.rs      # OPFS 异步包装（Phase 5 实装，当前为 stub）
+│           └── storage.rs      # OPFS 异步包装（Phase 8 实装，当前为 stub）
 └── signaling/                  # 独立部署（TS 项目）
     ├── wrangler.toml
     ├── package.json

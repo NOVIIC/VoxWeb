@@ -285,7 +285,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
   - `navigator.storage.persist()` 启动时申请
   - 协议 migration 框架（`storage_version` + `migrations[]` 数组，本期含 identity）
   - 加载失败错误处理 + 删档功能（不再因版本不匹配强制删档）
-- [ ] （可选）Variant B Worker + sync handle 升级：若 Phase 5 上线后出现可观察的"关 Tab 丢数据"投诉，新增 `crates/client/src/storage_worker.rs` 走 `FileSystemSyncAccessHandle`；详见 [`features/persistence.md` §十二](features/persistence.md#十二variant-a-vs-variant-bworker)
+- [ ] （可选）Variant B Worker + sync handle 升级：若 Phase 8 Variant A 上线后出现可观察的"关 Tab 丢数据"投诉，新增 `crates/client/src/storage_worker.rs` 走 `FileSystemSyncAccessHandle`；详见 [`features/persistence.md` §十二](features/persistence.md#十二variant-a-vs-variant-bworker)
 
 ### 验证
 - 看到清晰的天空（地平线渐变 + 太阳）

@@ -2,6 +2,11 @@
 
 > **何时阅读**：改存档逻辑；增删存储字段；调写入频率；处理配额异常；评估迁移到 Worker 同步路径
 > **关联文档**：[`README.md`](../../README.md) · [`modules/server.md`](../modules/server.md) · [`modules/client.md`](../modules/client.md) · [`reference.md`](../reference.md) · [`roadmap.md`](../roadmap.md)
+>
+> **⚠️ Phase 5 延后**：本文档描述的是 OPFS 持久化的**完整设计**。Phase 5 仅实现了 Server 层的 `dirty_chunks` 标记与 `drain_dirty()` 接口；
+> `chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait 实装、PersistenceManager（snapshot/commit/failure 三段式）、
+> prime 预加载、按需 load、1s 周期 flush、`pagehide` 退出 flush、LRU 卸载、配额 UI、migration 框架
+> **全部延后到 Phase 8**。当前 `crates/client/src/storage.rs` 仅留 stub 签名。
 
 ---
 
@@ -410,7 +415,7 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 }
 ```
 
-`migrations` 是有序数组，每项 `fn(&mut World, &OpfsStorage) -> Result<(), MigrationError>`。Phase 5 仅含 identity（v1→v1）；v2 协议升级时新增 v1→v2 步骤。
+`migrations` 是有序数组，每项 `fn(&mut World, &OpfsStorage) -> Result<(), MigrationError>`。Phase 8 仅含 identity（v1→v1）；v2 协议升级时新增 v1→v2 步骤。
 
 不再"版本不同就删档"——大存档用户的累积损失不可接受。
 
@@ -432,9 +437,9 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 
 ## 十二、Variant A vs Variant B（Worker）
 
-两种实现路径，Phase 5 默认走 A，Phase 8 视真实丢数据投诉决定是否升级 B。
+两种实现路径，Phase 8 默认走 A，视真实丢数据投诉决定是否升级 B。
 
-### Variant A：无 Worker，单线程 async（**Phase 5 默认**）
+### Variant A：无 Worker，单线程 async（**Phase 8 默认**）
 
 - 序列化在主线程；OPFS 写入走 `createWritable / write / close` 异步 API
 - `pagehide` 内 `spawn_local`，尽力 await；BFCache 路径下浏览器会等待完成
@@ -522,7 +527,7 @@ window.voxwebDebug.quota()                   // 打印 quota / usage
   - Firefox / Safari：触发浏览器单文件下载
 - 大厅"导入存档" → `<input type="file">` → 解压写入 OPFS
 
-不在 Phase 5/8 范围。
+不在 Phase 8 范围。
 
 ---
 
