@@ -20,9 +20,10 @@ pub struct NegotiationProgress {
 }
 
 /// 房间会话状态机。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RoomSession {
     /// 大厅：尚未启动连接。
+    #[default]
     Idle,
     /// 正在连信令 WebSocket。
     SignalingConnect,
@@ -34,12 +35,6 @@ pub enum RoomSession {
     Connected,
     /// 断开（reason 描述原因，用于 UI 提示）。
     Disconnected { reason: String },
-}
-
-impl Default for RoomSession {
-    fn default() -> Self {
-        RoomSession::Idle
-    }
 }
 
 impl RoomSession {

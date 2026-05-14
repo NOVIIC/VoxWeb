@@ -9,15 +9,18 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use glam::Vec3;
+use voxweb_core::protocol::EntityId;
 use voxweb_net::{NetEndpoint, NetError, ServerInbox};
 use voxweb_server::Server;
 
 use crate::camera::Camera;
+use crate::chunk_assembler::ChunkAssembler;
 use crate::chunk_loader::ChunkLoader;
 use crate::hotbar::Hotbar;
+use crate::interp::PlayerInterp;
 use crate::mesh_jobs::MeshJobQueue;
 use crate::physics::LocalPhysics;
-use crate::prediction::PendingActions;
+use crate::prediction::{InputHistory, PendingActions};
 use crate::raycast::RaycastHit;
 
 /// 应用全局状态。
@@ -50,6 +53,48 @@ pub enum GameMode {
     /// 远端客户端：仅持有 PeerConnection 到 Host。Phase 4 仍跑本地 server 做 placeholder
     /// （世界与 Host 不同步，Phase 5 改为 Host 推送）。
     Remote,
+}
+
+/// 远端玩家运行时状态（渲染 + UI 用）。
+#[derive(Clone, Debug)]
+pub struct RemotePlayerState {
+    pub display_name: String,
+    /// 最近一次收到 PlayerTick 中该玩家的 server tick。
+    pub last_seen_tick: u32,
+    /// 确定性派生颜色（entity_id → HSV → RGB），同一玩家在所有终端颜色一致。
+    pub color_rgb: [f32; 3],
+}
+
+impl RemotePlayerState {
+    pub fn new(display_name: String, entity_id: EntityId) -> Self {
+        Self {
+            display_name,
+            last_seen_tick: 0,
+            color_rgb: entity_color(entity_id),
+        }
+    }
+}
+
+/// 按 entity_id 派生一个 HSV 颜色 → RGB。确定性函数，所有客户端一致。
+fn entity_color(eid: EntityId) -> [f32; 3] {
+    // 简单 hash：Gold ratio multiplier
+    let h = (eid.wrapping_mul(2_654_435_761)) as f32 / u32::MAX as f32; // hue ∈ [0, 1)
+    hsv_to_rgb(h, 0.7, 0.9)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+    let c = v * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h * 6.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r + m, g + m, b + m]
 }
 
 /// Phase 3 游戏运行时设置。Phase 6 起会扩展为 AppSettings 全集。
@@ -137,7 +182,7 @@ pub struct Game {
     pub current_hit: Option<RaycastHit>,
     /// 上次挖掘成功时间（performance.now()，毫秒），用于连续挖掘冷却。
     pub last_break_at_ms: f64,
-    /// 自己的 entity_id（由 Welcome 提供）。
+    /// 自己的 entity_id（由 Welcome 或 add_player 提供）。
     pub entity_id: u32,
     /// Phase 4：RTT（毫秒）。`None` 表示未测过 / 上次 Ping 还没回。Local 模式永远 None。
     pub rtt_ms: Option<f32>,
@@ -147,24 +192,47 @@ pub struct Game {
     pub pending_pings: HashMap<u64, f64>,
     /// 房间号（Host/Remote 模式有效；Local 留空）。
     pub room_id: String,
+    // ── Phase 5 新字段 ──
+    /// 远端玩家实体表（PeerJoined 插入，PeerLeft 移除）。
+    pub remote_players: HashMap<EntityId, RemotePlayerState>,
+    /// 远端玩家位置插值器（PlayerTick 摄入，每渲染帧 advance）。
+    pub interp: PlayerInterp,
+    /// Chunk 快照接收组装器（Remote 端用，Host/Local 闲置）。
+    pub chunk_assembler: ChunkAssembler,
+    /// 本地位置预测的输入历史（60Hz 推入，PlayerTick reconcile 时修剪）。
+    pub input_history: InputHistory,
+    /// Host 时钟与本地时钟的瞬态偏移（ms）：server_time_ms - local_now_ms。
+    /// PlayerTick 每帧覆盖；远端的 rendering target 用。
+    pub server_clock_offset_ms: i64,
 }
 
 impl Game {
     /// 启动一个单机游戏：创建 Server + 配对 NetEndpoint + 初始相机/物理。
-    pub fn new_local(seed: u64, settings: GameSettings) -> Self {
+    /// Phase 5：构造时立即调 `server.add_player(display_name)` 把 Host 本人入表，
+    /// 丢弃随之产生的初始 outbox（Welcome/PeerJoined/ChunkSnapshot — 对自己冗余）。
+    pub fn new_local(seed: u64, settings: GameSettings, display_name: &str) -> Self {
         let server = Rc::new(RefCell::new(Server::new(seed)));
+        let eid = {
+            let mut s = server.borrow_mut();
+            let id = s.add_player(display_name.to_string());
+            let _ = s.drain_outbox();
+            id
+        };
         let (net, server_inbox) = NetEndpoint::new_local_pair();
-        Self::assemble(
+        let mut game = Self::assemble(
             GameMode::Local,
             server,
             server_inbox,
             net,
             settings,
             String::new(),
-        )
+        );
+        game.entity_id = eid;
+        game
     }
 
     /// 启动一个 Host 游戏：本地仍跑 Server（Local 风格），同时连信令接受 Remote。
+    /// Phase 5：与 Local 同样调 add_player；额外把 eid 注册给 net 端做后续路由。
     pub fn new_host(
         seed: u64,
         settings: GameSettings,
@@ -173,26 +241,35 @@ impl Game {
         display_name: &str,
     ) -> Result<Self, NetError> {
         let server = Rc::new(RefCell::new(Server::new(seed)));
-        let (net, server_inbox) = NetEndpoint::new_host(signaling_url, room_id, display_name)?;
-        Ok(Self::assemble(
+        let eid = {
+            let mut s = server.borrow_mut();
+            let id = s.add_player(display_name.to_string());
+            let _ = s.drain_outbox();
+            id
+        };
+        let (mut net, server_inbox) = NetEndpoint::new_host(signaling_url, room_id, display_name)?;
+        net.host_set_self_entity(eid);
+        let mut game = Self::assemble(
             GameMode::Host,
             server,
             server_inbox,
             net,
             settings,
             room_id.to_string(),
-        ))
+        );
+        game.entity_id = eid;
+        Ok(game)
     }
 
-    /// 启动一个 Remote 客户端：连信令、等 Host SDP。Phase 4 本地仍创建一个 Server 占位
-    /// （世界不与 Host 同步；Phase 5 起改为 Host 推送）。
+    /// 启动一个 Remote 客户端：连信令、等 Host SDP。
+    /// Phase 5：Remote 端 `server` 是**纯方块数据宿主**（接收 ChunkSnapshot / BlockUpdate 写入），
+    /// 不调 add_player / tick / handle_message — 自身 entity_id 由 Welcome 填回。
     pub fn new_remote(
         settings: GameSettings,
         signaling_url: &str,
         room_id: &str,
         display_name: &str,
     ) -> Result<Self, NetError> {
-        // Remote 端 server 仅占位，seed 用 0；world 不会进入 view（Phase 5 替换）
         let server = Rc::new(RefCell::new(Server::new(0)));
         // server_inbox 在 Remote 模式不参与驱动；为保持 Game 字段不可空，造一对空 mpsc
         let (_net_local, dummy_inbox) = NetEndpoint::new_local_pair();
@@ -233,11 +310,17 @@ impl Game {
             settings,
             current_hit: None,
             last_break_at_ms: 0.0,
-            entity_id: 0, // 待 Welcome 填充
+            entity_id: 0, // 由 add_player（Local/Host）或 Welcome（Remote）填
             rtt_ms: None,
             last_ping_sent_ms: 0.0,
             pending_pings: HashMap::new(),
             room_id,
+            // Phase 5
+            remote_players: HashMap::new(),
+            interp: PlayerInterp::new(),
+            chunk_assembler: ChunkAssembler::new(),
+            input_history: InputHistory::new(120),
+            server_clock_offset_ms: 0,
         }
     }
 }

@@ -10,7 +10,7 @@
 ```
 Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase 5 ─▶ Phase 6 ─▶ Phase 7 ─▶ Phase 8 ─▶ Phase 9 (stretch)
 脚手架      渲染骨架     体素单人     物理交互     P2P 通道     权威同步     多人 UI      渲染优化     多 Pass+存档   后处理/TURN/触屏
-  ✅          ✅          ✅          ✅          ✅
+  ✅          ✅          ✅          ✅          ✅          ✅
 ```
 
 每个 Phase **可独立验收**：完成时可以演示一个具体的、可观察的功能。后续 Phase 只增不破。
@@ -187,23 +187,17 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`features/persistence.md`](features/persistence.md)
 
 ### 任务清单
-- [ ] `core::protocol` 完整消息定义 + bincode 配置
-- [ ] Hello/Welcome 握手
-- [ ] ChunkSnapshot 分片传输 + 接收端组装
-- [ ] PlayerInput / PlayerTick 60Hz 收发
-- [ ] `client::prediction` 自身位置预测协调
-- [ ] `client::interp` 远端玩家位置插值
-- [ ] BlockUpdate 广播闭环（Remote 操作 → Host 仲裁 → 全员看到）
-- [ ] Action Ack 协调
-- [ ] PeerJoined / PeerLeft 玩家进出广播
-- [ ] 简单玩家身体渲染（一个 box，颜色按 entity_id 派生）
-- [ ] **基础 OPFS 持久化（最小可用版）**：
-  - `crates/core/src/chunk.rs` 加 `encode` / `decode`（palette + RLE，目标 < 5 KB/chunk）
-  - `crates/client/src/storage.rs` 用 OPFS 实现 `WorldStorage` trait
-  - 启动 prime（出生点 4 chunk 半径同步加载）+ 运行时按需 load
-  - `PersistenceManager` 拆分 `snapshot_dirty` / `commit_flushed` / `record_failure`，flush 失败不丢 dirty
-  - 周期 1s flush + `pagehide` 退出 flush（Variant A，主线程 async）
-  - 浏览器能力检测在 Phase 0 已完成，此处可信任 OPFS 可用
+- [x] `core::protocol` 完整消息定义 + bincode 配置（消息枚举 + PROTOCOL_VERSION + Recipient/OutboundMessage）
+- [x] Hello/Welcome 握手（add_player 分配 eid，Welcome 含 seed + eid）
+- [x] ChunkSnapshot 分片传输 + 接收端组装（ChunkAssembler）
+- [x] PlayerInput / PlayerTick 60Hz 收发
+- [x] `client::prediction` 自身位置预测协调（InputHistory + reconcile_self）
+- [x] `client::interp` 远端玩家位置插值（PlayerInterp, delay=100ms）
+- [x] BlockUpdate 广播闭环（Remote 操作 → Host 仲裁 → 全员看到）
+- [x] Action Ack 协调
+- [x] PeerJoined / PeerLeft 玩家进出广播
+- [x] 简单玩家身体渲染（PlayerPass：实心 AABB cube，颜色 entity_id 派生）
+- [ ] **基础 OPFS 持久化** — 整体延后到 Phase 8
 
 ### 验证
 - A 创建房间 → B 加入

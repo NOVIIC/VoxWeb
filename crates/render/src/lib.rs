@@ -25,6 +25,7 @@ use voxweb_core::chunk::Position;
 
 use crate::chunk_mesh::ChunkMeshCpu;
 use crate::passes::opaque::{ChunkMeshGpu, GlobalsUniform, OpaquePass};
+use crate::passes::player::{PlayerInstance, PlayerPass};
 use crate::passes::selection::{SelectionGlobals, SelectionPass};
 
 /// 深度纹理格式（与 OpaquePass 中的 DepthStencilState 对齐）。
@@ -44,6 +45,7 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
 
     opaque_pass: OpaquePass,
+    player_pass: PlayerPass,
     selection_pass: SelectionPass,
     chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>,
 }
@@ -57,6 +59,7 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth(&ctx.device, w, h);
         let opaque_pass = OpaquePass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
+        let player_pass = PlayerPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
         let selection_pass = SelectionPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
 
         Ok(Self {
@@ -69,6 +72,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             opaque_pass,
+            player_pass,
             selection_pass,
             chunk_meshes: HashMap::new(),
         })
@@ -327,6 +331,24 @@ impl Renderer {
         pass.set_bind_group(0, &self.selection_pass.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, self.selection_pass.vertex_buffer.slice(..));
         pass.draw(0..SelectionPass::VERTEX_COUNT, 0..1);
+    }
+
+    /// 上传远端玩家实例缓冲（Phase 5）。无远端玩家时传空 slice 即可。
+    pub fn upload_player_instances(&mut self, instances: &[PlayerInstance]) {
+        self.player_pass.upload_instances(&self.queue, instances);
+    }
+
+    /// 渲染所有远端玩家实体（Phase 5）。
+    /// 必须在 `render_world` 之后、`render_selection` 之前调用；LoadOp=Load。
+    pub fn render_players(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        view_proj: Mat4,
+    ) {
+        self.player_pass.write_globals(&self.queue, view_proj);
+        self.player_pass
+            .render(encoder, color_view, &self.depth_view);
     }
 }
 

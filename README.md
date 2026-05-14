@@ -33,7 +33,7 @@ VoxWeb 是一款 **运行在浏览器内** 的体素沙盒游戏，采用 Rust �
 | 构建工具 | `trunk`（首选）或 `wasm-pack` | trunk 集成 HTML 模板与资源管线，开箱即用 |
 | 范围内功能 | 渲染优化核心 / 物理与挖放 / 多人 UI / 多 Pass / 天空盒 / 聊天 | 用户勾选 + agent 决定的扩展项 |
 | 范围外功能 | Mod 系统 / 着色器热重载 / 移动端触屏 / 语音聊天 / 独立 server bin | 浏览器侧 ROI 偏低或非本期目标 |
-| 当前 Phase | Phase 4 ✅ P2P 通道（2026-05-13） | 见 [`PHASE_4_DONE.md`](PHASE_4_DONE.md) |
+| 当前 Phase | Phase 5 ✅ 主机权威同步（2026-05-14） | 见 [`PHASE_5_DONE.md`](PHASE_5_DONE.md) |
 
 ---
 

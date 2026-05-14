@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use crate::block::BlockID;
 use crate::chunk::{ChunkPos, Position};
 
+// —— 协议常量 ——
+
+/// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
+/// 任何破坏性消息字段变更必须递增此版本。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// ChunkSnapshot 单片 payload 上限（字节）。
+/// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
+pub const CHUNK_SNAPSHOT_PAYLOAD_MAX: usize = 14 * 1024;
+
+/// 单个玩家实体的全局唯一 ID。Phase 5 起由 Server::add_player 分配（u32，1 起步）。
+/// 0 表示"未分配"（Welcome 之前的 Remote 端使用）。
+pub type EntityId = u32;
+
 // —— 序列化工具 ——
 
 /// 获取项目统一的 bincode 配置：little-endian + varint。
@@ -111,9 +125,16 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RoomEvent {
     Connected,
-    Disconnected { reason: String },
+    Disconnected {
+        reason: String,
+    },
     PeerCount(u32),
     SignalingError(String),
+    /// Phase 5：某个 Remote 离开（Host 端用，Remote 收不到）。
+    /// Client 端收到后调 `host_unregister_peer(peer_id)` → eid → `server.remove_player(eid)`。
+    RemoteLeft {
+        peer_id: u32,
+    },
 }
 
 /// PlayerTick 中携带的单个玩家快照。
@@ -138,6 +159,27 @@ pub enum AckReason {
     Overlap,
     /// 操作冷却中
     Cooldown,
+}
+
+// —— Server 内部：出站消息 + 收信对象路由 ——
+
+/// 一条 ServerMessage 的目标接收者。
+/// 由 Server::handle_message 在 enqueue 时填入；Net 层 host_route_outbox 据此分发。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Recipient {
+    /// 广播给所有玩家（含 Host 本人）。
+    All,
+    /// 广播给除 eid 之外的所有玩家。常用于"PeerJoined 通知其他人但不通知新加入者"。
+    Except(EntityId),
+    /// 仅发给单个 eid。常用于 Welcome / ActionAck / ChunkSnapshot 等单点回执。
+    One(EntityId),
+}
+
+/// Server outbox 中的一项：携带 Recipient 标签的 ServerMessage。
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboundMessage {
+    pub recipient: Recipient,
+    pub message: ServerMessage,
 }
 
 // —— 测试 ——
@@ -215,5 +257,21 @@ mod tests {
             accepted: false,
             reason: AckReason::OutOfRange,
         });
+    }
+
+    #[test]
+    fn roundtrip_recipient_variants() {
+        // Recipient 是 Serialize/Deserialize 派生的；走一遍确保 derive 配置正确，
+        // 后续 Server outbox 序列化（如果做存档/录像）能复用。
+        roundtrip(&Recipient::All);
+        roundtrip(&Recipient::Except(7));
+        roundtrip(&Recipient::One(42));
+    }
+
+    #[test]
+    fn roundtrip_room_event_remote_left() {
+        // 确保 Phase 5 新增的 RoomEvent::RemoteLeft 不破坏旧变体序列化兼容。
+        roundtrip(&RoomEvent::RemoteLeft { peer_id: 1001 });
+        roundtrip(&RoomEvent::Connected);
     }
 }

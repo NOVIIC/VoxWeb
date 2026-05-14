@@ -2,21 +2,25 @@
 //!
 //! Phase 2：World 持有 TerrainGenerator；区块按需生成 + 卸载；
 //! 提供世界坐标查询接口供网格化跨区块剔除使用。
+//! Phase 5：set_block 实装 dirty 标记；持久化层（Phase 8）会从 drain_dirty 取出待写。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 
 use crate::terrain::TerrainGenerator;
 
-/// 世界状态。Phase 2 仅含 chunk 表 + 地形生成器；玩家表与 dirty 集合留后续 Phase。
+/// 世界状态。Phase 2 仅含 chunk 表 + 地形生成器；Phase 5 起加 dirty_chunks。
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
     pub terrain: TerrainGenerator,
-    /// 自创建以来的总 tick 数（Phase 2 仅累加，不驱动逻辑）
+    /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
     pub tick_count: u64,
+    /// Phase 5：被 set_block 修改过的 ChunkPos 集合。
+    /// 持久化层（Phase 8）通过 drain_dirty 取出待写；Phase 5 暂不消费。
+    pub dirty_chunks: HashSet<ChunkPos>,
 }
 
 impl World {
@@ -26,6 +30,7 @@ impl World {
             chunks: HashMap::new(),
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
+            dirty_chunks: HashSet::new(),
         }
     }
 
@@ -62,7 +67,7 @@ impl World {
     }
 
     /// 在世界坐标处放置一个方块（若 chunk 未加载则忽略）。
-    /// Phase 2 仅供测试与未来挖放使用；本期主循环不调用。
+    /// Phase 5 起：成功写入会把该 chunk 标记为 dirty。
     pub fn set_block(&mut self, pos: Position, block: BlockID) {
         let cp = pos.to_chunk_pos();
         let Some(chunk) = self.chunks.get_mut(&cp) else {
@@ -70,12 +75,19 @@ impl World {
         };
         if let Some(idx) = pos.local_index() {
             chunk.blocks[idx] = block;
+            self.dirty_chunks.insert(cp);
         }
     }
 
     /// 读取世界坐标处的方块。chunk 未加载返回 AIR（与 get_block_world 等价的 Position 接口）。
     pub fn get_block(&self, pos: Position) -> BlockID {
         self.get_block_world(pos.x, pos.y, pos.z)
+    }
+
+    /// Phase 5：取出当前 dirty chunk 列表并清空集合。
+    /// Phase 5 暂无调用方；Phase 8 持久化层每秒 flush 一次。
+    pub fn drain_dirty(&mut self) -> Vec<ChunkPos> {
+        self.dirty_chunks.drain().collect()
     }
 
     /// 推进 tick 计数（Phase 5 起会驱动玩家广播等）。
@@ -146,5 +158,30 @@ mod tests {
         world.ensure_chunk_generated(ChunkPos::new(0, 0));
         world.set_block(Position::new(5, 100, 7), BlockID::STONE);
         assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
+    }
+
+    #[test]
+    fn set_block_marks_world_dirty() {
+        // Phase 5：set_block 成功写入应把该 chunk 加进 dirty_chunks。
+        let mut world = World::new(0);
+        let cp = ChunkPos::new(0, 0);
+        world.ensure_chunk_generated(cp);
+        assert!(world.dirty_chunks.is_empty());
+
+        world.set_block(Position::new(5, 100, 7), BlockID::STONE);
+        assert!(world.dirty_chunks.contains(&cp));
+
+        // drain 后清空
+        let drained = world.drain_dirty();
+        assert_eq!(drained, vec![cp]);
+        assert!(world.dirty_chunks.is_empty());
+    }
+
+    #[test]
+    fn set_block_on_unloaded_chunk_does_not_mark_dirty() {
+        // chunk 未加载时 set_block 不应静默写入 / 标 dirty。
+        let mut world = World::new(0);
+        world.set_block(Position::new(0, 64, 0), BlockID::STONE);
+        assert!(world.dirty_chunks.is_empty());
     }
 }

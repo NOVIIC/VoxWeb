@@ -1,41 +1,103 @@
 //! VoxWeb 世界逻辑层（lib only）。
 //! 负责地形生成、物理仲裁、方块操作校验、持久化触发。
+//!
+//! ## 角色与调用方
+//!
+//! - **Local-Only**：Client 直接持 `Rc<RefCell<Server>>`，每帧 `tick()` + 通过 mpsc 投递 ClientMessage。
+//! - **Host**：与 Local 相同，额外接收来自远端 Peer 的 ClientMessage（由 [`voxweb_net::NetEndpoint`] 解码后调
+//!   `handle_message`）。`broadcast_tick` 把 PlayerTick 加进 outbox 由 net 层路由。
+//! - **Remote**：客户端仍持有一个 `Server` 实例**但仅作为方块数据宿主** — Phase 5 的取舍是不引入独立的
+//!   `WorldView`，而是让 ChunkSnapshot 直接写入 `server.world.chunks`。
+//!   Remote 模式下 `tick()` / `handle_message()` 不会被主循环驱动；任何对这两个方法的调用都意味着调用方搞错了。
 
 pub mod persistence;
 pub mod physics;
 pub mod terrain;
 pub mod world;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use glam::Vec3;
 
-use voxweb_core::protocol::{ClientMessage, ServerMessage};
+use voxweb_core::chunk::{CHUNK_X, CHUNK_Z, ChunkPos};
+use voxweb_core::protocol::{
+    CHUNK_SNAPSHOT_PAYLOAD_MAX, ClientMessage, EntityId, OutboundMessage, PlayerSnapshot,
+    Recipient, ServerMessage,
+};
+
+/// 服务端权威的玩家实体（Phase 5 起完整版）。
+///
+/// Local-Only 时只有一项（id=1 的 Host 本人）；Host 模式下 Remote 通过
+/// [`Server::add_player`] 分配 id 并写入此表。
+#[derive(Clone, Debug)]
+pub struct PlayerEntity {
+    pub display_name: String,
+    /// 脚底世界坐标。挖放仲裁 / PlayerTick 广播都读这个值。
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    /// 已处理过的最大 PlayerInput.tick。过期输入会被丢弃。
+    pub last_input_tick: u32,
+    /// 加入时的 server tick 计数。
+    pub joined_at_tick: u32,
+}
+
+impl PlayerEntity {
+    fn new(display_name: String, joined_at_tick: u32) -> Self {
+        Self {
+            display_name,
+            position: DEFAULT_SPAWN,
+            yaw: 0.0,
+            pitch: 0.0,
+            last_input_tick: 0,
+            joined_at_tick,
+        }
+    }
+
+    fn to_snapshot(&self, entity_id: EntityId) -> PlayerSnapshot {
+        PlayerSnapshot {
+            entity_id,
+            position: self.position,
+            yaw: self.yaw,
+            pitch: self.pitch,
+        }
+    }
+}
 
 /// 服务端实例。在 Local-Only 模式下与 Client 共享内存；
-/// 在 Host 模式下额外接收远程 Client 消息。
+/// 在 Host 模式下额外接收远程 Client 消息；Remote 模式下仅作数据宿主（不 tick）。
 pub struct Server {
     pub world: world::World,
     /// 当前 server tick（60Hz 递增）
     pub tick: u32,
     /// 世界种子（地形与生物群落共用）
     pub seed: u64,
-    /// 玩家位置表：entity_id → 脚底世界坐标。Phase 3 仅用于挖放范围/重叠仲裁。
-    /// Phase 5 会扩展为完整 PlayerSnapshot（含 yaw/pitch）并参与 PlayerTick 广播。
-    pub players: HashMap<u32, Vec3>,
+    /// 玩家实体表。entity_id → 完整玩家状态。
+    /// Phase 5 起替换了 Phase 3 的 `HashMap<u32, Vec3>` 单字段形式。
+    pub players: HashMap<EntityId, PlayerEntity>,
     /// 当前实时时钟（毫秒，performance.now() 量级）。Host 每帧由主循环更新；
-    /// `Pong` 响应时携带，配合客户端的 `Ping.client_time_ms` 计算 RTT。
+    /// `Pong` / `PlayerTick` 响应时携带，配合客户端的 RTT 与时钟偏移估算。
     pub current_time_ms: u64,
+    /// 下一个待分配的 entity_id（从 [`FIRST_ENTITY_ID`] 起步）。
+    next_entity_id: EntityId,
+    /// 出站消息队列（带 Recipient 标签）。
+    /// `handle_message` / `add_player` / `broadcast_tick` 都向此队列追加，
+    /// 由调用方（Local 直接消费 / Host 通过 net 层路由）每帧 `drain_outbox()` 取走。
+    outbox: VecDeque<OutboundMessage>,
 }
 
-/// Phase 3 单玩家固定 entity_id；Phase 5 由 add_player 动态分配。
-const LOCAL_ENTITY_ID: u32 = 1;
+/// 第一个分配的 entity_id（Host 本人通常占这个值）。
+pub const FIRST_ENTITY_ID: EntityId = 1;
 
 /// Phase 3 出生点（与 client::start_single_player 一致）。
 const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
 
+/// 初始 ChunkSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
+const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
+
 impl Server {
-    /// 根据种子创建世界（自动生成初始 spawn 区域地形）。
+    /// 根据种子创建世界。Phase 5 不再自动注册玩家：
+    /// Client 启动时（Local/Host）显式调 [`Server::add_player`] 让 Host 本人入表。
     pub fn new(seed: u64) -> Self {
         Self {
             world: world::World::new(seed),
@@ -43,63 +105,150 @@ impl Server {
             seed,
             players: HashMap::new(),
             current_time_ms: 0,
+            next_entity_id: FIRST_ENTITY_ID,
+            outbox: VecDeque::new(),
         }
     }
 
-    /// 由 Host 主循环每帧更新（performance.now() 毫秒）；Pong 中带回。
+    /// 由 Host 主循环每帧更新（performance.now() 毫秒）；Pong/PlayerTick 中带回。
     pub fn set_clock(&mut self, ms: u64) {
         self.current_time_ms = ms;
     }
 
-    /// 每帧 tick（60Hz）：推进物理、标记 dirty chunks、持久化触发。
+    /// 每帧 tick（60Hz）：推进 world tick + 把当前所有玩家位置打包成 PlayerTick 广播。
+    /// **Remote 模式不调用**（无权威逻辑可推进）。
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.world.tick();
+        self.broadcast_tick();
     }
 
-    /// 处理一条来自 Client 的消息（本地或远程），返回需要广播的响应消息列表。
-    pub fn handle_message(&mut self, _entity_id: u32, msg: ClientMessage) -> Vec<ServerMessage> {
+    /// 加入一个玩家：分配 entity_id、入 players 表，并 enqueue 三类消息：
+    /// - Welcome → `Recipient::One(eid)`
+    /// - PeerJoined → `Recipient::Except(eid)`（其他在场玩家收到通告）
+    /// - ChunkSnapshot 分片 → `Recipient::One(eid)`（出生点周围 INITIAL_SNAPSHOT_RADIUS 内的所有 chunk）
+    ///
+    /// 返回新分配的 entity_id；Host 端 net 层用它建立 peer_id ↔ entity_id 映射。
+    pub fn add_player(&mut self, display_name: String) -> EntityId {
+        let eid = self.next_entity_id;
+        self.next_entity_id = self.next_entity_id.wrapping_add(1);
+        if self.next_entity_id == 0 {
+            // u32 溢出兜底（理论上单房间内永远走不到）
+            self.next_entity_id = FIRST_ENTITY_ID;
+        }
+
+        let player = PlayerEntity::new(display_name.clone(), self.tick);
+        self.players.insert(eid, player);
+
+        self.enqueue(
+            Recipient::One(eid),
+            ServerMessage::Welcome {
+                entity_id: eid,
+                server_tick: self.tick,
+                world_seed: self.seed,
+            },
+        );
+        self.enqueue(
+            Recipient::Except(eid),
+            ServerMessage::PeerJoined {
+                entity_id: eid,
+                display_name,
+            },
+        );
+
+        // 初始快照：以出生点 (chunk 0,0) 为中心扩 INITIAL_SNAPSHOT_RADIUS 圈。
+        let spawn_chunk = ChunkPos::new(
+            (DEFAULT_SPAWN.x as i32).div_euclid(CHUNK_X as i32),
+            (DEFAULT_SPAWN.z as i32).div_euclid(CHUNK_Z as i32),
+        );
+        self.send_initial_snapshot(eid, spawn_chunk, INITIAL_SNAPSHOT_RADIUS);
+
+        eid
+    }
+
+    /// 移除玩家：从 players 表删除，enqueue `PeerLeft` 到所有剩余玩家。
+    pub fn remove_player(&mut self, eid: EntityId) {
+        if self.players.remove(&eid).is_some() {
+            self.enqueue(Recipient::All, ServerMessage::PeerLeft { entity_id: eid });
+        }
+    }
+
+    /// 取走 outbox 中所有 OutboundMessage。
+    /// Local 调用方直接把每条 `message` 喂回 `ServerInbox`；
+    /// Host 调用方走 `NetEndpoint::host_route_outbox`。
+    pub fn drain_outbox(&mut self) -> Vec<OutboundMessage> {
+        self.outbox.drain(..).collect()
+    }
+
+    /// Phase 8 持久化层用的占位。Phase 5 不消费，留方法签名以免后续 API churn。
+    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: voxweb_core::chunk::Chunk) {
+        self.world.chunks.insert(pos, chunk);
+    }
+
+    /// 处理一条来自 Client 的消息（本地或远程）。
+    /// 所有响应通过 [`Server::enqueue`] 进入 outbox；调用方负责 drain 后路由。
+    ///
+    /// **注意**：`Hello` 不在此处理 — 调用方收到 Hello 时应改调 [`Server::add_player`]
+    /// （因为 entity_id 的分配是 Hello 的一部分，但分配又依赖 `&mut self`，
+    /// 与 net 层 peer_to_entity 映射的写入顺序耦合太重 — 把它从 dispatch 中抽出来更干净）。
+    pub fn handle_message(&mut self, entity_id: EntityId, msg: ClientMessage) {
         match msg {
             ClientMessage::Hello { .. } => {
-                // Phase 2：固定 entity_id=1。Phase 5 引入玩家表后由 add_player 分配。
-                self.players.insert(LOCAL_ENTITY_ID, DEFAULT_SPAWN);
-                vec![ServerMessage::Welcome {
-                    entity_id: LOCAL_ENTITY_ID,
-                    server_tick: self.tick,
-                    world_seed: self.seed,
-                }]
+                log::warn!(
+                    "[server] Hello reached handle_message; caller should call add_player instead"
+                );
             }
-            ClientMessage::PlayerInput { position, .. } => {
-                // 更新玩家位置（Phase 3 仅供挖放仲裁；Phase 5 同时驱动 PlayerTick 广播）。
-                self.players.insert(LOCAL_ENTITY_ID, position);
-                vec![]
+            ClientMessage::PlayerInput {
+                tick,
+                position,
+                yaw,
+                pitch,
+            } => {
+                let Some(player) = self.players.get_mut(&entity_id) else {
+                    return;
+                };
+                // 拒绝过期 / 乱序 tick（防止丢包补传导致位置回退）
+                if tick <= player.last_input_tick && player.last_input_tick != 0 {
+                    return;
+                }
+                player.position = position;
+                player.yaw = yaw;
+                player.pitch = pitch;
+                player.last_input_tick = tick;
             }
             ClientMessage::Break { pos, request_id } => {
                 let player_feet = self
                     .players
-                    .get(&LOCAL_ENTITY_ID)
-                    .copied()
+                    .get(&entity_id)
+                    .map(|p| p.position)
                     .unwrap_or(DEFAULT_SPAWN);
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
-                    vec![
+                    self.enqueue(
+                        Recipient::One(entity_id),
                         ServerMessage::ActionAck {
                             request_id,
                             accepted: true,
                             reason,
                         },
+                    );
+                    self.enqueue(
+                        Recipient::All,
                         ServerMessage::BlockUpdate {
                             pos,
                             block: voxweb_core::BlockID::AIR,
                         },
-                    ]
+                    );
                 } else {
-                    vec![ServerMessage::ActionAck {
-                        request_id,
-                        accepted: false,
-                        reason,
-                    }]
+                    self.enqueue(
+                        Recipient::One(entity_id),
+                        ServerMessage::ActionAck {
+                            request_id,
+                            accepted: false,
+                            reason,
+                        },
+                    );
                 }
             }
             ClientMessage::Place {
@@ -109,37 +258,114 @@ impl Server {
             } => {
                 let player_feet = self
                     .players
-                    .get(&LOCAL_ENTITY_ID)
-                    .copied()
+                    .get(&entity_id)
+                    .map(|p| p.position)
                     .unwrap_or(DEFAULT_SPAWN);
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
-                    vec![
+                    self.enqueue(
+                        Recipient::One(entity_id),
                         ServerMessage::ActionAck {
                             request_id,
                             accepted: true,
                             reason,
                         },
-                        ServerMessage::BlockUpdate { pos, block },
-                    ]
+                    );
+                    self.enqueue(Recipient::All, ServerMessage::BlockUpdate { pos, block });
                 } else {
-                    vec![ServerMessage::ActionAck {
-                        request_id,
-                        accepted: false,
-                        reason,
-                    }]
+                    self.enqueue(
+                        Recipient::One(entity_id),
+                        ServerMessage::ActionAck {
+                            request_id,
+                            accepted: false,
+                            reason,
+                        },
+                    );
                 }
             }
-            ClientMessage::Ping { client_time_ms } => {
-                // Phase 4：心跳 + RTT 探测。server_time_ms 由 Host 主循环每帧通过 set_clock 更新。
-                vec![ServerMessage::Pong {
-                    client_time_ms,
-                    server_time_ms: self.current_time_ms,
-                }]
+            ClientMessage::Chat { content } => {
+                // Phase 5 协议层不做长度限制（Phase 6 加 256 字符 + 速率限制）
+                self.enqueue(
+                    Recipient::All,
+                    ServerMessage::Chat {
+                        from: entity_id,
+                        content,
+                    },
+                );
             }
-            _ => vec![],
+            ClientMessage::Ping { client_time_ms } => {
+                self.enqueue(
+                    Recipient::One(entity_id),
+                    ServerMessage::Pong {
+                        client_time_ms,
+                        server_time_ms: self.current_time_ms,
+                    },
+                );
+            }
         }
+    }
+
+    /// 把所有当前在场玩家打包成 PlayerTick，enqueue 到 `Recipient::All`。
+    /// 频率：60Hz（由 `tick()` 末尾调用）。
+    pub fn broadcast_tick(&mut self) {
+        if self.players.is_empty() {
+            return;
+        }
+        let players: Vec<PlayerSnapshot> = self
+            .players
+            .iter()
+            .map(|(eid, p)| p.to_snapshot(*eid))
+            .collect();
+        self.enqueue(
+            Recipient::All,
+            ServerMessage::PlayerTick {
+                tick: self.tick,
+                players,
+                server_time_ms: self.current_time_ms,
+            },
+        );
+    }
+
+    /// 把出生点附近的 chunk 切片成 ChunkSnapshot 分片塞进 outbox（Recipient::One(eid)）。
+    /// 半径 = chunk 数，覆盖 `(2*radius+1)^2` 个 chunk。未加载的 chunk 会先 `ensure_chunk_generated`。
+    pub fn send_initial_snapshot(&mut self, recipient: EntityId, center: ChunkPos, radius: i32) {
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let pos = ChunkPos::new(center.x + dx, center.z + dz);
+                self.world.ensure_chunk_generated(pos);
+                let Some(chunk) = self.world.chunks.get(&pos) else {
+                    continue;
+                };
+                let bytes = match voxweb_core::protocol::encode(&chunk.blocks) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("[server] encode chunk {pos:?} failed: {e}");
+                        continue;
+                    }
+                };
+                let total_len = bytes.len();
+                let frag_count = total_len.div_ceil(CHUNK_SNAPSHOT_PAYLOAD_MAX).max(1);
+                debug_assert!(frag_count <= u16::MAX as usize, "chunk too big");
+                for (i, chunk_bytes) in bytes.chunks(CHUNK_SNAPSHOT_PAYLOAD_MAX).enumerate() {
+                    self.enqueue(
+                        Recipient::One(recipient),
+                        ServerMessage::ChunkSnapshot {
+                            pos,
+                            frag_index: i as u16,
+                            frag_total: frag_count as u16,
+                            payload: chunk_bytes.to_vec(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// 内部：把一条消息压入 outbox。
+    fn enqueue(&mut self, recipient: Recipient, message: ServerMessage) {
+        self.outbox
+            .push_back(OutboundMessage { recipient, message });
     }
 }
 
@@ -149,73 +375,144 @@ mod handle_message_tests {
     use voxweb_core::chunk::Position;
     use voxweb_core::protocol::{AckReason, ClientMessage, ServerMessage};
 
-    #[test]
-    fn hello_returns_welcome_with_seed() {
-        let mut server = Server::new(42);
-        let replies = server.handle_message(
-            1,
-            ClientMessage::Hello {
-                display_name: "Tester".into(),
-                version: 1,
-            },
-        );
-        assert_eq!(replies.len(), 1);
-        match &replies[0] {
-            ServerMessage::Welcome {
-                entity_id,
-                world_seed,
-                ..
-            } => {
-                assert_eq!(*entity_id, 1);
-                assert_eq!(*world_seed, 42);
-            }
-            other => panic!("expected Welcome, got {other:?}"),
-        }
-        // Hello 应同时把 entity_id=1 的初始位置塞进 players 表
-        assert_eq!(server.players.get(&LOCAL_ENTITY_ID), Some(&DEFAULT_SPAWN));
+    /// 在 outbox 中找到第一条匹配 predicate 的消息，返回其 (Recipient, ServerMessage) 副本。
+    fn find_outbox<F>(server: &Server, pred: F) -> Option<(Recipient, ServerMessage)>
+    where
+        F: Fn(&OutboundMessage) -> bool,
+    {
+        server
+            .outbox
+            .iter()
+            .find(|m| pred(m))
+            .map(|m| (m.recipient.clone(), m.message.clone()))
     }
 
     #[test]
-    fn player_input_updates_players_table() {
+    fn add_player_allocates_increasing_ids_and_enqueues_welcome_peerjoined_snapshot() {
+        let mut server = Server::new(42);
+        let eid1 = server.add_player("Alice".into());
+        let eid2 = server.add_player("Bob".into());
+        assert_eq!(eid1, 1);
+        assert_eq!(eid2, 2);
+        assert!(server.players.contains_key(&eid1));
+        assert!(server.players.contains_key(&eid2));
+
+        // Welcome 应给 eid1 和 eid2 各一条
+        let welcome1 = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::Welcome { entity_id, .. }) if *e == 1 && *entity_id == 1
+            )
+        });
+        let welcome2 = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::Welcome { entity_id, .. }) if *e == 2 && *entity_id == 2
+            )
+        });
+        assert!(welcome1.is_some(), "missing Welcome to eid 1");
+        assert!(welcome2.is_some(), "missing Welcome to eid 2");
+
+        // PeerJoined：第一次 add_player 也会 enqueue（即使没有别人；Except 让 outbox 路由层自然过滤）
+        let pj_for_bob = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::Except(e), ServerMessage::PeerJoined { entity_id, .. }) if *e == 2 && *entity_id == 2
+            )
+        });
+        assert!(pj_for_bob.is_some(), "missing PeerJoined for eid 2");
+
+        // ChunkSnapshot：至少有一片到 eid1
+        let has_snapshot = server.outbox.iter().any(|m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::ChunkSnapshot { .. }) if *e == 1
+            )
+        });
+        assert!(has_snapshot, "expected at least one ChunkSnapshot fragment");
+    }
+
+    #[test]
+    fn remove_player_enqueues_peer_left_to_all() {
         let mut server = Server::new(0);
-        server.players.insert(LOCAL_ENTITY_ID, DEFAULT_SPAWN);
-        let replies = server.handle_message(
-            1,
+        let eid = server.add_player("Alice".into());
+        server.drain_outbox(); // 清掉 add_player 产生的消息
+
+        server.remove_player(eid);
+
+        let pl = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::All, ServerMessage::PeerLeft { entity_id }) if *entity_id == eid
+            )
+        });
+        assert!(pl.is_some(), "missing PeerLeft");
+        assert!(!server.players.contains_key(&eid));
+    }
+
+    #[test]
+    fn remove_unknown_player_is_no_op() {
+        let mut server = Server::new(0);
+        server.remove_player(999);
+        assert!(server.outbox.is_empty());
+    }
+
+    #[test]
+    fn drain_outbox_empties_queue() {
+        let mut server = Server::new(0);
+        server.add_player("A".into());
+        let before = server.outbox.len();
+        assert!(before > 0);
+        let drained = server.drain_outbox();
+        assert_eq!(drained.len(), before);
+        assert!(server.outbox.is_empty());
+    }
+
+    #[test]
+    fn handle_message_player_input_updates_player_entity_and_rejects_old_tick() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        // 推 tick=5
+        server.handle_message(
+            eid,
             ClientMessage::PlayerInput {
                 tick: 5,
-                position: Vec3::new(3.5, 70.0, 4.5),
+                position: Vec3::new(1.0, 70.0, 2.0),
+                yaw: 0.1,
+                pitch: -0.2,
+            },
+        );
+        let p = &server.players[&eid];
+        assert_eq!(p.position, Vec3::new(1.0, 70.0, 2.0));
+        assert_eq!(p.last_input_tick, 5);
+
+        // 过期 tick=3 应被拒绝
+        server.handle_message(
+            eid,
+            ClientMessage::PlayerInput {
+                tick: 3,
+                position: Vec3::new(100.0, 70.0, 2.0),
                 yaw: 0.0,
                 pitch: 0.0,
             },
         );
-        assert!(replies.is_empty());
+        let p = &server.players[&eid];
         assert_eq!(
-            server.players.get(&LOCAL_ENTITY_ID),
-            Some(&Vec3::new(3.5, 70.0, 4.5))
+            p.position,
+            Vec3::new(1.0, 70.0, 2.0),
+            "expired tick must not override"
         );
-    }
-
-    #[test]
-    fn ping_returns_pong_with_server_clock() {
-        let mut server = Server::new(0);
-        server.set_clock(12345);
-        let replies = server.handle_message(1, ClientMessage::Ping { client_time_ms: 7 });
-        assert_eq!(replies.len(), 1);
-        match &replies[0] {
-            ServerMessage::Pong {
-                client_time_ms,
-                server_time_ms,
-            } => {
-                assert_eq!(*client_time_ms, 7);
-                assert_eq!(*server_time_ms, 12345);
-            }
-            other => panic!("expected Pong, got {other:?}"),
-        }
+        assert_eq!(p.last_input_tick, 5);
     }
 
     /// 把 chunk(0,0) 的一柱方块设置好，便于挖放测试。
-    fn prepare_world() -> Server {
+    fn prepare_world() -> (Server, EntityId) {
         let mut server = Server::new(0);
+        let eid = server.add_player("Tester".into());
+        server.drain_outbox(); // 清掉初始消息
+
         server
             .world
             .ensure_chunk_generated(voxweb_core::ChunkPos::new(0, 0));
@@ -230,38 +527,42 @@ mod handle_message_tests {
             }
         }
         // 玩家站在 (3.5, 65, 3.5)
-        server
-            .players
-            .insert(LOCAL_ENTITY_ID, Vec3::new(3.5, 65.0, 3.5));
-        server
+        server.players.get_mut(&eid).unwrap().position = Vec3::new(3.5, 65.0, 3.5);
+        (server, eid)
     }
 
     #[test]
-    fn break_in_range_succeeds_and_broadcasts() {
-        let mut server = prepare_world();
-        let replies = server.handle_message(
-            LOCAL_ENTITY_ID,
+    fn handle_message_break_enqueues_ack_one_and_blockupdate_all() {
+        let (mut server, eid) = prepare_world();
+        server.handle_message(
+            eid,
             ClientMessage::Break {
                 pos: Position::new(3, 64, 3),
                 request_id: 42,
             },
         );
-        assert_eq!(replies.len(), 2);
-        assert!(matches!(
-            replies[0],
-            ServerMessage::ActionAck {
-                accepted: true,
-                request_id: 42,
-                ..
-            }
-        ));
-        assert!(matches!(
-            replies[1],
-            ServerMessage::BlockUpdate {
-                block: voxweb_core::BlockID::AIR,
-                ..
-            }
-        ));
+
+        // ActionAck 应只发给 eid
+        let ack = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::ActionAck { request_id, accepted: true, .. })
+                    if *e == eid && *request_id == 42
+            )
+        });
+        assert!(ack.is_some(), "missing ActionAck One({eid})");
+
+        // BlockUpdate 应是 All
+        let bu = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::All, ServerMessage::BlockUpdate { block, .. })
+                    if *block == voxweb_core::BlockID::AIR
+            )
+        });
+        assert!(bu.is_some(), "missing BlockUpdate All");
+
+        // World 应该真的更新了
         assert_eq!(
             server.world.get_block(Position::new(3, 64, 3)),
             voxweb_core::BlockID::AIR
@@ -269,25 +570,37 @@ mod handle_message_tests {
     }
 
     #[test]
-    fn break_out_of_range_only_returns_ack() {
-        let mut server = prepare_world();
-        let replies = server.handle_message(
-            LOCAL_ENTITY_ID,
+    fn handle_message_break_out_of_range_only_ack_no_blockupdate() {
+        let (mut server, eid) = prepare_world();
+        server.handle_message(
+            eid,
             ClientMessage::Break {
-                pos: Position::new(15, 64, 15), // 距玩家约 sqrt(11.5^2 + 0.6^2 + 11.5^2) ≈ 16m
+                pos: Position::new(15, 64, 15),
                 request_id: 7,
             },
         );
-        assert_eq!(replies.len(), 1);
-        assert!(matches!(
-            replies[0],
-            ServerMessage::ActionAck {
-                accepted: false,
-                reason: AckReason::OutOfRange,
-                request_id: 7,
-            }
-        ));
-        // 没有 BlockUpdate；world 不变
+        let ack = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (
+                    Recipient::One(_),
+                    ServerMessage::ActionAck {
+                        accepted: false,
+                        reason: AckReason::OutOfRange,
+                        request_id: 7
+                    }
+                )
+            )
+        });
+        assert!(ack.is_some());
+        // 不应出现 BlockUpdate
+        let bu = find_outbox(&server, |m| {
+            matches!(m.message, ServerMessage::BlockUpdate { .. })
+        });
+        assert!(
+            bu.is_none(),
+            "out-of-range break should not enqueue BlockUpdate"
+        );
         assert_eq!(
             server.world.get_block(Position::new(15, 64, 15)),
             voxweb_core::BlockID::STONE
@@ -295,24 +608,129 @@ mod handle_message_tests {
     }
 
     #[test]
-    fn place_overlapping_player_rejected() {
-        let mut server = prepare_world();
-        let replies = server.handle_message(
-            LOCAL_ENTITY_ID,
+    fn handle_message_place_overlap_rejected_and_no_blockupdate() {
+        let (mut server, eid) = prepare_world();
+        server.handle_message(
+            eid,
             ClientMessage::Place {
                 pos: Position::new(3, 65, 3),
                 block: voxweb_core::BlockID::STONE,
                 request_id: 9,
             },
         );
-        assert_eq!(replies.len(), 1);
-        assert!(matches!(
-            replies[0],
-            ServerMessage::ActionAck {
-                accepted: false,
-                reason: AckReason::Overlap,
-                request_id: 9,
-            }
-        ));
+        let ack = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (
+                    Recipient::One(_),
+                    ServerMessage::ActionAck {
+                        accepted: false,
+                        reason: AckReason::Overlap,
+                        request_id: 9
+                    }
+                )
+            )
+        });
+        assert!(ack.is_some());
+        let bu = find_outbox(&server, |m| {
+            matches!(m.message, ServerMessage::BlockUpdate { .. })
+        });
+        assert!(bu.is_none());
+    }
+
+    #[test]
+    fn handle_message_ping_returns_pong_one_with_server_clock() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.set_clock(12345);
+        server.drain_outbox();
+
+        server.handle_message(eid, ClientMessage::Ping { client_time_ms: 7 });
+        let pong = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::Pong { client_time_ms: 7, server_time_ms: 12345 })
+                    if *e == eid
+            )
+        });
+        assert!(pong.is_some());
+    }
+
+    #[test]
+    fn handle_message_chat_broadcasts_to_all() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        server.handle_message(
+            eid,
+            ClientMessage::Chat {
+                content: "hi".into(),
+            },
+        );
+        let chat = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::All, ServerMessage::Chat { from, content })
+                    if *from == eid && content == "hi"
+            )
+        });
+        assert!(chat.is_some());
+    }
+
+    #[test]
+    fn tick_enqueues_player_tick_with_all_players_to_all() {
+        let mut server = Server::new(0);
+        let eid1 = server.add_player("A".into());
+        let eid2 = server.add_player("B".into());
+        server.drain_outbox();
+
+        server.set_clock(5000);
+        server.tick();
+
+        let pt = find_outbox(&server, |m| {
+            matches!(m.message, ServerMessage::PlayerTick { .. })
+        });
+        assert!(pt.is_some());
+        if let Some((
+            rec,
+            ServerMessage::PlayerTick {
+                players,
+                server_time_ms,
+                ..
+            },
+        )) = pt
+        {
+            assert_eq!(rec, Recipient::All);
+            assert_eq!(server_time_ms, 5000);
+            assert_eq!(players.len(), 2);
+            assert!(players.iter().any(|p| p.entity_id == eid1));
+            assert!(players.iter().any(|p| p.entity_id == eid2));
+        }
+    }
+
+    #[test]
+    fn tick_without_players_does_not_enqueue_player_tick() {
+        let mut server = Server::new(0);
+        server.tick();
+        let pt = find_outbox(&server, |m| {
+            matches!(m.message, ServerMessage::PlayerTick { .. })
+        });
+        assert!(pt.is_none(), "empty world should not produce PlayerTick");
+    }
+
+    #[test]
+    fn hello_in_handle_message_is_warning_no_op() {
+        // 防御性：调用方应改调 add_player；handle_message 收到 Hello 也不该 panic 或副作用。
+        let mut server = Server::new(0);
+        server.handle_message(
+            999,
+            ClientMessage::Hello {
+                display_name: "X".into(),
+                version: 1,
+            },
+        );
+        assert!(server.players.is_empty());
+        assert!(server.outbox.is_empty());
     }
 }

@@ -9,4 +9,7 @@ pub mod protocol;
 pub use block::{BlockID, BlockProperties, properties};
 pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
-pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};
+pub use protocol::{
+    AckReason, CHUNK_SNAPSHOT_PAYLOAD_MAX, ClientMessage, EntityId, OutboundMessage,
+    PROTOCOL_VERSION, PlayerSnapshot, Recipient, RoomEvent, ServerMessage, encode,
+};

@@ -3,7 +3,7 @@
 //! 三种 NetEndpoint：
 //! - `Local`：单机模式。client ↔ server 通过 futures mpsc 双向通道，无网络。
 //! - `Host`：房主。在本地继续以 mpsc 跑自己的 client ↔ server；同时维护多个
-//!   [`PeerConnection`] 接受 Remote。Phase 4 仅做 Ping/Pong 验证；Phase 5 起接入完整广播。
+//!   [`PeerConnection`] 接受 Remote。Phase 5 起完整接入 outbox 路由（broadcast/unicast）。
 //! - `Remote`：远端客户端。一个 [`PeerConnection`] 连到 Host；client 发出的 ClientMessage
 //!   按 [`transport::ChannelKind`] 通过 DataChannel 发出，收到的 ServerMessage 入 inbox。
 //!
@@ -19,7 +19,9 @@ use std::collections::{HashMap, VecDeque};
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use voxweb_core::protocol::{ClientMessage, RoomEvent, ServerMessage};
+use voxweb_core::protocol::{
+    ClientMessage, EntityId, OutboundMessage, Recipient, RoomEvent, ServerMessage,
+};
 
 pub use peer::{PeerConnection, PeerEvent, PeerState};
 pub use room::{NegotiationProgress, RoomSession};
@@ -59,6 +61,63 @@ pub struct PendingNegotiation {
     pub answer_received: bool,
 }
 
+/// outbox 路由的执行计划：哪些 peer 走 DC，是否还要送给本地 Host。
+/// 纯数据结构便于单元测试，避免触碰 PeerConnection / mpsc。
+#[derive(Debug, PartialEq)]
+pub struct RoutingPlan {
+    pub peers_to_send: Vec<u32>,
+    pub send_to_local: bool,
+}
+
+/// 给定一条 OutboundMessage 与当前的 peer→entity 映射 + Host 自身 eid，
+/// 计算该消息应该发往哪些 peer 以及是否要回流到本地 Host。
+///
+/// 提取为独立纯函数以便单元测试；`host_route_outbox` 是它的 IO 包装。
+pub fn plan_route(
+    msg: &OutboundMessage,
+    peer_to_entity: &HashMap<u32, EntityId>,
+    host_self: Option<EntityId>,
+) -> RoutingPlan {
+    match msg.recipient {
+        Recipient::All => RoutingPlan {
+            peers_to_send: peer_to_entity.keys().copied().collect(),
+            send_to_local: host_self.is_some(),
+        },
+        Recipient::Except(excluded) => {
+            let peers_to_send = peer_to_entity
+                .iter()
+                .filter(|(_, eid)| **eid != excluded)
+                .map(|(pid, _)| *pid)
+                .collect();
+            let send_to_local = match host_self {
+                Some(self_eid) => self_eid != excluded,
+                None => false,
+            };
+            RoutingPlan {
+                peers_to_send,
+                send_to_local,
+            }
+        }
+        Recipient::One(target) => {
+            if host_self == Some(target) {
+                RoutingPlan {
+                    peers_to_send: vec![],
+                    send_to_local: true,
+                }
+            } else {
+                let peer = peer_to_entity
+                    .iter()
+                    .find(|(_, eid)| **eid == target)
+                    .map(|(pid, _)| *pid);
+                RoutingPlan {
+                    peers_to_send: peer.into_iter().collect(),
+                    send_to_local: false,
+                }
+            }
+        }
+    }
+}
+
 pub enum NetEndpoint {
     /// 单机模式：mpsc 双向通道。
     Local {
@@ -77,6 +136,12 @@ pub enum NetEndpoint {
         session: RoomSession,
         room_id: String,
         display_name: String,
+        /// peer_id → entity_id 映射（Phase 5）。
+        /// 由 client 端在收到 Hello 时调 `host_register_peer` 写入；
+        /// PeerLeft 时 `host_unregister_peer` 取出后传给 server.remove_player。
+        peer_to_entity: HashMap<u32, EntityId>,
+        /// Host 本人的 entity_id（add_player 第一次后由 client 端 `host_set_self_entity` 设置）。
+        host_self_entity_id: Option<EntityId>,
     },
     /// 远端客户端：单条到 Host 的 Peer。
     Remote {
@@ -130,6 +195,8 @@ impl NetEndpoint {
             session: RoomSession::SignalingConnect,
             room_id: room_id.to_string(),
             display_name: display_name.to_string(),
+            peer_to_entity: HashMap::new(),
+            host_self_entity_id: None,
         };
         let inbox = ServerInbox {
             rx_client,
@@ -207,39 +274,120 @@ impl NetEndpoint {
         }
     }
 
-    /// Host 端向所有已连接 Remote 广播一条 ServerMessage。
-    /// Phase 4 只在 Ping 转发路径用到（server.handle_message 返回 Pong）。
-    pub fn broadcast_to_remotes(&mut self, msg: &ServerMessage) {
-        let NetEndpoint::Host { peers, .. } = self else {
+    /// Phase 5：注册 peer ↔ entity 映射（Host 模式）。
+    /// 由 client 端在收到 Remote 的 Hello 时调 `server.add_player(...)` 得到 eid 后调用。
+    pub fn host_register_peer(&mut self, peer_id: u32, entity_id: EntityId) {
+        if let NetEndpoint::Host { peer_to_entity, .. } = self {
+            peer_to_entity.insert(peer_id, entity_id);
+        }
+    }
+
+    /// Phase 5：取消注册并返回该 peer 对应的 entity_id。
+    /// 由 client 端在收到 `RoomEvent::RemoteLeft { peer_id }` 时调用，
+    /// 取得 eid 后再调 `server.remove_player(eid)`。
+    pub fn host_unregister_peer(&mut self, peer_id: u32) -> Option<EntityId> {
+        if let NetEndpoint::Host { peer_to_entity, .. } = self {
+            peer_to_entity.remove(&peer_id)
+        } else {
+            None
+        }
+    }
+
+    /// Phase 5：查询某个 peer 对应的 entity_id（不删除）。
+    pub fn host_peer_entity(&self, peer_id: u32) -> Option<EntityId> {
+        if let NetEndpoint::Host { peer_to_entity, .. } = self {
+            peer_to_entity.get(&peer_id).copied()
+        } else {
+            None
+        }
+    }
+
+    /// Phase 5：克隆当前 peer_to_entity 表（用于 client 端在闭包中查 eid 时绕过 &mut self 借用冲突）。
+    pub fn host_peer_to_entity_clone(&self) -> HashMap<u32, EntityId> {
+        if let NetEndpoint::Host { peer_to_entity, .. } = self {
+            peer_to_entity.clone()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Phase 5：设置 Host 自身的 entity_id。Host 启动时 `server.add_player("Host")` 拿到 eid 后立即调一次。
+    pub fn host_set_self_entity(&mut self, eid: EntityId) {
+        if let NetEndpoint::Host {
+            host_self_entity_id,
+            ..
+        } = self
+        {
+            *host_self_entity_id = Some(eid);
+        }
+    }
+
+    /// Phase 5：把 server 的 outbox 按 Recipient 路由分发：
+    /// - 走 peer DC 的部分调 [`PeerConnection::send`] 序列化发送；
+    /// - 走本地 Host 的部分通过 `local_inbox.send_server_message` 喂回 client 主循环。
+    ///
+    /// 仅 Host 模式生效；Local / Remote 调用是 no-op。
+    pub fn host_route_outbox(&mut self, msgs: Vec<OutboundMessage>, local_inbox: &ServerInbox) {
+        let NetEndpoint::Host {
+            peers,
+            peer_to_entity,
+            host_self_entity_id,
+            ..
+        } = self
+        else {
             return;
         };
-        let channel = transport::channel_for_server_message(msg);
-        let bytes = match transport::encode_server_message(msg) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!("[net] encode server message: {e}");
-                return;
-            }
-        };
-        for pc in peers.values() {
-            if pc.is_open(channel) {
-                if let Err(e) = pc.send(channel, &bytes) {
-                    log::warn!("[net] broadcast send to peer {} failed: {e:?}", pc.peer_id);
+
+        for msg in msgs {
+            let plan = plan_route(&msg, peer_to_entity, *host_self_entity_id);
+            // 先准备字节（同一条消息发给多个 peer 时复用编码结果）
+            let bytes = if plan.peers_to_send.is_empty() {
+                None
+            } else {
+                match transport::encode_server_message(&msg.message) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        log::warn!("[net/host] encode server message: {e}");
+                        None
+                    }
                 }
+            };
+            let channel = transport::channel_for_server_message(&msg.message);
+
+            if let Some(b) = bytes {
+                for pid in &plan.peers_to_send {
+                    if let Some(pc) = peers.get(pid)
+                        && pc.is_open(channel)
+                        && let Err(e) = pc.send(channel, &b)
+                    {
+                        log::warn!("[net/host] send to peer {pid} failed: {e:?}");
+                    }
+                }
+            }
+
+            if plan.send_to_local {
+                local_inbox.send_server_message(msg.message);
             }
         }
     }
 
     /// 每帧推进网络状态机。
     ///
-    /// `server_handle`：Host 模式下，从某个 peer 收到 ClientMessage 时调它处理并广播回 Pong 等。
-    /// 它接受 `(peer_entity_id, ClientMessage)` 返回 `Vec<ServerMessage>`。
-    /// Local 模式忽略这个参数。
+    /// `peer_msg_handler`：Host 模式下，从某个 peer 收到 ClientMessage 时调用。
+    /// 它接受 `(peer_id, ClientMessage)`；闭包内部由 client 端负责：
+    /// - 若是 Hello：校验 version → `server.add_player(...)` → 记录 peer_id ↔ entity_id（待 poll 返回后通过
+    ///   [`NetEndpoint::host_register_peer`] 写入 endpoint）；
+    /// - 否则：从 `peer_to_entity` 查 entity_id → `server.handle_message(eid, msg)`。
     ///
-    /// 返回房间生命周期事件，供 UI 推进 AppState。
+    /// 闭包不返回 — 所有响应通过 server.outbox 流出，由 client 调
+    /// [`NetEndpoint::host_route_outbox`] 路由。
+    ///
+    /// Local / Remote 忽略此参数。
+    ///
+    /// 返回房间生命周期事件，供 UI 推进 AppState 与 host_unregister_peer 时机决策。
     pub fn poll(
         &mut self,
-        mut server_handle: Option<&mut dyn FnMut(u32, ClientMessage) -> Vec<ServerMessage>>,
+        mut peer_msg_handler: Option<&mut dyn FnMut(u32, ClientMessage)>,
     ) -> Vec<RoomEvent> {
         let mut out: Vec<RoomEvent> = Vec::new();
         match self {
@@ -258,7 +406,7 @@ impl NetEndpoint {
                     pending,
                     ice_servers,
                     session,
-                    &mut server_handle,
+                    &mut peer_msg_handler,
                     &mut out,
                 );
             }
@@ -300,7 +448,7 @@ fn poll_host(
     pending: &mut HashMap<u32, PendingNegotiation>,
     ice_servers: &mut Vec<IceServerConfig>,
     session: &mut RoomSession,
-    server_handle: &mut Option<&mut dyn FnMut(u32, ClientMessage) -> Vec<ServerMessage>>,
+    peer_msg_handler: &mut Option<&mut dyn FnMut(u32, ClientMessage)>,
     out: &mut Vec<RoomEvent>,
 ) {
     // 1) 信令事件
@@ -336,6 +484,8 @@ fn poll_host(
                     pc.close();
                 }
                 pending.remove(&peer_id);
+                // Phase 5：通知 client 端做 host_unregister_peer + server.remove_player
+                out.push(RoomEvent::RemoteLeft { peer_id });
                 out.push(RoomEvent::PeerCount(peers.len() as u32));
             }
             SignalingEvent::Answer { from, sdp } => {
@@ -373,7 +523,6 @@ fn poll_host(
     }
 
     // 2) 每个 peer 的事件
-    // 收集要广播的 ServerMessage（针对每个 peer 处理 Ping → 通过该 peer 的 DC 回 Pong）
     let peer_ids: Vec<u32> = peers.keys().copied().collect();
     for peer_id in peer_ids {
         let events = peers.get(&peer_id).map(|pc| pc.poll()).unwrap_or_default();
@@ -395,19 +544,11 @@ fn poll_host(
                 PeerEvent::Message { channel: _, bytes } => {
                     match transport::decode_client_message(&bytes) {
                         Ok(msg) => {
-                            if let Some(handle) = server_handle.as_mut() {
-                                // 临时 entity_id：1000 + peer_id（Phase 5 由 server.add_player 分配）
-                                let entity_id = 1000u32 + peer_id;
-                                let replies = (**handle)(entity_id, msg);
-                                // 把回复发回 *该* peer（Phase 5 才区分 broadcast vs 单播）
-                                if let Some(pc) = peers.get(&peer_id) {
-                                    for reply in replies {
-                                        let ch = transport::channel_for_server_message(&reply);
-                                        if let Ok(b) = transport::encode_server_message(&reply) {
-                                            let _ = pc.send(ch, &b);
-                                        }
-                                    }
-                                }
+                            if let Some(handle) = peer_msg_handler.as_mut() {
+                                // Phase 5：闭包内部负责 Hello → add_player / 其他 → handle_message。
+                                // 不再向闭包要回复 — 所有响应通过 server.outbox 流出，
+                                // 由调用方 (client lib) 在 poll 后调 host_route_outbox 路由。
+                                (**handle)(peer_id, msg);
                             }
                         }
                         Err(e) => log::warn!("[net/host] decode peer msg from {peer_id}: {e}"),
@@ -422,6 +563,8 @@ fn poll_host(
                             pc.close();
                         }
                         pending.remove(&peer_id);
+                        // Phase 5：让 client 端清理 server-side 玩家表
+                        out.push(RoomEvent::RemoteLeft { peer_id });
                         out.push(RoomEvent::PeerCount(peers.len() as u32));
                     }
                 }
@@ -582,12 +725,13 @@ fn poll_remote(
 }
 
 // ──────────────────────────────────────────────────────────────
-// 单元测试（仅 Local，WebRTC 部分需浏览器集成测试 v2 引入）
+// 单元测试（Local + 纯函数路由；WebRTC 部分需浏览器集成测试 v2 引入）
 // ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voxweb_core::protocol::AckReason;
 
     #[test]
     fn local_pair_roundtrip() {
@@ -619,5 +763,79 @@ mod tests {
         let (mut endpoint, mut inbox) = NetEndpoint::new_local_pair();
         assert!(endpoint.try_recv_server_message().is_none());
         assert!(inbox.try_recv_client_message().is_none());
+    }
+
+    /// 构造一个 OutboundMessage（recipient 任意；payload 固定）。
+    fn outbound(recipient: Recipient) -> OutboundMessage {
+        OutboundMessage {
+            recipient,
+            message: ServerMessage::ActionAck {
+                request_id: 0,
+                accepted: true,
+                reason: AckReason::Ok,
+            },
+        }
+    }
+
+    fn mapping(pairs: &[(u32, EntityId)]) -> HashMap<u32, EntityId> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn route_all_sends_to_all_peers_and_local() {
+        let map = mapping(&[(101, 2), (102, 3)]);
+        let plan = plan_route(&outbound(Recipient::All), &map, Some(1));
+        assert!(plan.send_to_local);
+        let mut got = plan.peers_to_send.clone();
+        got.sort();
+        assert_eq!(got, vec![101, 102]);
+    }
+
+    #[test]
+    fn route_all_without_host_self_skips_local() {
+        let map = mapping(&[(101, 2)]);
+        let plan = plan_route(&outbound(Recipient::All), &map, None);
+        assert!(!plan.send_to_local);
+        assert_eq!(plan.peers_to_send, vec![101]);
+    }
+
+    #[test]
+    fn route_except_skips_target_entity_on_peers_and_local() {
+        let map = mapping(&[(101, 2), (102, 3)]);
+        // 排除 eid=2 → 应该跳过 peer 101，但 host_self=1 仍要收
+        let plan = plan_route(&outbound(Recipient::Except(2)), &map, Some(1));
+        assert_eq!(plan.peers_to_send, vec![102]);
+        assert!(plan.send_to_local);
+
+        // 排除 host_self（eid=1）→ 应该跳过 local，但所有 peer 仍要收
+        let plan2 = plan_route(&outbound(Recipient::Except(1)), &map, Some(1));
+        let mut got = plan2.peers_to_send.clone();
+        got.sort();
+        assert_eq!(got, vec![101, 102]);
+        assert!(!plan2.send_to_local);
+    }
+
+    #[test]
+    fn route_one_to_host_self_only_goes_local() {
+        let map = mapping(&[(101, 2), (102, 3)]);
+        let plan = plan_route(&outbound(Recipient::One(1)), &map, Some(1));
+        assert!(plan.send_to_local);
+        assert!(plan.peers_to_send.is_empty());
+    }
+
+    #[test]
+    fn route_one_to_remote_peer_goes_single_peer() {
+        let map = mapping(&[(101, 2), (102, 3)]);
+        let plan = plan_route(&outbound(Recipient::One(3)), &map, Some(1));
+        assert!(!plan.send_to_local);
+        assert_eq!(plan.peers_to_send, vec![102]);
+    }
+
+    #[test]
+    fn route_one_to_unknown_entity_routes_nothing() {
+        let map = mapping(&[(101, 2)]);
+        let plan = plan_route(&outbound(Recipient::One(999)), &map, Some(1));
+        assert!(!plan.send_to_local);
+        assert!(plan.peers_to_send.is_empty());
     }
 }

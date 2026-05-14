@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod camera;
+pub mod chunk_assembler;
 pub mod chunk_loader;
 pub mod hotbar;
 pub mod input;
@@ -18,6 +19,7 @@ pub mod storage;
 pub mod ui;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -26,15 +28,15 @@ use web_sys::HtmlCanvasElement;
 
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::Position;
-use voxweb_core::protocol::{ClientMessage, RoomEvent, ServerMessage};
+use voxweb_core::protocol::{ClientMessage, EntityId, PROTOCOL_VERSION, RoomEvent, ServerMessage};
 use voxweb_render::Renderer;
 
-use crate::app::{AppState, Game, GameMode, GameSettings};
+use crate::app::{AppState, Game, GameMode, GameSettings, RemotePlayerState};
 use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
 use crate::mesh_jobs::MeshPriority;
-use crate::prediction::{PendingAction, PendingKind};
+use crate::prediction::{PendingAction, PendingKind, reconcile_self};
 use crate::raycast::raycast;
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
@@ -710,14 +712,9 @@ fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>) {
     log::info!("启动单机游戏，seed = {seed}");
 
     let settings = GameSettings::default();
-    let mut game = Game::new_local(seed, settings);
+    let mut game = Game::new_local(seed, settings, "Player");
 
-    // 发 Hello，driver 下一帧消费
-    game.net.send_client_message(ClientMessage::Hello {
-        display_name: "Player".into(),
-        version: 1,
-    });
-
+    // Phase 5：add_player 已经在 Game::new_local 内做掉，不再发 Hello。
     // 相机 yaw/pitch 用默认值（physics 驱动 position）
     game.camera.position = game.physics.eye_position();
     game.camera.pitch = -0.4;
@@ -794,8 +791,9 @@ fn set_room_in_url(room_id: &str) {
 fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
     let seed = seed.unwrap_or_else(random_seed);
     let Some(url) = signaling_url() else {
-        app.borrow_mut().lobby_state.error_message =
-            Some("未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into());
+        app.borrow_mut().lobby_state.error_message = Some(
+            "未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into(),
+        );
         return;
     };
     log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}");
@@ -806,10 +804,7 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
     let mut a = app.borrow_mut();
     match game_result {
         Ok(mut game) => {
-            game.net.send_client_message(ClientMessage::Hello {
-                display_name: display.clone(),
-                version: 1,
-            });
+            // Phase 5：add_player 已在 Game::new_host 内完成，不再发 Hello。
             game.camera.position = game.physics.eye_position();
             game.camera.pitch = -0.4;
 
@@ -830,8 +825,9 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
 
 fn start_remote(app: &Rc<RefCell<App>>, room_id: &str) {
     let Some(url) = signaling_url() else {
-        app.borrow_mut().lobby_state.error_message =
-            Some("未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into());
+        app.borrow_mut().lobby_state.error_message = Some(
+            "未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into(),
+        );
         return;
     };
     log::info!("启动 Remote：room={room_id}, signaling={url}");
@@ -842,10 +838,11 @@ fn start_remote(app: &Rc<RefCell<App>>, room_id: &str) {
     let mut a = app.borrow_mut();
     match game_result {
         Ok(mut game) => {
-            // DC open 后再 flush 出去
+            // Remote：DC open 后再 flush 出去（NetEndpoint::Remote 的 outbox 暂存）
+            // Phase 5：Hello 由 Host 收到时触发 add_player；本端不调 add_player。
             game.net.send_client_message(ClientMessage::Hello {
                 display_name: display.clone(),
-                version: 1,
+                version: PROTOCOL_VERSION,
             });
             game.camera.position = game.physics.eye_position();
             game.camera.pitch = -0.4;
@@ -1021,29 +1018,123 @@ fn paint_egui_only(
 }
 
 /// 推进 Game.net 状态机：每帧调用一次。
-/// 在 Host 模式下注入 server.handle_message 闭包，处理 peer 来的 ClientMessage。
+/// 在 Host 模式下注入闭包处理 peer 来的 ClientMessage：
+/// - Hello → 校验版本 → `server.add_player(...)` → 记录 (peer_id, eid) 待 poll 返回后注册
+/// - 其他消息 → 从已建立的 peer_to_entity 映射查 eid → `server.handle_message(eid, msg)`
+///
+/// poll 完成后：
+/// 1. 把新分配的 (peer_id, eid) 应用到 net（host_register_peer）
+/// 2. drain server.outbox + 根据 mode 路由（Host：host_route_outbox / Local：折叠到 server_inbox）
+/// 3. 应用 RoomEvent（其中 RemoteLeft 会再触发 server.remove_player，下帧 flush）
 fn poll_net(app: &Rc<RefCell<App>>) {
     let now = now_ms();
-    let events: Vec<RoomEvent> = {
+    let (events, pending_registrations) = {
         let mut a = app.borrow_mut();
         let Some(game) = a.game.as_mut() else {
             return;
         };
-        // Host：每帧把 performance.now() 同步给 server.current_time_ms（Pong 用）
-        if game.mode == GameMode::Host {
-            game.server.borrow_mut().set_clock(now as u64);
-            let server_rc = game.server.clone();
-            let mut handler = |entity_id: u32, msg: ClientMessage| -> Vec<ServerMessage> {
-                server_rc.borrow_mut().handle_message(entity_id, msg)
-            };
-            game.net.poll(Some(&mut handler))
-        } else {
-            game.net.poll(None)
+        match game.mode {
+            GameMode::Host => {
+                // Host：每帧把 performance.now() 同步给 server.current_time_ms
+                // （Pong / PlayerTick 中 server_time_ms 字段用）
+                game.server.borrow_mut().set_clock(now as u64);
+
+                let server_rc = game.server.clone();
+                // 本帧的 peer_to_entity 快照（含本帧新增的 Hello 注册），供非-Hello 消息查 eid
+                let live_map: Rc<RefCell<HashMap<u32, EntityId>>> =
+                    Rc::new(RefCell::new(game.net.host_peer_to_entity_clone()));
+                let live_map_for_closure = live_map.clone();
+                // 本帧新注册的 (peer_id, eid)，poll 返回后写回 net
+                let pending_regs: Rc<RefCell<Vec<(u32, EntityId)>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+                let pending_regs_inner = pending_regs.clone();
+
+                let mut handler = |peer_id: u32, msg: ClientMessage| match msg {
+                    ClientMessage::Hello {
+                        display_name,
+                        version,
+                    } => {
+                        if version != PROTOCOL_VERSION {
+                            log::warn!(
+                                "[host] peer {peer_id} bad protocol version {version} (expected {PROTOCOL_VERSION})"
+                            );
+                            return;
+                        }
+                        let eid = server_rc.borrow_mut().add_player(display_name);
+                        live_map_for_closure.borrow_mut().insert(peer_id, eid);
+                        pending_regs_inner.borrow_mut().push((peer_id, eid));
+                    }
+                    other => {
+                        let map = live_map_for_closure.borrow();
+                        let Some(&eid) = map.get(&peer_id) else {
+                            log::warn!(
+                                "[host] peer {peer_id} sent message before Hello: {:?}",
+                                std::mem::discriminant(&other)
+                            );
+                            return;
+                        };
+                        drop(map);
+                        server_rc.borrow_mut().handle_message(eid, other);
+                    }
+                };
+                let events = game.net.poll(Some(&mut handler));
+                let regs = pending_regs.borrow().clone();
+                (events, regs)
+            }
+            _ => (game.net.poll(None), Vec::new()),
         }
     };
-    // 应用 RoomEvent
+
+    // 应用 Host 新注册的 peer_id → entity_id 映射
+    if !pending_registrations.is_empty() {
+        let mut a = app.borrow_mut();
+        if let Some(game) = a.game.as_mut() {
+            for (pid, eid) in pending_registrations {
+                game.net.host_register_peer(pid, eid);
+            }
+        }
+    }
+
+    // 应用 RoomEvent（含 RemoteLeft → remove_player 入 outbox）
     for ev in events {
         apply_room_event(app, ev);
+    }
+
+    // 最终统一 flush outbox：把 handle_message / add_player / remove_player 产生的
+    // 所有 ServerMessage 通过 net（Host）或 mpsc（Local）送出。
+    {
+        let mut a = app.borrow_mut();
+        if let Some(game) = a.game.as_mut() {
+            flush_server_outbox(game);
+        }
+    }
+}
+
+/// Phase 5：把 server.outbox 中累积的 OutboundMessage 路由到正确去向。
+///
+/// - **Local**：所有 Recipient 折叠为 server_inbox（自己是唯一玩家）。
+/// - **Host**：调 `net.host_route_outbox`，按 Recipient 分发 peers DC + 自身 mpsc。
+/// - **Remote**：理论上 outbox 永远空（不 tick / 不 handle_message），防御性 drain 后忽略。
+fn flush_server_outbox(game: &mut Game) {
+    let outbox = game.server.borrow_mut().drain_outbox();
+    if outbox.is_empty() {
+        return;
+    }
+    match game.mode {
+        GameMode::Local => {
+            for m in outbox {
+                game.server_inbox.send_server_message(m.message);
+            }
+        }
+        GameMode::Host => {
+            game.net.host_route_outbox(outbox, &game.server_inbox);
+        }
+        GameMode::Remote => {
+            log::warn!(
+                "[client] Remote 模式不应该有 outbox（{} 条消息被丢弃）",
+                outbox.len()
+            );
+        }
     }
 }
 
@@ -1065,6 +1156,15 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             // 在 Connecting / InGame 都直接回大厅
             a.state = AppState::Lobby;
             a.game = None;
+        }
+        RoomEvent::RemoteLeft { peer_id } => {
+            log::info!("[net] RemoteLeft: peer {peer_id}");
+            // Host：从 net 拿 entity_id → 调 server.remove_player
+            if let Some(ref mut game) = a.game
+                && let Some(eid) = game.net.host_unregister_peer(peer_id)
+            {
+                game.server.borrow_mut().remove_player(eid);
+            }
         }
         RoomEvent::SignalingError(msg) => {
             log::warn!("[net] signaling error: {msg}");
@@ -1109,11 +1209,11 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
             game.entity_id
         };
         for msg in pending {
-            let replies = game.server.borrow_mut().handle_message(entity_id, msg);
-            for reply in replies {
-                game.server_inbox.send_server_message(reply);
-            }
+            game.server.borrow_mut().handle_message(entity_id, msg);
         }
+        // Phase 5：handle_message 不再返回 Vec，改为 enqueue 到 server.outbox；
+        // 本帧 flush 保证 ActionAck 等能在下文的 apply_server_message 中收到。
+        flush_server_outbox(game);
     }
 
     // —— 2. drain Server→Client → 应用 ——
@@ -1202,14 +1302,25 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         // 60Hz 逻辑帧
         game.frame_clock.accumulate(dt);
         let mut steps_consumed: u32 = 0;
+        let server_tick_allowed = matches!(game.mode, GameMode::Local | GameMode::Host);
         while game.frame_clock.consume_logic_step() {
-            game.server.borrow_mut().tick();
+            if server_tick_allowed {
+                game.server.borrow_mut().tick();
+            }
+            // 每个逻辑步推一条 input history（Host reconcile 用；Remote 也可靠它追踪本地步数）
+            game.input_history
+                .push(game.server.borrow().tick, game.physics.feet_position);
             steps_consumed += 1;
         }
 
-        // 每个 logic step 上报一条 PlayerInput（Phase 3：让 server 知道玩家位置以做范围/重叠校验）
+        // 每个 logic step 上报一条 PlayerInput
         if steps_consumed > 0 && game.entity_id != 0 {
-            let tick = game.server.borrow().tick;
+            let tick = if server_tick_allowed {
+                game.server.borrow().tick
+            } else {
+                // Remote：用自己的 input history 计数（从 physics 最后一次 reconcile 后的步数推导）
+                0 // Phase 5 简化：Remote 的 PlayerInput.tick 用 0；Host Server 不依赖 Remote 的 tick 做排序
+            };
             game.net.send_client_message(ClientMessage::PlayerInput {
                 tick,
                 position: game.physics.feet_position,
@@ -1358,6 +1469,31 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         // 世界 Pass
         a.renderer
             .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+
+        // Phase 5 玩家实体 Pass：从插值器拿远端位置 → instance buffer → 渲染
+        {
+            let now = now_ms();
+            let mut instances: Vec<voxweb_render::passes::player::PlayerInstance> = Vec::new();
+            if let Some(ref mut game) = a.game {
+                let render_server_time =
+                    now + game.server_clock_offset_ms as f64 - game.interp.delay_ms;
+                let eids: Vec<voxweb_core::protocol::EntityId> = game.interp.ids().collect();
+                for eid in eids {
+                    if let Some((pos, _yaw, _pitch)) = game.interp.advance(eid, render_server_time)
+                        && let Some(rp) = game.remote_players.get(&eid)
+                    {
+                        instances.push(voxweb_render::passes::player::PlayerInstance {
+                            position: pos.to_array(),
+                            _pad0: 0.0,
+                            color: rp.color_rgb,
+                            _pad1: 0.0,
+                        });
+                    }
+                }
+            }
+            a.renderer.upload_player_instances(&instances);
+            a.renderer.render_players(&mut encoder, &view, view_proj);
+        }
 
         // 选中方块线框（命中时）
         a.renderer
@@ -1509,6 +1645,55 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
         } => {
             game.entity_id = entity_id;
             log::info!("Welcome: entity_id={entity_id}, seed={world_seed}");
+            // Remote：清掉本地占位生成的 chunks（Phase 4 用 seed=0 生成了一个空世界），
+            // 后续 ChunkSnapshot 逐个填充 Host 的真实世界。
+            if game.mode == GameMode::Remote {
+                game.server.borrow_mut().world.chunks.clear();
+            }
+        }
+        ServerMessage::ChunkSnapshot {
+            pos,
+            frag_index,
+            frag_total,
+            payload,
+        } => {
+            if let Some(full) = game
+                .chunk_assembler
+                .ingest(pos, frag_index, frag_total, payload)
+            {
+                let blocks: Result<Vec<voxweb_core::block::BlockID>, _> =
+                    voxweb_core::protocol::decode(&full);
+                match blocks {
+                    Ok(blocks) if blocks.len() == voxweb_core::chunk::CHUNK_SIZE => {
+                        let chunk = voxweb_core::chunk::Chunk { blocks };
+                        game.server.borrow_mut().world.chunks.insert(pos, chunk);
+                        // 自己 + 相邻 8 个 chunk 都重 mesh
+                        for dz in -1..=1i32 {
+                            for dx in -1..=1i32 {
+                                game.mesh_jobs.enqueue(
+                                    voxweb_core::chunk::ChunkPos::new(pos.x + dx, pos.z + dz),
+                                    MeshPriority::High,
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        log::warn!("[client] ChunkSnapshot {pos:?} wrong block count after decode");
+                    }
+                    Err(e) => {
+                        log::warn!("[client] ChunkSnapshot {pos:?} decode failed: {e}");
+                    }
+                }
+            }
+        }
+        ServerMessage::BlockUpdate { pos, block } => {
+            // Remote：先写 world，再做 remesh（因为 Remote 的 server 不做本地 handle_message）
+            if game.mode == GameMode::Remote {
+                game.server.borrow_mut().world.set_block(pos, block);
+            }
+            for cp in affected_chunks(pos) {
+                game.mesh_jobs.enqueue(cp, MeshPriority::High);
+            }
         }
         ServerMessage::ActionAck {
             request_id,
@@ -1516,7 +1701,6 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             reason,
         } => {
             if let Some(rolled) = game.pending.resolve(request_id, accepted) {
-                // server 拒绝 → 写回 backup + 重 mesh
                 log::warn!(
                     "ActionAck rejected: id={request_id} reason={reason:?} pos={:?}",
                     rolled.pos
@@ -1530,25 +1714,63 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 }
             }
         }
-        ServerMessage::BlockUpdate { pos, .. } => {
-            // Local 模式 server 已经写过 world；这里只需重 mesh 受影响 chunk。
-            // Phase 5 远端 BlockUpdate 也走这条路径，到时 world 由这里同步。
-            for cp in affected_chunks(pos) {
-                game.mesh_jobs.enqueue(cp, MeshPriority::High);
+        ServerMessage::PlayerTick {
+            tick: server_tick,
+            players,
+            server_time_ms,
+        } => {
+            let now = (now_ms()) as i64;
+            game.server_clock_offset_ms = server_time_ms as i64 - now;
+
+            for snap in &players {
+                if snap.entity_id == game.entity_id {
+                    // 自己的权威位置 → reconcile
+                    let _r = reconcile_self(
+                        snap.position,
+                        server_tick,
+                        &mut game.physics,
+                        &mut game.input_history,
+                    );
+                } else {
+                    // 远端玩家 → 喂入插值缓冲
+                    game.interp.ingest_tick(
+                        snap.entity_id,
+                        server_time_ms,
+                        snap.position,
+                        snap.yaw,
+                        snap.pitch,
+                    );
+                    if let Some(rp) = game.remote_players.get_mut(&snap.entity_id) {
+                        rp.last_seen_tick = server_tick;
+                    }
+                }
             }
+        }
+        ServerMessage::PeerJoined {
+            entity_id,
+            display_name,
+        } => {
+            // 排查重复加入（信令层理论上不应重复，但防御不 panic）
+            game.remote_players
+                .entry(entity_id)
+                .or_insert_with(|| RemotePlayerState::new(display_name, entity_id));
+        }
+        ServerMessage::PeerLeft { entity_id } => {
+            game.remote_players.remove(&entity_id);
+            game.interp.remove(entity_id);
+        }
+        ServerMessage::Chat { from, content } => {
+            // Phase 5 只打 log；Phase 6 接入聊天 UI
+            log::info!("[chat] {from}: {content}");
         }
         ServerMessage::Pong {
             client_time_ms,
             server_time_ms: _,
         } => {
-            // 与待办 Ping 对齐计算 RTT
             if let Some(sent_ms) = game.pending_pings.remove(&client_time_ms) {
                 let rtt = (now_ms() - sent_ms) as f32;
                 game.rtt_ms = Some(rtt);
             }
-        }
-        _ => {
-            // Phase 5+ 才处理 PlayerTick / PeerJoined / Chat 等
         }
     }
 }
