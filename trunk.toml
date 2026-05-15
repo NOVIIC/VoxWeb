@@ -1,3 +1,8 @@
+[[hooks]]
+stage = "post_build"
+command = "bash"
+command_arguments = ["-c", "grep -q '^SIGNALING_URL=' .env || { echo '[post_build] ERROR: .env not found or SIGNALING_URL not set. Copy .env.example to .env and fill in the value.'; exit 1; }; sed -i \"s|__SIGNALING_URL__|$(grep '^SIGNALING_URL=' .env | cut -d= -f2- | head -1)|g\" dist/.stage/start.html && echo '[post_build] SIGNALING_URL injected'"]
+
 [build]
 target = "start.html"
 html_output = "start.html"
