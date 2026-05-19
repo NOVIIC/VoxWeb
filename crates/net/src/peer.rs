@@ -495,13 +495,11 @@ fn install_pc_handlers(
                     // null 表示收集完毕（gathering complete）
                     return;
                 };
+                // 重写 priority,让 IPv6 候选总是排在 IPv4 之前
+                let cand_str = bump_ipv6_priority(&candidate.candidate());
                 // 序列化为带 sdpMid / sdpMLineIndex 的对象 JSON，便于对端 addIceCandidate
                 let obj = Object::new();
-                let _ = Reflect::set(
-                    &obj,
-                    &"candidate".into(),
-                    &JsValue::from_str(&candidate.candidate()),
-                );
+                let _ = Reflect::set(&obj, &"candidate".into(), &JsValue::from_str(&cand_str));
                 if let Some(mid) = candidate.sdp_mid() {
                     let _ = Reflect::set(&obj, &"sdpMid".into(), &JsValue::from_str(&mid));
                 }
@@ -785,4 +783,108 @@ async fn add_ice_candidate(rtc: &RtcPeerConnection, candidate_json: &str) -> Res
         .await
         .map_err(|e| format!("addIceCandidate failed: {e:?}"))?;
     Ok(())
+}
+
+/// IPv4 candidate 的 priority 下调量(单位:priority 数值)。
+///
+/// 当本机同时有 IPv4 和 IPv6 网络时,ICE candidate pair 的连通性检查顺序按 priority 排。
+/// 浏览器给出的默认 priority 让 IPv4 host (~2.12B) 排在 IPv6 srflx (~1.68B) 之前,
+/// 但 IPv4 host 通常是内网地址(192.168.x / 10.x),跨公网注定连不通,白白消耗检查窗口。
+/// 把所有 IPv4 candidate 的 priority 减去 `IPV4_PRIORITY_PENALTY`(约 1.07B)后:
+/// - IPv4 host 降到 ~1.05B,低于 IPv6 srflx;
+/// - 同族内部 host > srflx > relay 的相对顺序保留;
+/// - relay 这种 priority 本来就低的会饱和到 0。
+///
+/// 对端拿到压低后的 IPv4 priority,在做 pair 配对时 IPv6 综合优先级就更高,
+/// 浏览器会先把检查带宽给 IPv6,IPv6 全失败才轮到 IPv4。
+const IPV4_PRIORITY_PENALTY: u32 = 0x4000_0000;
+
+/// 重写 ICE candidate 字符串的 priority 字段,让 IPv6 候选总是排在 IPv4 之前。
+///
+/// 输入格式(WebRTC `RTCIceCandidate.candidate` 返回值):
+/// `candidate:<foundation> <component> <transport> <priority> <address> <port> typ <type> ...`
+///
+/// 规则:
+/// - 第 5 段(index 4)是地址,含 `:` 判为 IPv6,含 `.` 判为 IPv4;
+/// - IPv6 不动;IPv4 priority 减 [`IPV4_PRIORITY_PENALTY`](饱和到 0);
+/// - 非 IPv4 / 非 IPv6 字面量(比如 mDNS `.local` 主机名)原样返回;
+/// - 字段数不足或 priority 解析失败也原样返回(兜底)。
+fn bump_ipv6_priority(candidate: &str) -> String {
+    let fields: Vec<&str> = candidate.split(' ').collect();
+    if fields.len() < 6 {
+        return candidate.to_string();
+    }
+    // 用真正的 IP 解析判定地址族,避免把 mDNS `.local` 主机名误判为 IPv4
+    let address = fields[4];
+    let is_ipv4 = address.parse::<std::net::Ipv4Addr>().is_ok();
+    if !is_ipv4 {
+        // IPv6 / mDNS hostname / 其他形式一律不动
+        return candidate.to_string();
+    }
+    let Ok(prio) = fields[3].parse::<u32>() else {
+        return candidate.to_string();
+    };
+    let new_prio = prio.saturating_sub(IPV4_PRIORITY_PENALTY).to_string();
+    let mut new_fields = fields.clone();
+    new_fields[3] = &new_prio;
+    new_fields.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv4_host_priority_reduced() {
+        let input = "candidate:2999745851 1 udp 2122260223 192.168.1.5 60169 typ host generation 0";
+        let expected_prio = 2122260223u32 - 0x4000_0000;
+        let expected = format!(
+            "candidate:2999745851 1 udp {expected_prio} 192.168.1.5 60169 typ host generation 0"
+        );
+        assert_eq!(bump_ipv6_priority(input), expected);
+    }
+
+    #[test]
+    fn ipv6_host_priority_unchanged() {
+        let input = "candidate:840527380 1 udp 2122197247 2001:db8::1 60170 typ host generation 0";
+        assert_eq!(bump_ipv6_priority(input), input);
+    }
+
+    #[test]
+    fn ipv4_srflx_priority_reduced() {
+        let input = "candidate:842163049 1 udp 1685987071 203.0.113.1 60169 typ srflx raddr 192.168.1.5 rport 60169";
+        let expected_prio = 1685987071u32 - 0x4000_0000;
+        let expected = format!(
+            "candidate:842163049 1 udp {expected_prio} 203.0.113.1 60169 typ srflx raddr 192.168.1.5 rport 60169"
+        );
+        assert_eq!(bump_ipv6_priority(input), expected);
+    }
+
+    #[test]
+    fn ipv4_low_priority_saturates_to_zero() {
+        // relay 候选,priority 远低于 penalty
+        let input = "candidate:1 1 udp 100 198.51.100.1 60169 typ relay raddr 0.0.0.0 rport 0";
+        let expected = "candidate:1 1 udp 0 198.51.100.1 60169 typ relay raddr 0.0.0.0 rport 0";
+        assert_eq!(bump_ipv6_priority(input), expected);
+    }
+
+    #[test]
+    fn malformed_candidate_returned_unchanged() {
+        let input = "not-a-candidate";
+        assert_eq!(bump_ipv6_priority(input), input);
+    }
+
+    #[test]
+    fn mdns_hostname_unchanged() {
+        // 现代浏览器会用 .local mDNS 地址替代真实 IP,既非 IPv4 也非 IPv6 字面量
+        let input = "candidate:1 1 udp 2122260223 abc-def.local 60169 typ host generation 0";
+        assert_eq!(bump_ipv6_priority(input), input);
+    }
+
+    #[test]
+    fn ipv6_srflx_unchanged() {
+        let input =
+            "candidate:2 1 udp 1685987071 2001:db8::abcd 60170 typ srflx raddr ::1 rport 60170";
+        assert_eq!(bump_ipv6_priority(input), input);
+    }
 }

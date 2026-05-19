@@ -254,6 +254,25 @@ let rtc = web_sys::RtcPeerConnection::new_with_configuration(&config)?;
 
 **TURN 凭据下发**：v2 阶段，信令服务 `Registered` 消息中携带短期 TURN 凭据（防泄漏），客户端动态注入到 `iceServers`。本期固定使用公共 STUN，TURN 槽位预留。
 
+### IPv6 优先策略
+
+国内运营商大量部署 CGNAT/对称 NAT，IPv4 srflx 打洞成功率显著低于 IPv6 host。浏览器默认对 IPv6 仅略微偏好（同类内 local-preference 高一点点），且 IPv4 host（注定连不通的内网地址）排序高于 IPv6 srflx，会浪费检查窗口。
+
+`peer.rs` 在 `onicecandidate` 回调中通过纯函数 `bump_ipv6_priority` 拦截每条本地候选，把 IPv4 候选的 priority 字段减去 `IPV4_PRIORITY_PENALTY`（`0x4000_0000`，约 1.07B），饱和到 0。结果：
+
+| 候选类型 | 默认 priority | 重写后 |
+|---|---|---|
+| IPv6 host | ~2.12 B | 不变 |
+| IPv6 srflx | ~1.68 B | 不变 |
+| IPv4 host | ~2.12 B | ~1.05 B |
+| IPv4 srflx | ~1.68 B | ~0.61 B |
+
+所有 IPv6 候选都排在所有 IPv4 候选之前，同族内部 host > srflx > relay 的相对顺序保留。双方都跑同一份代码 → 互相重写对方收到的 candidate priority → ICE pair 检查队列前段全部是 IPv6 pair，IPv4 仅作兜底（IPv6 全失败时浏览器自动降级到下一档）。
+
+只重写出方向的 trickle candidate（即 `onicecandidate` 给出的）；SDP（`createOffer`/`createAnswer` 返回值）里可能内嵌的初始候选未处理。Chrome 默认 trickle 模式下初始 SDP 基本不含 candidate，所以单边重写够用；如果实测发现 IPv4 仍抢跑，再考虑在 `setLocalDescription` 前做 SDP munging。
+
+非 IPv4 字面量（mDNS `.local` 主机名、IPv6 字面量）一律原样转发，不参与重写。
+
 ### `send` / `recv`
 
 ```rust
