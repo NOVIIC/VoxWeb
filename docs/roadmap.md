@@ -308,9 +308,16 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - Bloom（v3）
 
 ### 9.2 TURN 中继 fallback
-- 信令服务下发 TURN 凭据
-- ICE 失败时自动降级使用 TURN
-- 客户端 stat 显示当前连接方式（direct/relay）
+
+**应用层字节中继 ✅（2026-05-21 实装，详见 [`networking/signaling.md`](networking/signaling.md) §九）**
+- ICE 失败 / 15s 协商超时 → Host 主动发 `relay_request`
+- 信令 Worker DO 维护 `relayPairs`，在 WS 上做二进制帧字节级转发
+- 客户端 HUD 显示「RELAY n」徽标
+- Per-peer 粒度：仅升级失败的对，其它直连不受影响
+
+**剩余项（仍为 stretch）**：
+- 信令服务下发 TURN 凭据（让 WebRTC 走 TURN，保留 unreliable 语义）
+- TURN/字节中继并存策略：先试 TURN，TURN 也失败再退到字节中继
 
 ### 9.3 触屏 / 移动端
 - 屏幕左右虚拟摇杆（左：移动，右：视角）

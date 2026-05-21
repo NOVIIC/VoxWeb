@@ -19,7 +19,7 @@ pub mod storage;
 pub mod ui;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -87,6 +87,9 @@ struct App {
 
     /// 区块预载状态（Connecting 状态下使用，网络协商完成后开始加载出生点周围区块）。
     preload_state: Option<PreloadState>,
+
+    /// 已被升级为信令中继的 peer 集合。仅供 UI 在玩家名牌 / 列表里加「中继中」徽标。
+    relayed_peers: HashSet<u32>,
 }
 
 #[wasm_bindgen(start)]
@@ -151,6 +154,7 @@ pub async fn start() -> Result<(), JsValue> {
         fps_display: 0.0,
         request_pointer_lock_next: false,
         preload_state: None,
+        relayed_peers: HashSet::new(),
     }));
 
     install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
@@ -1295,12 +1299,14 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             a.disconnect_reason = Some(reason.clone());
             a.connecting_error = Some(reason);
             a.preload_state = None;
+            a.relayed_peers.clear();
             // 在 Connecting / InGame 都直接回大厅
             a.state = AppState::Lobby;
             a.game = None;
         }
         RoomEvent::RemoteLeft { peer_id } => {
             log::info!("[net] RemoteLeft: peer {peer_id}");
+            a.relayed_peers.remove(&peer_id);
             // Host：从 net 拿 entity_id → 调 server.remove_player
             if let Some(ref mut game) = a.game
                 && let Some(eid) = game.net.host_unregister_peer(peer_id)
@@ -1314,6 +1320,10 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
         }
         RoomEvent::PeerCount(n) => {
             log::info!("[net] peer count: {n}");
+        }
+        RoomEvent::PeerRelayed { peer_id } => {
+            log::info!("[net] peer {peer_id} 已切换为中继模式");
+            a.relayed_peers.insert(peer_id);
         }
     }
 }
@@ -1558,6 +1568,7 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         let game_mode = game.map(|g| g.mode).unwrap_or(GameMode::Local);
         let rtt_ms = game.and_then(|g| g.rtt_ms);
         let room_id = game.map(|g| g.room_id.clone()).unwrap_or_default();
+        let relayed_peer_count = a.relayed_peers.len();
         let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
             draw_hud(
                 ui.ctx(),
@@ -1576,6 +1587,7 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
                     game_mode,
                     rtt_ms,
                     room_id: room_id.clone(),
+                    relayed_peer_count,
                 },
             );
         });
@@ -1932,6 +1944,8 @@ struct HudData {
     game_mode: GameMode,
     rtt_ms: Option<f32>,
     room_id: String,
+    /// 当前走信令 Worker 中继的 peer 数。> 0 时 HUD 显示「RELAY n」徽标。
+    relayed_peer_count: usize,
 }
 
 fn draw_hud(ctx: &egui::Context, data: HudData) {
@@ -1996,6 +2010,13 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                         egui::Color32::from_rgb(200, 200, 160),
                         format!("NET {mode_str}  RTT {rtt_str}{room_str}"),
                     );
+                    if data.relayed_peer_count > 0 {
+                        // 醒目橙色：表示当前有 peer 走信令 Worker 中继
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 165, 80),
+                            format!("RELAY {} peer(s) (中继中)", data.relayed_peer_count),
+                        );
+                    }
                 });
         });
 

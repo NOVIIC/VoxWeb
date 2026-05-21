@@ -70,6 +70,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 | `u32 request_id` | 客户端单调递增，用于 ActionAck 配对 |
 | `u32 tick` | 服务端 60Hz 累计 tick |
 
+> **中继兜底**：当 Host 与某 Remote 的 P2P 直连失败，该对 peer 会自动切换为通过信令 Worker 的 WebSocket 中继 bincode 字节（详见 [`signaling.md`](signaling.md) §九）。
+> 此时 `reliable` / `unreliable` 两个通道在该对方向上**统一退化为 reliable+ordered**（WS 自带语义），原 unreliable 的「丢了无所谓」不再保留。
+> 接收侧按消息 `kind` 而非 channel 分发，正确性不变；现象上只会偶发额外延迟，不会出现错乱或丢消息。
+
 ---
 
 ## 四、连接握手序列

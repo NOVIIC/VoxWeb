@@ -1,6 +1,8 @@
 name = "voxweb-signaling"
 main = "src/worker.ts"
 compatibility_date = "2025-01-01"
+workers_dev = false
+preview_urls = false
 
 # Durable Object 绑定：房间管理
 [[durable_objects.bindings]]

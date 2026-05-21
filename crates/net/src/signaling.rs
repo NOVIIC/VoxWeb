@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use js_sys::{ArrayBuffer, Uint8Array};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -65,6 +66,19 @@ pub enum SignalingEvent {
     SocketError { message: String },
     /// WebSocket 已关闭。
     Closed,
+    /// 中继升级被服务端确认（Host 主动 request 后双方各收一份；peer_id 是对端）。
+    RelayActive {
+        peer_id: u32,
+        max_msg_size: u32,
+        max_rate: u32,
+    },
+    /// 中继对被服务端关闭（peer_left / rate_limit / msg_too_large 等）。
+    RelayClosed { peer_id: u32, reason: String },
+    /// 来自 sender 的中继数据帧（剥离 4B 头部后的 bincode payload）。
+    RelayBinary {
+        sender_peer_id: u32,
+        payload: Vec<u8>,
+    },
 }
 
 /// 从信令服务下发的 ICE Server 配置项。
@@ -125,24 +139,41 @@ impl SignalingClient {
             closures.push(on_open.into_js_value());
         }
 
-        // onmessage：JSON parse → 转 SignalingEvent → push inbox
+        // onmessage：text 走 JSON 解析；binary 走中继帧（4B sender + payload）。
         {
             let inbox_clone = inbox.clone();
             let peer_id_clone = peer_id.clone();
             let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |evt: MessageEvent| {
-                let Some(text) = evt.data().as_string() else {
-                    // 二进制帧 ignore（信令协议只有 JSON 文本）
-                    return;
-                };
-                match parse_event(&text) {
-                    Ok(event) => {
-                        if let SignalingEvent::Registered { peer_id, .. } = &event {
-                            peer_id_clone.set(Some(*peer_id));
+                let data = evt.data();
+                if let Some(text) = data.as_string() {
+                    match parse_event(&text) {
+                        Ok(event) => {
+                            if let SignalingEvent::Registered { peer_id, .. } = &event {
+                                peer_id_clone.set(Some(*peer_id));
+                            }
+                            inbox_clone.borrow_mut().push_back(event);
                         }
-                        inbox_clone.borrow_mut().push_back(event);
+                        Err(err) => {
+                            log::warn!("[signaling] 无法解析消息：{err} / raw={text}");
+                        }
                     }
-                    Err(err) => {
-                        log::warn!("[signaling] 无法解析消息：{err} / raw={text}");
+                    return;
+                }
+                if let Some(buf) = data.dyn_ref::<ArrayBuffer>() {
+                    // 中继数据帧：[sender_peer_id: u32 LE][bincode payload...]
+                    let bytes = Uint8Array::new(buf).to_vec();
+                    match parse_relay_frame(&bytes) {
+                        Some((sender_peer_id, payload)) => {
+                            inbox_clone
+                                .borrow_mut()
+                                .push_back(SignalingEvent::RelayBinary {
+                                    sender_peer_id,
+                                    payload: payload.to_vec(),
+                                });
+                        }
+                        None => {
+                            log::warn!("[signaling] 二进制帧过短：{}", bytes.len());
+                        }
                     }
                 }
             });
@@ -217,6 +248,26 @@ impl SignalingClient {
 
     pub fn send_leave(&self) {
         self.send_json(serde_json::json!({ "kind": "leave" }));
+    }
+
+    /// Host 发起：请求服务端把自己与 `peer_id` 升级为中继模式。
+    /// 服务端确认后会向双方各发一条 `RelayActive`。
+    pub fn request_relay(&self, peer_id: u32) {
+        self.send_json(serde_json::json!({
+            "kind": "relay_request",
+            "peer_id": peer_id,
+        }));
+    }
+
+    /// 通过信令 WS 二进制帧把 bincode payload 发给 `target_peer_id`。
+    /// 帧格式：[target_peer_id: u32 LE][payload...]。
+    /// 调用前需确保 `RelayActive` 已收到，否则服务端会静默丢弃。
+    pub fn send_relay_binary(&self, target_peer_id: u32, payload: &[u8]) {
+        if self.socket.ready_state() != WebSocket::OPEN {
+            return;
+        }
+        let frame = build_relay_frame(target_peer_id, payload);
+        let _ = self.socket.send_with_u8_array(&frame);
     }
 
     fn send_json(&self, value: serde_json::Value) {
@@ -337,8 +388,60 @@ fn parse_event(text: &str) -> Result<SignalingEvent, String> {
                 .to_owned();
             Ok(SignalingEvent::ServerError { message })
         }
+        "relay_active" => {
+            let peer_id = value
+                .get("peer_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "relay_active.peer_id missing".to_string())?
+                as u32;
+            let max_msg_size = value
+                .get("max_msg_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(64 * 1024) as u32;
+            let max_rate = value
+                .get("max_rate")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200) as u32;
+            Ok(SignalingEvent::RelayActive {
+                peer_id,
+                max_msg_size,
+                max_rate,
+            })
+        }
+        "relay_closed" => {
+            let peer_id = value
+                .get("peer_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "relay_closed.peer_id missing".to_string())?
+                as u32;
+            let reason = value
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            Ok(SignalingEvent::RelayClosed { peer_id, reason })
+        }
         other => Err(format!("unknown kind: {other}")),
     }
+}
+
+/// 中继帧构造：`[peer_id: u32 LE][payload...]`。
+/// 发送方向：peer_id 是 **目标** peer；接收方向：peer_id 是 **来源** peer。
+pub(crate) fn build_relay_frame(peer_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&peer_id.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// 中继帧解析：从 binary frame 读出 `(peer_id, payload)`。
+/// 帧不足 4 字节返回 `None`（调用方应丢弃）。
+pub(crate) fn parse_relay_frame(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let peer_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Some((peer_id, &bytes[4..]))
 }
 
 #[cfg(test)]
@@ -388,5 +491,81 @@ mod tests {
     fn parse_unknown_kind_errors() {
         let txt = r#"{"kind":"oops"}"#;
         assert!(parse_event(txt).is_err());
+    }
+
+    #[test]
+    fn parse_relay_active() {
+        let txt = r#"{"kind":"relay_active","peer_id":5,"max_msg_size":65536,"max_rate":200}"#;
+        let ev = parse_event(txt).unwrap();
+        match ev {
+            SignalingEvent::RelayActive {
+                peer_id,
+                max_msg_size,
+                max_rate,
+            } => {
+                assert_eq!(peer_id, 5);
+                assert_eq!(max_msg_size, 65536);
+                assert_eq!(max_rate, 200);
+            }
+            other => panic!("expected RelayActive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_relay_closed() {
+        let txt = r#"{"kind":"relay_closed","peer_id":7,"reason":"rate_limit"}"#;
+        let ev = parse_event(txt).unwrap();
+        match ev {
+            SignalingEvent::RelayClosed { peer_id, reason } => {
+                assert_eq!(peer_id, 7);
+                assert_eq!(reason, "rate_limit");
+            }
+            other => panic!("expected RelayClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_relay_active_defaults() {
+        // 缺省 max_msg_size / max_rate 时应取默认值
+        let txt = r#"{"kind":"relay_active","peer_id":1}"#;
+        let ev = parse_event(txt).unwrap();
+        match ev {
+            SignalingEvent::RelayActive {
+                max_msg_size,
+                max_rate,
+                ..
+            } => {
+                assert_eq!(max_msg_size, 64 * 1024);
+                assert_eq!(max_rate, 200);
+            }
+            other => panic!("expected RelayActive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_relay_frame_prefixes_peer_id_le() {
+        let frame = build_relay_frame(0xDEAD_BEEF, &[0x11, 0x22, 0x33]);
+        assert_eq!(frame, vec![0xEF, 0xBE, 0xAD, 0xDE, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn build_relay_frame_empty_payload_keeps_header() {
+        let frame = build_relay_frame(1, &[]);
+        assert_eq!(frame, vec![0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn parse_relay_frame_roundtrip() {
+        let payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let frame = build_relay_frame(42, &payload);
+        let (peer, recovered) = parse_relay_frame(&frame).unwrap();
+        assert_eq!(peer, 42);
+        assert_eq!(recovered, payload.as_slice());
+    }
+
+    #[test]
+    fn parse_relay_frame_rejects_short_frame() {
+        assert!(parse_relay_frame(&[]).is_none());
+        assert!(parse_relay_frame(&[1, 2, 3]).is_none());
     }
 }

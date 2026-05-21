@@ -135,6 +135,12 @@ pub enum RoomEvent {
     RemoteLeft {
         peer_id: u32,
     },
+    /// 该 peer 已从 P2P 切换为通过信令 Worker 中继（详见 docs/networking/signaling.md 数据中继章节）。
+    /// Host 端：peer_id 为对应 Remote 的 id；Remote 端：peer_id 为 Host 的 id。
+    /// 仅 UI 用于显示「中继中」徽标；不影响协议路径。
+    PeerRelayed {
+        peer_id: u32,
+    },
 }
 
 /// PlayerTick 中携带的单个玩家快照。

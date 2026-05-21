@@ -7,6 +7,13 @@
 //   - 一房一 host；host 离开 → 整个房间销毁（其它 peer 收 room_closed）
 //   - offer/answer/ice 按 to 字段路由；目标不存在静默丢弃
 //   - 上限 16 个 peer，超出拒绝
+//
+// 数据中继 fallback（详见 docs/networking/signaling.md §X）：
+//   - 当 Host 与某 Remote ICE 协商失败时，Host 发 relay_request 升级该对为中继模式；
+//   - 升级后，该对的 bincode 字节流通过同一条信令 WS 的二进制帧转发：
+//       Client→DO binary：[target_peer_id: u32 LE][payload...]
+//       DO→Client binary：[sender_peer_id: u32 LE][payload...]
+//   - 每 peer 200 msg/s、单 payload ≤ 64KB；违规则关闭该中继对。
 
 interface PeerInfo {
   ws: WebSocket;
@@ -20,13 +27,26 @@ interface IceServer {
   credential?: string;
 }
 
+// 中继限流状态（令牌桶）。容量 200，每 50ms 补 10。
+interface RateState {
+  tokens: number;
+  lastRefillMs: number;
+}
+
 // Workers 运行时全局 WebSocket 暴露的常量（@cloudflare/workers-types 已声明 READY_STATE_OPEN 等）。
 const MAX_PEERS = 16;
+const RELAY_MAX_PAYLOAD = 64 * 1024; // 64KB（不含 4B header）
+const RELAY_RATE_CAPACITY = 200; // 桶容量（消息条数）
+const RELAY_RATE_REFILL_PER_MS = 200 / 1000; // 200/s
 
 export class Room {
   private peers = new Map<number, PeerInfo>();
   private hostId: number | null = null;
   private nextPeerId = 1;
+  // 已建立中继的双向 peer 集合。relayPairs.get(A) 含 B ⇔ relayPairs.get(B) 含 A。
+  private relayPairs = new Map<number, Set<number>>();
+  // 每 peer 一个令牌桶，控制其发出的中继帧速率。
+  private rateState = new Map<number, RateState>();
 
   constructor(_state: DurableObjectState) {}
 
@@ -49,7 +69,18 @@ export class Room {
     let registered = false;
 
     ws.addEventListener("message", (event: MessageEvent) => {
-      // 消息体期望是 JSON 字符串
+      // 二进制帧：中继数据载荷。未注册一律拒绝。
+      if (event.data instanceof ArrayBuffer) {
+        if (!registered || myPeerId == null) {
+          this.sendError(ws, "must_register_first");
+          ws.close();
+          return;
+        }
+        this.handleBinary(myPeerId, event.data);
+        return;
+      }
+
+      // 文本帧：JSON 信令消息
       let raw: unknown;
       try {
         if (typeof event.data !== "string") {
@@ -97,6 +128,9 @@ export class Room {
         case "answer":
         case "ice":
           this.routeMessage(myPeerId!, msg as unknown as RoutedMessage);
+          return;
+        case "relay_request":
+          this.handleRelayRequest(myPeerId!, msg);
           return;
         default:
           this.sendError(ws, "unknown_kind");
@@ -194,9 +228,170 @@ export class Room {
     this.sendJson(target.ws, forwarded);
   }
 
+  // 处理 Host 发起的中继升级请求。
+  // 仅 Host 可调用；peer_id 必须存在且非自身；幂等（已建立则 no-op）。
+  private handleRelayRequest(from: number, msg: Record<string, unknown>): void {
+    if (from !== this.hostId) {
+      this.sendError(this.peers.get(from)!.ws, "relay_request_host_only");
+      return;
+    }
+    const peerId =
+      typeof msg.peer_id === "number" ? (msg.peer_id as number) : null;
+    if (peerId == null || peerId === from) {
+      this.sendError(this.peers.get(from)!.ws, "relay_request_invalid_peer");
+      return;
+    }
+    const target = this.peers.get(peerId);
+    if (!target) {
+      this.sendError(this.peers.get(from)!.ws, "relay_request_no_peer");
+      return;
+    }
+    // 已建立 → 幂等
+    if (this.relayPairs.get(from)?.has(peerId)) return;
+
+    // 双向写入
+    this.linkRelay(from, peerId);
+
+    const params = {
+      max_msg_size: RELAY_MAX_PAYLOAD,
+      max_rate: RELAY_RATE_CAPACITY,
+    };
+    this.sendJson(this.peers.get(from)!.ws, {
+      kind: "relay_active",
+      peer_id: peerId,
+      ...params,
+    });
+    this.sendJson(target.ws, {
+      kind: "relay_active",
+      peer_id: from,
+      ...params,
+    });
+    console.log(`[room] RELAY peer${from} <-> peer${peerId}`);
+  }
+
+  // 处理二进制中继帧。
+  // 帧格式：[target_peer_id: u32 LE][bincode payload...]
+  // 校验：长度合法 + 双方已建立 relay pair + 限流。
+  private handleBinary(from: number, buf: ArrayBuffer): void {
+    if (buf.byteLength < 4) {
+      this.closeRelayPair(from, /* notifyPeer */ null, "invalid_frame");
+      return;
+    }
+    if (buf.byteLength - 4 > RELAY_MAX_PAYLOAD) {
+      this.closeRelayPair(from, /* notifyPeer */ null, "msg_too_large");
+      return;
+    }
+    const view = new DataView(buf);
+    const targetId = view.getUint32(0, /* littleEndian */ true);
+    const partners = this.relayPairs.get(from);
+    if (!partners || !partners.has(targetId)) {
+      // 未建立中继的目标 → 静默丢弃（不暴露成员存在与否）
+      return;
+    }
+    const target = this.peers.get(targetId);
+    if (!target) {
+      // 对端已不在房间（应已被 handleLeave 清理），保险起见再清一次
+      this.unlinkRelay(from, targetId);
+      return;
+    }
+
+    // 令牌桶限流
+    if (!this.consumeToken(from)) {
+      this.closeRelayPair(from, targetId, "rate_limit");
+      return;
+    }
+
+    // 重写头部为 sender_peer_id，转发剩余字节
+    const out = new Uint8Array(buf.byteLength);
+    const outView = new DataView(out.buffer);
+    outView.setUint32(0, from, true);
+    out.set(new Uint8Array(buf, 4), 4);
+    try {
+      target.ws.send(out.buffer);
+    } catch {
+      // ignore；下次心跳或 close 事件会清理
+    }
+  }
+
+  // 令牌桶：容量 RELAY_RATE_CAPACITY，按时间线性补充。
+  private consumeToken(peerId: number): boolean {
+    const now = Date.now();
+    let state = this.rateState.get(peerId);
+    if (!state) {
+      state = { tokens: RELAY_RATE_CAPACITY, lastRefillMs: now };
+      this.rateState.set(peerId, state);
+    }
+    const elapsed = now - state.lastRefillMs;
+    if (elapsed > 0) {
+      state.tokens = Math.min(
+        RELAY_RATE_CAPACITY,
+        state.tokens + elapsed * RELAY_RATE_REFILL_PER_MS,
+      );
+      state.lastRefillMs = now;
+    }
+    if (state.tokens < 1) return false;
+    state.tokens -= 1;
+    return true;
+  }
+
+  private linkRelay(a: number, b: number): void {
+    let setA = this.relayPairs.get(a);
+    if (!setA) {
+      setA = new Set();
+      this.relayPairs.set(a, setA);
+    }
+    setA.add(b);
+    let setB = this.relayPairs.get(b);
+    if (!setB) {
+      setB = new Set();
+      this.relayPairs.set(b, setB);
+    }
+    setB.add(a);
+  }
+
+  private unlinkRelay(a: number, b: number): void {
+    this.relayPairs.get(a)?.delete(b);
+    this.relayPairs.get(b)?.delete(a);
+    if (this.relayPairs.get(a)?.size === 0) this.relayPairs.delete(a);
+    if (this.relayPairs.get(b)?.size === 0) this.relayPairs.delete(b);
+  }
+
+  // 关闭 from 与 partner 的中继对（partner=null 表示关闭 from 与所有对端的中继）。
+  // reason 通过 relay_closed 通知双方。
+  private closeRelayPair(
+    from: number,
+    partner: number | null,
+    reason: string,
+  ): void {
+    const partners = this.relayPairs.get(from);
+    if (!partners) return;
+    const targets = partner != null ? [partner] : Array.from(partners);
+    for (const p of targets) {
+      this.unlinkRelay(from, p);
+      const fromWs = this.peers.get(from)?.ws;
+      const pWs = this.peers.get(p)?.ws;
+      if (fromWs) {
+        this.sendJson(fromWs, { kind: "relay_closed", peer_id: p, reason });
+      }
+      if (pWs) {
+        this.sendJson(pWs, { kind: "relay_closed", peer_id: from, reason });
+      }
+      console.log(
+        `[room] RELAY_CLOSED peer${from} <-> peer${p} reason=${reason}`,
+      );
+    }
+  }
+
   private handleLeave(peerId: number): void {
     const peer = this.peers.get(peerId);
     if (!peer) return;
+
+    // 先关闭该 peer 涉及的所有中继对，通知对端
+    if (this.relayPairs.has(peerId)) {
+      this.closeRelayPair(peerId, null, "peer_left");
+    }
+    this.rateState.delete(peerId);
+
     this.peers.delete(peerId);
 
     if (peerId === this.hostId) {
@@ -217,6 +412,8 @@ export class Room {
         }
       }
       this.peers.clear();
+      this.relayPairs.clear();
+      this.rateState.clear();
     } else {
       // 普通 peer 离开 → 通知 host（Phase 5+ 还会通知其它 remote）
       console.log(`[room] LEFT peer${peerId} (host=peer${this.hostId})`);

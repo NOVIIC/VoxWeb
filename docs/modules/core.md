@@ -211,6 +211,11 @@ pub enum RoomEvent {
     Disconnected { reason: String },
     PeerCount(u32),
     SignalingError(String),
+    /// Host 端：某 Remote 离开（见 docs/networking/signaling.md 房间生命周期）
+    RemoteLeft { peer_id: u32 },
+    /// 该 peer 已升级为信令 Worker 字节中继（见 docs/networking/signaling.md §九）
+    /// 仅 UI 提示用，不改变协议路径
+    PeerRelayed { peer_id: u32 },
 }
 
 /// 玩家快照（PlayerTick 携带）

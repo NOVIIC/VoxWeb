@@ -15,7 +15,7 @@ pub mod room;
 pub mod signaling;
 pub mod transport;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -142,6 +142,14 @@ pub enum NetEndpoint {
         peer_to_entity: HashMap<u32, EntityId>,
         /// Host 本人的 entity_id（add_player 第一次后由 client 端 `host_set_self_entity` 设置）。
         host_self_entity_id: Option<EntityId>,
+        /// 已升级为中继的 peer 集合。这些 peer 的 RTCPeerConnection 已被关闭，
+        /// 后续 server→peer 字节走信令 WS 二进制帧。
+        relayed_peers: HashSet<u32>,
+        /// 已经发出 relay_request 但还在等服务端 RelayActive 的 peer。
+        /// 用于避免对同一 peer 重复请求升级。
+        relay_requested: HashSet<u32>,
+        /// 每个 peer 协商起始时间（performance.now() ms）。用于 15s 超时升级。
+        negotiation_started_ms: HashMap<u32, f64>,
     },
     /// 远端客户端：单条到 Host 的 Peer。
     Remote {
@@ -156,6 +164,8 @@ pub enum NetEndpoint {
         outbox: VecDeque<ClientMessage>,
         /// 从 Host 收到的 ServerMessage 队列（供 client try_recv_server_message 拉取）。
         inbox: VecDeque<ServerMessage>,
+        /// 若已切到中继模式，记录 Host 的 peer_id；此时 `host` 已被关闭并置 None。
+        relayed_host: Option<u32>,
     },
 }
 
@@ -197,6 +207,9 @@ impl NetEndpoint {
             display_name: display_name.to_string(),
             peer_to_entity: HashMap::new(),
             host_self_entity_id: None,
+            relayed_peers: HashSet::new(),
+            relay_requested: HashSet::new(),
+            negotiation_started_ms: HashMap::new(),
         };
         let inbox = ServerInbox {
             rx_client,
@@ -222,6 +235,7 @@ impl NetEndpoint {
             display_name: display_name.to_string(),
             outbox: VecDeque::new(),
             inbox: VecDeque::new(),
+            relayed_host: None,
         })
     }
 
@@ -243,7 +257,21 @@ impl NetEndpoint {
             NetEndpoint::Host { tx_client, .. } => {
                 let _ = tx_client.unbounded_send(msg);
             }
-            NetEndpoint::Remote { host, outbox, .. } => {
+            NetEndpoint::Remote {
+                host,
+                outbox,
+                signaling,
+                relayed_host,
+                ..
+            } => {
+                // 中继模式：直接经由信令 WS 二进制帧发往 Host。
+                if let Some(host_pid) = *relayed_host {
+                    match transport::encode_client_message(&msg) {
+                        Ok(bytes) => signaling.send_relay_binary(host_pid, &bytes),
+                        Err(e) => log::warn!("[net] encode client message (relay): {e}"),
+                    }
+                    return;
+                }
                 let channel = transport::channel_for_client_message(&msg);
                 let connected = host.as_ref().is_some_and(|pc| pc.is_open(channel));
                 if connected {
@@ -257,7 +285,7 @@ impl NetEndpoint {
                         Err(e) => log::warn!("[net] encode client message: {e}"),
                     }
                 } else {
-                    // 还没开连接 → 暂存；DC open 时 flush
+                    // 还没开连接 → 暂存；DC open 或 RelayActive 时 flush
                     outbox.push_back(msg);
                 }
             }
@@ -339,6 +367,8 @@ impl NetEndpoint {
             peers,
             peer_to_entity,
             host_self_entity_id,
+            relayed_peers,
+            signaling,
             ..
         } = self
         else {
@@ -363,14 +393,15 @@ impl NetEndpoint {
             };
             let channel = transport::channel_for_server_message(&msg.message);
 
-            // 流控检查：若任一目标 peer 的 reliable DC 因 bufferedAmount 暂停，整条消息推迟
+            // 流控检查：若任一目标 peer 的 reliable DC 因 bufferedAmount 暂停，整条消息推迟。
+            // 中继 peer 不受 DC bufferedAmount 影响（WS 自带反压）。
             if let Some(_b) = &bytes
                 && channel == crate::transport::ChannelKind::Reliable
             {
-                let any_paused = plan
-                    .peers_to_send
-                    .iter()
-                    .any(|pid| peers.get(pid).is_some_and(|pc| pc.is_reliable_paused()));
+                let any_paused = plan.peers_to_send.iter().any(|pid| {
+                    !relayed_peers.contains(pid)
+                        && peers.get(pid).is_some_and(|pc| pc.is_reliable_paused())
+                });
                 if any_paused {
                     unsent.push(msg);
                     continue;
@@ -379,6 +410,11 @@ impl NetEndpoint {
 
             if let Some(b) = bytes {
                 for pid in &plan.peers_to_send {
+                    if relayed_peers.contains(pid) {
+                        // 中继路径：信令 WS 二进制帧
+                        signaling.send_relay_binary(*pid, &b);
+                        continue;
+                    }
                     if let Some(pc) = peers.get(pid)
                         && pc.is_open(channel)
                         && let Err(e) = pc.send(channel, &b)
@@ -423,6 +459,9 @@ impl NetEndpoint {
                 pending,
                 ice_servers,
                 session,
+                relayed_peers,
+                relay_requested,
+                negotiation_started_ms,
                 ..
             } => {
                 poll_host(
@@ -431,6 +470,9 @@ impl NetEndpoint {
                     pending,
                     ice_servers,
                     session,
+                    relayed_peers,
+                    relay_requested,
+                    negotiation_started_ms,
                     &mut peer_msg_handler,
                     &mut out,
                 );
@@ -443,6 +485,7 @@ impl NetEndpoint {
                 session,
                 outbox,
                 inbox,
+                relayed_host,
                 ..
             } => {
                 poll_remote(
@@ -453,6 +496,7 @@ impl NetEndpoint {
                     session,
                     outbox,
                     inbox,
+                    relayed_host,
                     &mut out,
                 );
             }
@@ -463,16 +507,31 @@ impl NetEndpoint {
 
 const CONNECTED_SESSION: RoomSession = RoomSession::Connected;
 
+/// 协商超时阈值：从 PeerJoined 起 15s 仍未 Connected → 触发中继升级。
+const NEGOTIATION_TIMEOUT_MS: f64 = 15_000.0;
+
+/// 取当前 performance.now() 毫秒；浏览器外（如 Node 测试）返回 0。
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
 // ──────────────────────────────────────────────────────────────
 // Host poll
 // ──────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn poll_host(
     signaling: &mut SignalingClient,
     peers: &mut HashMap<u32, PeerConnection>,
     pending: &mut HashMap<u32, PendingNegotiation>,
     ice_servers: &mut Vec<IceServerConfig>,
     session: &mut RoomSession,
+    relayed_peers: &mut HashSet<u32>,
+    relay_requested: &mut HashSet<u32>,
+    negotiation_started_ms: &mut HashMap<u32, f64>,
     peer_msg_handler: &mut Option<&mut dyn FnMut(u32, ClientMessage)>,
     out: &mut Vec<RoomEvent>,
 ) {
@@ -497,6 +556,7 @@ fn poll_host(
                         pc.start_offer();
                         peers.insert(peer_id, pc);
                         pending.insert(peer_id, PendingNegotiation::default());
+                        negotiation_started_ms.insert(peer_id, now_ms());
                         session.mark_offer_exchanged();
                     }
                     Err(e) => {
@@ -509,9 +569,14 @@ fn poll_host(
                     pc.close();
                 }
                 pending.remove(&peer_id);
+                negotiation_started_ms.remove(&peer_id);
+                relayed_peers.remove(&peer_id);
+                relay_requested.remove(&peer_id);
                 // Phase 5：通知 client 端做 host_unregister_peer + server.remove_player
                 out.push(RoomEvent::RemoteLeft { peer_id });
-                out.push(RoomEvent::PeerCount(peers.len() as u32));
+                out.push(RoomEvent::PeerCount(
+                    peers.len() as u32 + relayed_peers.len() as u32,
+                ));
             }
             SignalingEvent::Answer { from, sdp } => {
                 if let Some(pc) = peers.get(&from) {
@@ -543,6 +608,54 @@ fn poll_host(
             SignalingEvent::Closed => {
                 // 信令关闭对已建立的 PC 没影响（设计如此）；不切 session
                 log::info!("[net/host] signaling socket closed");
+            }
+            SignalingEvent::RelayActive { peer_id, .. } => {
+                // 服务端确认中继对建立。关闭对应 PeerConnection（释放资源），把 peer 移入 relayed_peers。
+                relay_requested.remove(&peer_id);
+                if let Some(pc) = peers.remove(&peer_id) {
+                    pc.close();
+                }
+                pending.remove(&peer_id);
+                negotiation_started_ms.remove(&peer_id);
+                if relayed_peers.insert(peer_id) {
+                    log::info!("[net/host] peer {peer_id} upgraded to relay");
+                    out.push(RoomEvent::PeerRelayed { peer_id });
+                    // 中继视为已连通，PeerCount 也包含 relayed
+                    session.mark_dc_open();
+                    out.push(RoomEvent::PeerCount(
+                        peers.len() as u32 + relayed_peers.len() as u32,
+                    ));
+                }
+            }
+            SignalingEvent::RelayClosed { peer_id, reason } => {
+                log::info!("[net/host] relay closed peer {peer_id}: {reason}");
+                relayed_peers.remove(&peer_id);
+                relay_requested.remove(&peer_id);
+                // 直连 PC 之前已关闭；若不在 relayed_peers 也不在 peers，就把 peer 当作离线
+                out.push(RoomEvent::RemoteLeft { peer_id });
+                out.push(RoomEvent::PeerCount(
+                    peers.len() as u32 + relayed_peers.len() as u32,
+                ));
+            }
+            SignalingEvent::RelayBinary {
+                sender_peer_id,
+                payload,
+            } => {
+                if !relayed_peers.contains(&sender_peer_id) {
+                    // 未在中继名单内的 sender → 安全起见丢弃
+                    log::warn!(
+                        "[net/host] relay binary from non-relayed peer {sender_peer_id}, dropped"
+                    );
+                    continue;
+                }
+                match transport::decode_client_message(&payload) {
+                    Ok(msg) => {
+                        if let Some(handle) = peer_msg_handler.as_mut() {
+                            (**handle)(sender_peer_id, msg);
+                        }
+                    }
+                    Err(e) => log::warn!("[net/host] decode relay msg from {sender_peer_id}: {e}"),
+                }
             }
         }
     }
@@ -582,15 +695,20 @@ fn poll_host(
                 PeerEvent::StateChanged(state) => {
                     if state == PeerState::Connected {
                         session.mark_dc_open();
-                        out.push(RoomEvent::PeerCount(peers.len() as u32));
+                        negotiation_started_ms.remove(&peer_id);
+                        out.push(RoomEvent::PeerCount(
+                            peers.len() as u32 + relayed_peers.len() as u32,
+                        ));
                     } else if matches!(state, PeerState::Disconnected | PeerState::Failed) {
-                        if let Some(pc) = peers.remove(&peer_id) {
-                            pc.close();
+                        // 直连失败 → 不直接 RemoteLeft；尝试升级为中继。
+                        if !relay_requested.contains(&peer_id) && !relayed_peers.contains(&peer_id)
+                        {
+                            log::info!("[net/host] peer {peer_id} state={state:?} → request_relay");
+                            signaling.request_relay(peer_id);
+                            relay_requested.insert(peer_id);
+                            // 注意：不立即 remove peer 或 emit RemoteLeft —
+                            // 等 RelayActive 把 peer 迁到 relayed_peers，或服务端拒绝时再清理。
                         }
-                        pending.remove(&peer_id);
-                        // Phase 5：让 client 端清理 server-side 玩家表
-                        out.push(RoomEvent::RemoteLeft { peer_id });
-                        out.push(RoomEvent::PeerCount(peers.len() as u32));
                     }
                 }
                 PeerEvent::NegotiationError(msg) => {
@@ -601,6 +719,28 @@ fn poll_host(
                 }
             }
         }
+    }
+
+    // 3) 协商超时：未连通且未请求中继的 peer，超过 NEGOTIATION_TIMEOUT_MS 就触发升级
+    let now = now_ms();
+    let timeout_ids: Vec<u32> = negotiation_started_ms
+        .iter()
+        .filter(|(pid, start)| {
+            !relay_requested.contains(*pid)
+                && !relayed_peers.contains(*pid)
+                && peers
+                    .get(*pid)
+                    .is_some_and(|pc| pc.state() != PeerState::Connected)
+                && now - **start > NEGOTIATION_TIMEOUT_MS
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+    for peer_id in timeout_ids {
+        log::info!(
+            "[net/host] peer {peer_id} negotiation timeout {NEGOTIATION_TIMEOUT_MS}ms → request_relay"
+        );
+        signaling.request_relay(peer_id);
+        relay_requested.insert(peer_id);
     }
 }
 
@@ -617,6 +757,7 @@ fn poll_remote(
     session: &mut RoomSession,
     outbox: &mut VecDeque<ClientMessage>,
     inbox: &mut VecDeque<ServerMessage>,
+    relayed_host: &mut Option<u32>,
     out: &mut Vec<RoomEvent>,
 ) {
     // 1) 信令事件
@@ -690,10 +831,68 @@ fn poll_remote(
             SignalingEvent::Closed => {
                 log::info!("[net/remote] signaling socket closed");
             }
+            SignalingEvent::RelayActive { peer_id, .. } => {
+                // 仅接受来自 host 的中继升级通知
+                if Some(peer_id) != *host_peer_id {
+                    log::warn!("[net/remote] relay_active for non-host peer {peer_id}, ignored");
+                    continue;
+                }
+                if relayed_host.is_some() {
+                    continue; // 幂等
+                }
+                // 关闭已建立的（或失败中的）PeerConnection，转入中继模式
+                if let Some(pc) = host.take() {
+                    pc.close();
+                }
+                *relayed_host = Some(peer_id);
+                log::info!("[net/remote] upgraded to relay via host {peer_id}");
+                // 视为已连通：flush outbox
+                session.mark_dc_open();
+                *session = RoomSession::Connected;
+                out.push(RoomEvent::Connected);
+                out.push(RoomEvent::PeerRelayed { peer_id });
+                let drained: Vec<_> = outbox.drain(..).collect();
+                for msg in drained {
+                    match transport::encode_client_message(&msg) {
+                        Ok(bytes) => signaling.send_relay_binary(peer_id, &bytes),
+                        Err(e) => log::warn!("[net/remote] encode (relay flush): {e}"),
+                    }
+                }
+            }
+            SignalingEvent::RelayClosed { peer_id, reason } => {
+                if Some(peer_id) != *host_peer_id {
+                    continue;
+                }
+                log::info!("[net/remote] relay closed by server: {reason}");
+                *relayed_host = None;
+                *session = RoomSession::Disconnected {
+                    reason: reason.clone(),
+                };
+                out.push(RoomEvent::Disconnected { reason });
+            }
+            SignalingEvent::RelayBinary {
+                sender_peer_id,
+                payload,
+            } => {
+                // 仅接受来自 host 且已升级为中继的二进制帧
+                if Some(sender_peer_id) != *host_peer_id || relayed_host.is_none() {
+                    log::warn!(
+                        "[net/remote] unexpected relay binary from {sender_peer_id}, dropped"
+                    );
+                    continue;
+                }
+                match transport::decode_server_message(&payload) {
+                    Ok(msg) => inbox.push_back(msg),
+                    Err(e) => log::warn!("[net/remote] decode relay server msg: {e}"),
+                }
+            }
         }
     }
 
-    // 2) Host PeerConnection 事件
+    // 2) Host PeerConnection 事件（仅在未升级到中继时）
+    if relayed_host.is_some() {
+        return;
+    }
     if let Some(pc) = host.as_ref() {
         for ev in pc.poll() {
             match ev {
@@ -736,12 +935,10 @@ fn poll_remote(
                             }
                         }
                     } else if matches!(state, PeerState::Disconnected | PeerState::Failed) {
-                        *session = RoomSession::Disconnected {
-                            reason: "peer_disconnected".into(),
-                        };
-                        out.push(RoomEvent::Disconnected {
-                            reason: "peer_disconnected".into(),
-                        });
+                        // 直连失败 → 不立刻断开，等 Host 端发起的 RelayActive。
+                        // 若服务端最终拒绝升级（RelayClosed 也未来），UI 仍卡在 Negotiating；
+                        // 现阶段保守处理：保留 PC（已 closed）等服务端通知，不抢先 emit Disconnected。
+                        log::info!("[net/remote] host PC state={state:?}; awaiting relay decision");
                     }
                 }
                 PeerEvent::NegotiationError(msg) => {

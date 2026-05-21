@@ -155,6 +155,10 @@ pub enum SignalingEvent {
     IceReceived { from: PeerId, candidate: String },
     RoomClosed,
     Error(String),
+    // 数据中继 fallback（详见 docs/networking/signaling.md §九）
+    RelayActive { peer_id: PeerId, max_msg_size: u32, max_rate: u32 },
+    RelayClosed { peer_id: PeerId, reason: String },
+    RelayBinary { sender_peer_id: PeerId, payload: Vec<u8> },
 }
 
 impl SignalingClient {
@@ -164,6 +168,9 @@ impl SignalingClient {
     pub fn send_ice(&self, to: PeerId, candidate: &str);
     pub fn poll(&self) -> Vec<SignalingEvent>;
     pub fn close(self);
+    // 中继
+    pub fn request_relay(&self, peer_id: PeerId);            // Host 主动升级
+    pub fn send_relay_binary(&self, target: PeerId, payload: &[u8]);  // 已升级后发字节
 }
 ```
 
