@@ -165,8 +165,7 @@ mod tests {
 
     /// 构造一个常用的透视 + look_at 矩阵（相机在原点向 +Z 看），方便测试投影。
     fn vp_camera_at_origin_looking_to_z() -> Mat4 {
-        let proj =
-            Mat4::perspective_rh(70_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let proj = Mat4::perspective_rh(70_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
         let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::Z, Vec3::Y);
         proj * view
     }
@@ -197,23 +196,14 @@ mod tests {
     #[test]
     fn project_happy_path_origin_target_lands_in_screen_center_ish() {
         // 相机在 (0, 0, -5) 看向原点 → 原点投影必在屏幕中央。
-        let proj =
-            Mat4::perspective_rh(70_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let proj = Mat4::perspective_rh(70_f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
         let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, -5.0), Vec3::ZERO, Vec3::Y);
         let vp = proj * view;
         let p = project_world_to_screen(vp, Vec3::ZERO, SCREEN)
             .expect("origin in front of camera should project");
         // 屏幕中央 ≈ (960, 540)，浮点误差允许 1px。
-        assert!(
-            (p.x - 960.0).abs() < 1.0,
-            "expected ~960, got {}",
-            p.x
-        );
-        assert!(
-            (p.y - 540.0).abs() < 1.0,
-            "expected ~540, got {}",
-            p.y
-        );
+        assert!((p.x - 960.0).abs() < 1.0, "expected ~960, got {}", p.x);
+        assert!((p.y - 540.0).abs() < 1.0, "expected ~540, got {}", p.y);
         // 同时确保整体仍在屏幕范围内（哨兵）。
         assert!(p.x >= 0.0 && p.x <= SCREEN.0);
         assert!(p.y >= 0.0 && p.y <= SCREEN.1);

@@ -40,14 +40,11 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
         .collapsible(false)
         .show(ctx, |ui| {
             // FOV：30°–110°，超广角到长焦的常用范围。
-            ui.add(
-                egui::Slider::new(&mut settings.fov_degrees, 30.0..=110.0).text("FOV (°)"),
-            );
+            ui.add(egui::Slider::new(&mut settings.fov_degrees, 30.0..=110.0).text("FOV (°)"));
 
             // 鼠标灵敏度倍率：1.0 为默认，乘到 BASE_SENSITIVITY_RAD_PER_PIXEL 上。
             ui.add(
-                egui::Slider::new(&mut settings.mouse_sensitivity, 0.1..=5.0)
-                    .text("鼠标灵敏度"),
+                egui::Slider::new(&mut settings.mouse_sensitivity, 0.1..=5.0).text("鼠标灵敏度"),
             );
 
             // 渲染距离：离散选项，使用 ComboBox 而非连续滑条，避免触发频繁的

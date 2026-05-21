@@ -99,8 +99,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.horizontal(|ui| {
                 ui.add_space(120.0);
                 ui.label(
-                    egui::RichText::new("昵称：")
-                        .color(egui::Color32::from_rgb(180, 190, 200)),
+                    egui::RichText::new("昵称：").color(egui::Color32::from_rgb(180, 190, 200)),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut state.display_name)
