@@ -2045,6 +2045,7 @@ dependencies = [
  "js-sys",
  "log",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-wasm",
  "voxweb-core",

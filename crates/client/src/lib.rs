@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod camera;
+pub mod chat;
 pub mod chunk_assembler;
 pub mod chunk_loader;
 pub mod hotbar;
@@ -15,6 +16,7 @@ pub mod mesh_jobs;
 pub mod physics;
 pub mod prediction;
 pub mod raycast;
+pub mod settings_storage;
 pub mod storage;
 pub mod ui;
 
@@ -28,10 +30,14 @@ use web_sys::HtmlCanvasElement;
 
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::Position;
-use voxweb_core::protocol::{ClientMessage, EntityId, PROTOCOL_VERSION, RoomEvent, ServerMessage};
+use voxweb_core::protocol::{
+    ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
+};
 use voxweb_render::Renderer;
 
-use crate::app::{AppState, Game, GameMode, GameSettings, PreloadState, RemotePlayerState};
+use crate::app::{
+    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
+};
 use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
@@ -200,12 +206,18 @@ fn install_event_listeners(
     egui_events: Rc<RefCell<Vec<egui::Event>>>,
     app: Rc<RefCell<App>>,
 ) -> Result<(), JsValue> {
-    // —— 点击 canvas → 请求指针锁（仅在 InGame 时）——
+    // —— 点击 canvas → 请求指针锁（仅在 InGame 且无暂停/聊天叠加层时）——
     {
         let canvas_clone = canvas.clone();
         let app_clone = app.clone();
         let on_click = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::MouseEvent| {
-            if app_clone.borrow().state == AppState::InGame {
+            if matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            ) {
                 canvas_clone.request_pointer_lock();
             }
         });
@@ -241,15 +253,28 @@ fn install_event_listeners(
     }
 
     // —— 键盘 ——
-    // InGame：用 e.code() 映射物理键到 KeyCode 给物理/相机/hotbar；
-    // Lobby/Connecting/...：用 e.key() 转 egui::Event::Text / Event::Key，让 TextEdit 收到输入。
+    // 活跃游戏（InGame 且未暂停未聊天）：用 e.code() 映射物理键到 KeyCode 给物理/相机/hotbar；
+    // 其它状态（Lobby/Connecting/InGame 暂停或聊天聚焦）：用 e.key() 转 egui::Event::Text / Event::Key，
+    // 让 TextEdit 收到输入。
     {
         let input_clone = input.clone();
         let app_clone = app.clone();
         let egui_events_clone = egui_events.clone();
         let on_keydown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
-            if app_clone.borrow().state != AppState::InGame {
+            let forward_to_egui = !matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            );
+            if forward_to_egui {
                 forward_keydown_to_egui(&e, &egui_events_clone);
+                // 注意：即便已转给 egui，依然让 InputState 接到边沿事件（ESC/T 等），
+                // 让主循环能消费这些 edge-trigger 字段切换 paused / chat_open。
+                if let Some(key) = map_key(&e.code()) {
+                    input_clone.borrow_mut().on_key_down(key, now_ms());
+                }
                 return;
             }
             if let Some(key) = map_key(&e.code()) {
@@ -268,8 +293,18 @@ fn install_event_listeners(
         let app_clone = app.clone();
         let egui_events_clone = egui_events.clone();
         let on_keyup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
-            if app_clone.borrow().state != AppState::InGame {
+            let forward_to_egui = !matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            );
+            if forward_to_egui {
                 forward_keyup_to_egui(&e, &egui_events_clone);
+                if let Some(key) = map_key(&e.code()) {
+                    input_clone.borrow_mut().on_key_up(key);
+                }
                 return;
             }
             if let Some(key) = map_key(&e.code()) {
@@ -311,8 +346,14 @@ fn install_event_listeners(
         let app_clone = app.clone();
         let on_mousedown = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             // 防止右键弹出浏览器上下文菜单（仅在 InGame 锁定指针时）
-            let is_ingame = app_clone.borrow().state == AppState::InGame;
-            if is_ingame {
+            let is_ingame_active = matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            );
+            if is_ingame_active {
                 input_clone.borrow_mut().on_mouse_down(e.button() as u16);
                 if e.button() == 2 {
                     e.prevent_default();
@@ -339,8 +380,14 @@ fn install_event_listeners(
         let egui_events_clone = egui_events.clone();
         let app_clone = app.clone();
         let on_mouseup = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            let is_ingame = app_clone.borrow().state == AppState::InGame;
-            if is_ingame {
+            let is_ingame_active = matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            );
+            if is_ingame_active {
                 input_clone.borrow_mut().on_mouse_up(e.button() as u16);
             } else if let Some(button) = map_pointer_button(e.button()) {
                 egui_events_clone
@@ -362,7 +409,13 @@ fn install_event_listeners(
     {
         let app_clone = app.clone();
         let on_contextmenu = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            if app_clone.borrow().state == AppState::InGame {
+            if matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            ) {
                 e.prevent_default();
             }
         });
@@ -525,9 +578,12 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
     // 按 state 分流
     let state = app.borrow().state.clone();
     match state {
-        AppState::InGame => render_game_frame(app, dt, cw, ch),
+        AppState::InGame { paused, chat_open } => {
+            render_game_frame(app, dt, cw, ch, paused, chat_open)
+        }
         AppState::Connecting => render_connecting_frame(app, cw, ch),
-        // Loading / Lobby / Disconnected / EscMenu / ChatOpen 暂时全部走大厅
+        AppState::Disconnected => render_disconnected_frame(app, cw, ch),
+        // Loading / Lobby 走大厅
         _ => render_lobby_frame(app, cw, ch),
     }
 }
@@ -582,10 +638,14 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
 
     // —— 处理动作 ——
     match action {
-        Some(LobbyAction::StartSinglePlayer { seed }) => {
-            start_single_player(app, seed);
+        Some(LobbyAction::StartSinglePlayer { seed, display_name }) => {
+            start_single_player(app, seed, &display_name);
         }
-        Some(LobbyAction::CreateRoom { room_id, seed }) => {
+        Some(LobbyAction::CreateRoom {
+            room_id,
+            seed,
+            display_name,
+        }) => {
             // 空房间号 → 自动生成 6 位
             let final_room = if room_id.is_empty() {
                 let g = generate_room_id();
@@ -610,15 +670,18 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                 }
             };
-            start_host(app, &final_room, seed);
+            start_host(app, &final_room, seed, &display_name);
         }
-        Some(LobbyAction::JoinRoom { room_id }) => {
+        Some(LobbyAction::JoinRoom {
+            room_id,
+            display_name,
+        }) => {
             // validate_room_id 已在 UI 内做过；这里再保底
             if let Err(e) = validate_room_id(&room_id) {
                 app.borrow_mut().lobby_state.error_message = Some(e);
                 return Ok(());
             }
-            start_remote(app, &room_id);
+            start_remote(app, &room_id, &display_name);
         }
         None => {}
     }
@@ -715,12 +778,12 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     Ok(())
 }
 
-fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>) {
+fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>, display_name: &str) {
     let seed = seed.unwrap_or_else(random_seed);
-    log::info!("启动单机游戏，seed = {seed}");
+    log::info!("启动单机游戏，seed = {seed}, display_name = {display_name}");
 
-    let settings = GameSettings::default();
-    let mut game = Game::new_local(seed, settings, "Player");
+    let settings = settings_storage::load().unwrap_or_default();
+    let mut game = Game::new_local(seed, settings, display_name);
 
     // 相机 yaw/pitch 用默认值（physics 驱动 position）
     game.camera.position = game.physics.eye_position();
@@ -807,7 +870,7 @@ fn set_room_in_url(room_id: &str) {
     let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
 }
 
-fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
+fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_name: &str) {
     let seed = seed.unwrap_or_else(random_seed);
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
@@ -815,11 +878,10 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
         );
         return;
     };
-    log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}");
+    log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}, name={display_name}");
 
-    let settings = GameSettings::default();
-    let display = "Host".to_string();
-    let game_result = Game::new_host(seed, settings, &url, room_id, &display);
+    let settings = settings_storage::load().unwrap_or_default();
+    let game_result = Game::new_host(seed, settings, &url, room_id, display_name);
     let mut a = app.borrow_mut();
     match game_result {
         Ok(mut game) => {
@@ -842,17 +904,17 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>) {
     }
 }
 
-fn start_remote(app: &Rc<RefCell<App>>, room_id: &str) {
+fn start_remote(app: &Rc<RefCell<App>>, room_id: &str, display_name: &str) {
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
             "未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into(),
         );
         return;
     };
-    log::info!("启动 Remote：room={room_id}, signaling={url}");
+    log::info!("启动 Remote：room={room_id}, signaling={url}, name={display_name}");
 
-    let settings = GameSettings::default();
-    let display = "Player".to_string();
+    let settings = settings_storage::load().unwrap_or_default();
+    let display = display_name.to_string();
     let game_result = Game::new_remote(settings, &url, room_id, &display);
     let mut a = app.borrow_mut();
     match game_result {
@@ -962,7 +1024,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
             // 完成条件：所有区块已接收 且 网格化队列为空（空 chunk 已被处理但不上传 mesh）
             if received >= preload.total && game.mesh_jobs.is_empty() {
                 preload.active = false;
-                *state = AppState::InGame;
+                *state = AppState::ingame_default();
                 *request_pointer_lock_next = true;
                 log::info!(
                     "[preload] 区块预载完成 (received={received} meshed={meshed} total={}) → InGame",
@@ -1146,6 +1208,48 @@ fn paint_egui_only(
     surface_texture.present();
 }
 
+// ============================================================
+// Disconnected 帧（Phase 6）
+// ============================================================
+
+/// 已断开连接页面：模型上和 Lobby 一样，纯 egui + 暗色清屏，没有 wgpu world pass。
+/// 用户点击"返回大厅"后切回 [`AppState::Lobby`] 并清掉 [`App::disconnect_reason`]。
+fn render_disconnected_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), String> {
+    let reason = app.borrow().disconnect_reason.clone().unwrap_or_default();
+
+    // —— 跑 egui ——
+    let (action, paint_jobs, pixels_per_point, textures_delta) = {
+        let a = app.borrow_mut();
+        let events: Vec<egui::Event> = std::mem::take(&mut *a.egui_events.borrow_mut());
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(cw as f32, ch as f32),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut act = ui::disconnected::DisconnectedAction::None;
+        let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
+            act = ui::disconnected::draw_disconnected(ui.ctx(), &reason);
+        });
+        let ppp = full_output.pixels_per_point;
+        let jobs = a.egui_ctx.tessellate(full_output.shapes, ppp);
+        (act, jobs, ppp, full_output.textures_delta)
+    };
+
+    if matches!(action, ui::disconnected::DisconnectedAction::BackToLobby) {
+        let mut a = app.borrow_mut();
+        a.state = AppState::Lobby;
+        a.disconnect_reason = None;
+        a.connecting_error = None;
+        return Ok(());
+    }
+
+    paint_egui_only(app, paint_jobs, pixels_per_point, textures_delta, cw, ch);
+    Ok(())
+}
+
 /// 推进 Game.net 状态机：每帧调用一次。
 /// 在 Host 模式下注入闭包处理 peer 来的 ClientMessage：
 /// - Hello → 校验版本 → `server.add_player(...)` → 记录 (peer_id, eid) 待 poll 返回后注册
@@ -1289,7 +1393,7 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
                     log::info!("[net] Connected → 开始区块预载 (total={total})");
                 } else {
                     // 无 game（不应发生），直接进 InGame 兜底
-                    a.state = AppState::InGame;
+                    a.state = AppState::ingame_default();
                     a.request_pointer_lock_next = true;
                 }
             }
@@ -1300,8 +1404,8 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             a.connecting_error = Some(reason);
             a.preload_state = None;
             a.relayed_peers.clear();
-            // 在 Connecting / InGame 都直接回大厅
-            a.state = AppState::Lobby;
+            // Phase 6：Connecting / InGame 失联都跳到 Disconnected 页让用户看到原因
+            a.state = AppState::Disconnected;
             a.game = None;
         }
         RoomEvent::RemoteLeft { peer_id } => {
@@ -1332,7 +1436,14 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
 // InGame 帧
 // ============================================================
 
-fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
+fn render_game_frame(
+    app: &Rc<RefCell<App>>,
+    dt: f32,
+    cw: u32,
+    ch: u32,
+    paused: bool,
+    chat_open: bool,
+) -> Result<(), String> {
     // —— 0. 推进网络状态机（Host/Remote 协商 + Pong 处理） ——
     poll_net(app);
 
@@ -1405,6 +1516,14 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
     }
 
     // —— 3. 输入 → 相机朝向 + 物理 + 动作 ——
+    // Phase 6：当 paused / chat_open 任一为 true 时，本帧用 neutral 输入跑物理（重力继续生效），
+    //          但不读取鼠标转向、hotbar、挖放等输入；同时消费 input.esc_menu / chat_open 边沿
+    //          切换叠加层状态。最终把更新后的 (paused, chat_open) 写回 app.state。
+    let mut next_paused = paused;
+    let mut next_chat_open = chat_open;
+    let mut request_pointer_lock_after = false;
+    let mut request_exit_pointer_lock = false;
+
     let (camera_pos, view_proj, fps_display, mesh_budget, current_hit_pos) = {
         let mut a = app.borrow_mut();
         let fps_display = a.fps_display;
@@ -1416,33 +1535,56 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
 
         let mut input = input_rc.borrow_mut();
 
-        // 鼠标转向
-        if input.pointer_locked && (input.mouse_dx != 0.0 || input.mouse_dy != 0.0) {
+        // —— Phase 6：ESC / T 边沿优先消费，切换叠加层 ——
+        // ESC 优先级：聊天 > 暂停 > 进入暂停
+        if input.esc_menu {
+            if next_chat_open {
+                next_chat_open = false;
+                game.chat.input_buffer.clear();
+                request_pointer_lock_after = true;
+            } else if next_paused {
+                next_paused = false;
+                request_pointer_lock_after = true;
+            } else {
+                next_paused = true;
+                request_exit_pointer_lock = true;
+            }
+        }
+        // T 仅在无叠加层时打开聊天
+        if input.chat_open && !next_paused && !next_chat_open {
+            next_chat_open = true;
+            request_exit_pointer_lock = true;
+        }
+
+        // 是否仍处于"活跃游戏"（用本帧消费 ESC / T 之后的值判定）
+        let active_play = !next_paused && !next_chat_open;
+
+        // 鼠标转向（仅活跃游戏时消费）
+        if active_play && input.pointer_locked && (input.mouse_dx != 0.0 || input.mouse_dy != 0.0) {
             game.camera.apply_mouse(
                 input.mouse_dx,
                 input.mouse_dy,
-                game.settings.mouse_sensitivity,
+                game.settings.mouse_sensitivity * BASE_SENSITIVITY_RAD_PER_PIXEL,
             );
         }
 
-        // Hotbar 切换
-        if let Some(idx) = input.hotbar_request.take() {
+        // Hotbar 切换（仅活跃游戏）
+        if active_play && let Some(idx) = input.hotbar_request.take() {
             game.hotbar.select(idx);
         }
 
-        // 双击空格切换 Fly/Walk
-        if input.fly_toggle_pending {
+        // 双击空格切换 Fly/Walk（仅活跃游戏）
+        if active_play && input.fly_toggle_pending {
             game.physics.toggle_mode();
             log::info!("模式切换 → {:?}", game.physics.mode);
         }
 
-        // 物理 step（指针锁定状态下才接受 WASD 输入；否则只跑重力）
+        // 物理 step：活跃 + 锁定 → 真实输入；否则 neutral（仅跑重力）
         let world_ref = game.server.clone();
         {
             let server_borrow = world_ref.borrow();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
-            // 不锁定时不接受方向输入，避免后台移动；但仍然跑物理（让重力工作）
-            if input.pointer_locked {
+            if active_play && input.pointer_locked {
                 game.physics.step(&getter, &game.camera, &input, dt);
             } else {
                 let neutral = neutral_input(&input);
@@ -1494,8 +1636,8 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
         };
         game.current_hit = hit;
 
-        // 挖放动作（仅在指针锁定时启用，防止 lobby/UI 误触）
-        if input.pointer_locked {
+        // 挖放动作（仅在活跃游戏 + 指针锁定时启用）
+        if active_play && input.pointer_locked {
             dispatch_actions(game, &input);
         }
 
@@ -1544,10 +1686,13 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
             .run_until_budget(mesh_budget, &server_borrow, renderer, &now_ms);
     }
 
-    // —— 7. egui HUD ——
+    // —— 7. egui HUD（Phase 6：含玩家列表 / 名牌 / 聊天浮窗 / 聊天框 / 暂停菜单） ——
     let pointer_locked = app.borrow().input.borrow().pointer_locked;
+    // 本帧 egui 内可能触发的动作
+    let mut chat_submission: Option<String> = None;
+    let mut pause_exit_to_lobby = false;
     let (paint_jobs, pixels_per_point, textures_delta) = {
-        let a = app.borrow();
+        let mut a = app.borrow_mut();
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1555,46 +1700,193 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
             )),
             ..Default::default()
         };
-        let game = a.game.as_ref();
-        let yaw_deg = game.map(|g| g.camera.yaw.to_degrees()).unwrap_or(0.0);
-        let pitch_deg = game.map(|g| g.camera.pitch.to_degrees()).unwrap_or(0.0);
-        let pos = game.map(|g| g.camera.position).unwrap_or_default();
-        let loaded_chunks = game.map(|g| g.chunk_loader.loaded.len()).unwrap_or(0);
-        let mesh_pending = game.map(|g| g.mesh_jobs.len()).unwrap_or(0);
-        let phys_mode = game.map(|g| g.physics.mode).unwrap_or(CameraMode::Walk);
-        let on_ground = game.map(|g| g.physics.on_ground).unwrap_or(false);
-        let hotbar_items = game.map(|g| g.hotbar.items).unwrap_or([BlockID::AIR; 9]);
-        let hotbar_selected = game.map(|g| g.hotbar.selected).unwrap_or(0);
-        let game_mode = game.map(|g| g.mode).unwrap_or(GameMode::Local);
-        let rtt_ms = game.and_then(|g| g.rtt_ms);
-        let room_id = game.map(|g| g.room_id.clone()).unwrap_or_default();
-        let relayed_peer_count = a.relayed_peers.len();
-        let full_output = a.egui_ctx.run_ui(raw_input, |ui| {
-            draw_hud(
-                ui.ctx(),
-                HudData {
-                    fps: fps_display,
-                    pos: (pos.x, pos.y, pos.z),
-                    yaw_deg,
-                    pitch_deg,
-                    pointer_locked,
-                    loaded_chunks,
-                    mesh_pending,
-                    mode: phys_mode,
-                    on_ground,
-                    hotbar_items,
-                    hotbar_selected,
-                    game_mode,
-                    rtt_ms,
-                    room_id: room_id.clone(),
-                    relayed_peer_count,
-                },
-            );
+        // 提前抓出本帧 HUD 用的只读快照（避免后续 closure 内对 game 同时持有可变和不可变借用）
+        let hud_data = a.game.as_ref().map(|g| HudData {
+            fps: fps_display,
+            pos: (
+                g.camera.position.x,
+                g.camera.position.y,
+                g.camera.position.z,
+            ),
+            yaw_deg: g.camera.yaw.to_degrees(),
+            pitch_deg: g.camera.pitch.to_degrees(),
+            pointer_locked,
+            loaded_chunks: g.chunk_loader.loaded.len(),
+            mesh_pending: g.mesh_jobs.len(),
+            mode: g.physics.mode,
+            on_ground: g.physics.on_ground,
+            hotbar_items: g.hotbar.items,
+            hotbar_selected: g.hotbar.selected,
+            game_mode: g.mode,
+            rtt_ms: g.rtt_ms,
+            room_id: g.room_id.clone(),
+            relayed_peer_count: a.relayed_peers.len(),
+            show_stats: g.settings.show_stats,
         });
+        // 装配 PlayerListEntry：自己（is_me=true）+ 远端，按 entity_id 升序
+        let player_list_entries: Vec<ui::players::PlayerListEntry> =
+            if let Some(g) = a.game.as_ref() {
+                let mut v: Vec<ui::players::PlayerListEntry> =
+                    Vec::with_capacity(g.remote_players.len() + 1);
+                v.push(ui::players::PlayerListEntry {
+                    entity_id: g.entity_id,
+                    display_name: g.display_name.clone(),
+                    color_rgb: crate::app::entity_color(g.entity_id),
+                    is_host: g.entity_id == g.host_entity_id,
+                    is_me: true,
+                });
+                for (eid, rp) in &g.remote_players {
+                    v.push(ui::players::PlayerListEntry {
+                        entity_id: *eid,
+                        display_name: rp.display_name.clone(),
+                        color_rgb: rp.color_rgb,
+                        is_host: *eid == g.host_entity_id,
+                        is_me: false,
+                    });
+                }
+                v.sort_by_key(|e| e.entity_id);
+                v
+            } else {
+                Vec::new()
+            };
+        // 装配名牌：从 interp 拿当前 render-target 时刻的位置；自己不画
+        let now_local = now_ms();
+        let mut nameplate_entries: Vec<ui::players::NameplateEntry> = Vec::new();
+        let mut view_proj_for_np = glam::Mat4::IDENTITY;
+        if let Some(g) = a.game.as_mut() {
+            view_proj_for_np = g.camera.vp_matrix();
+            let render_target = now_local + g.server_clock_offset_ms as f64 - g.interp.delay_ms;
+            let cam_pos = g.camera.position;
+            let eids: Vec<EntityId> = g.interp.ids().collect();
+            for eid in eids {
+                if eid == g.entity_id {
+                    continue;
+                }
+                let Some((pos, _yaw, _pitch)) = g.interp.advance(eid, render_target) else {
+                    continue;
+                };
+                let dist = (pos - cam_pos).length();
+                let name = g
+                    .remote_players
+                    .get(&eid)
+                    .map(|r| r.display_name.clone())
+                    .unwrap_or_else(|| format!("Player {eid}"));
+                nameplate_entries.push(ui::players::NameplateEntry {
+                    world_position: pos,
+                    display_name: name,
+                    distance: dist,
+                });
+            }
+        }
+
+        // —— 跑 egui：在同一 ctx.run 内绘制 HUD + 玩家列表 + 名牌 + 聊天浮窗 + 聊天框 + 暂停菜单 ——
+        let App {
+            ref egui_ctx,
+            ref mut game,
+            ..
+        } = *a;
+        let mut chat_action_local = ui::chat::ChatUiAction::None;
+        let mut pause_action_local = ui::pause::PauseAction::None;
+        let mut pause_settings_changed = false;
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let ctx = ui.ctx();
+            // 1) HUD（左上角统计面板受 hud.show_stats 开关控制；准星 / hotbar / 提示栏照常）
+            if let Some(hud) = hud_data.as_ref() {
+                draw_hud(ctx, hud.clone());
+            }
+            // 2) 玩家列表
+            ui::players::draw_player_list(ctx, &player_list_entries);
+            // 3) 远端玩家名牌
+            ui::players::draw_nameplates(ctx, &nameplate_entries, view_proj_for_np);
+            // 4) 聊天最近消息浮窗（不论叠加层都显示）
+            if let Some(g) = game.as_ref() {
+                ui::chat::draw_recent_overlay(ctx, &g.chat, now_local);
+            }
+            // 5) 聊天输入框（仅 chat_open）
+            if next_chat_open && let Some(g) = game.as_mut() {
+                chat_action_local = ui::chat::draw_chat_window(ctx, &mut g.chat);
+            }
+            // 6) 暂停菜单（仅 paused）
+            if next_paused && let Some(g) = game.as_mut() {
+                // 复制一份 settings 比较，避免 egui closure 内反复 mut/immutable 借用
+                let working_before = g.settings.clone();
+                pause_action_local = ui::pause::draw_pause_menu(ctx, &mut g.settings);
+                if g.settings != working_before {
+                    pause_settings_changed = true;
+                }
+            }
+        });
+
+        // 处理聊天动作
+        match chat_action_local {
+            ui::chat::ChatUiAction::Submit(content) => {
+                chat_submission = Some(content);
+                next_chat_open = false;
+                request_pointer_lock_after = true;
+            }
+            ui::chat::ChatUiAction::Cancel => {
+                next_chat_open = false;
+                request_pointer_lock_after = true;
+            }
+            ui::chat::ChatUiAction::None => {}
+        }
+        // 处理暂停菜单：设置变更 → 应用；按钮 → 设置返回 flag
+        if pause_settings_changed && let Some(g) = a.game.as_mut() {
+            g.apply_settings();
+        }
+        match pause_action_local {
+            ui::pause::PauseAction::Resume => {
+                if let Some(g) = a.game.as_ref() {
+                    settings_storage::save(&g.settings);
+                }
+                next_paused = false;
+                request_pointer_lock_after = true;
+            }
+            ui::pause::PauseAction::ExitToLobby => {
+                if let Some(g) = a.game.as_ref() {
+                    settings_storage::save(&g.settings);
+                }
+                pause_exit_to_lobby = true;
+            }
+            ui::pause::PauseAction::None => {}
+        }
+
         let ppp = full_output.pixels_per_point;
         let jobs = a.egui_ctx.tessellate(full_output.shapes, ppp);
         (jobs, ppp, full_output.textures_delta)
     };
+
+    // —— 7b. 聊天发送 / 暂停菜单 ExitToLobby 副作用 ——
+    if let Some(content) = chat_submission {
+        let mut a = app.borrow_mut();
+        if let Some(g) = a.game.as_mut() {
+            send_chat(g, content);
+        }
+    }
+    if pause_exit_to_lobby {
+        let mut a = app.borrow_mut();
+        a.game = None;
+        a.state = AppState::Lobby;
+        a.disconnect_reason = None;
+        a.preload_state = None;
+        return Ok(());
+    }
+
+    // 把 paused / chat_open 写回 AppState
+    {
+        let mut a = app.borrow_mut();
+        a.state = AppState::InGame {
+            paused: next_paused,
+            chat_open: next_chat_open,
+        };
+        if request_exit_pointer_lock && let Some(doc) = web_sys::window().and_then(|w| w.document())
+        {
+            doc.exit_pointer_lock();
+        }
+        if request_pointer_lock_after {
+            a.request_pointer_lock_next = true;
+        }
+    }
 
     // —— 8. 渲染 + present ——
     {
@@ -1790,15 +2082,48 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
     }
 }
 
+/// Phase 6：发送一条聊天消息。
+///
+/// 走和其它客户端→服务端消息（Break / Place / Ping）一致的 [`NetEndpoint::send_client_message`] 路径：
+/// - **Local-Only**：消息经内部 mpsc 进入 server_inbox，下一帧的 `handle_message` 把内容回灌成
+///   `ServerMessage::Chat` 广播到自己（也会进入 `apply_server_message` 推到 `game.chat`）。
+/// - **Host**：本地 server 直接处理 + 广播（自身 mpsc + DC），表现一致。
+/// - **Remote**：通过 reliable DC 发到 Host；Host 广播回包含自己。
+///
+/// 不在本地直接 push 消息，避免和服务端广播的回灌重复出现。
+fn send_chat(game: &mut Game, content: String) {
+    game.net
+        .send_client_message(ClientMessage::Chat { content });
+}
+
 fn apply_server_message(game: &mut Game, msg: ServerMessage) {
     match msg {
         ServerMessage::Welcome {
             entity_id,
             world_seed,
+            host_entity_id,
+            players,
             ..
         } => {
             game.entity_id = entity_id;
-            log::info!("Welcome: entity_id={entity_id}, seed={world_seed}");
+            game.host_entity_id = host_entity_id;
+            log::info!(
+                "Welcome v2: entity_id={entity_id}, seed={world_seed}, host={host_entity_id}, roster_size={}",
+                players.len()
+            );
+            // 写入 roster：除自己以外的玩家进入 remote_players
+            for PlayerEntry {
+                entity_id: ex_eid,
+                display_name,
+            } in players
+            {
+                if ex_eid == entity_id {
+                    continue;
+                }
+                game.remote_players
+                    .entry(ex_eid)
+                    .or_insert_with(|| RemotePlayerState::new(display_name.clone(), ex_eid));
+            }
             // Remote：清掉本地占位生成的 chunks（Phase 4 用 seed=0 生成了一个空世界），
             // 后续 ChunkSnapshot 逐个填充 Host 的真实世界。
             if game.mode == GameMode::Remote {
@@ -1902,15 +2227,32 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             // 排查重复加入（信令层理论上不应重复，但防御不 panic）
             game.remote_players
                 .entry(entity_id)
-                .or_insert_with(|| RemotePlayerState::new(display_name, entity_id));
+                .or_insert_with(|| RemotePlayerState::new(display_name.clone(), entity_id));
+            game.chat
+                .push_system(format!("{display_name} 加入了房间"), now_ms());
         }
         ServerMessage::PeerLeft { entity_id } => {
+            // 在 remove 之前先取一下名字，PeerLeft 系统消息才能拿到原名
+            let name = game
+                .remote_players
+                .get(&entity_id)
+                .map(|r| r.display_name.clone())
+                .unwrap_or_else(|| format!("Player {entity_id}"));
+            game.chat
+                .push_system(format!("{name} 离开了房间"), now_ms());
             game.remote_players.remove(&entity_id);
             game.interp.remove(entity_id);
         }
         ServerMessage::Chat { from, content } => {
-            // Phase 5 只打 log；Phase 6 接入聊天 UI
-            log::info!("[chat] {from}: {content}");
+            let name = if from == game.entity_id {
+                game.display_name.clone()
+            } else {
+                game.remote_players
+                    .get(&from)
+                    .map(|r| r.display_name.clone())
+                    .unwrap_or_else(|| format!("Player {from}"))
+            };
+            game.chat.push_user(from, name, content, now_ms());
         }
         ServerMessage::Pong {
             client_time_ms,
@@ -1928,6 +2270,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
 // HUD（egui）
 // ============================================================
 
+#[derive(Clone)]
 struct HudData {
     fps: f32,
     pos: (f32, f32, f32),
@@ -1946,79 +2289,83 @@ struct HudData {
     room_id: String,
     /// 当前走信令 Worker 中继的 peer 数。> 0 时 HUD 显示「RELAY n」徽标。
     relayed_peer_count: usize,
+    /// Phase 6：[`AppSettings::show_stats`] 透传。false 时跳过左上角统计面板（保留准星 / hotbar）。
+    show_stats: bool,
 }
 
 fn draw_hud(ctx: &egui::Context, data: HudData) {
-    // 左上角 stat
-    egui::Area::new(egui::Id::new("hud_topleft"))
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
-        .show(ctx, |ui| {
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 230, 235),
-                        format!("FPS  {:>5.1}", data.fps),
-                    );
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 230, 235),
-                        format!(
-                            "POS  x {:+8.2}  y {:+8.2}  z {:+8.2}",
-                            data.pos.0, data.pos.1, data.pos.2
-                        ),
-                    );
-                    ui.colored_label(
-                        egui::Color32::from_rgb(180, 190, 200),
-                        format!("YAW {:+6.1}°  PITCH {:+5.1}°", data.yaw_deg, data.pitch_deg),
-                    );
-                    let mode_str = match data.mode {
-                        CameraMode::Walk => "Walk",
-                        CameraMode::Fly => "Fly",
-                    };
-                    ui.colored_label(
-                        egui::Color32::from_rgb(180, 200, 180),
-                        format!(
-                            "MODE {}  {}",
-                            mode_str,
-                            if data.on_ground { "[ground]" } else { "" }
-                        ),
-                    );
-                    ui.colored_label(
-                        egui::Color32::from_rgb(160, 175, 190),
-                        format!(
-                            "CHUNKS {}  MESH_Q {}",
-                            data.loaded_chunks, data.mesh_pending
-                        ),
-                    );
-                    // Phase 4：网络模式 + RTT + 房间号
-                    let mode_str = match data.game_mode {
-                        GameMode::Local => "LOCAL",
-                        GameMode::Host => "HOST",
-                        GameMode::Remote => "REMOTE",
-                    };
-                    let rtt_str = match data.rtt_ms {
-                        Some(rtt) => format!("{rtt:>5.1} ms"),
-                        None => "  --  ".to_string(),
-                    };
-                    let room_str = if data.room_id.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ROOM {}", data.room_id)
-                    };
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 200, 160),
-                        format!("NET {mode_str}  RTT {rtt_str}{room_str}"),
-                    );
-                    if data.relayed_peer_count > 0 {
-                        // 醒目橙色：表示当前有 peer 走信令 Worker 中继
+    // 左上角 stat（show_stats 关闭时跳过；准星 / hotbar / 提示栏照常显示）
+    if data.show_stats {
+        egui::Area::new(egui::Id::new("hud_topleft"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
                         ui.colored_label(
-                            egui::Color32::from_rgb(240, 165, 80),
-                            format!("RELAY {} peer(s) (中继中)", data.relayed_peer_count),
+                            egui::Color32::from_rgb(220, 230, 235),
+                            format!("FPS  {:>5.1}", data.fps),
                         );
-                    }
-                });
-        });
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 230, 235),
+                            format!(
+                                "POS  x {:+8.2}  y {:+8.2}  z {:+8.2}",
+                                data.pos.0, data.pos.1, data.pos.2
+                            ),
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(180, 190, 200),
+                            format!("YAW {:+6.1}°  PITCH {:+5.1}°", data.yaw_deg, data.pitch_deg),
+                        );
+                        let mode_str = match data.mode {
+                            CameraMode::Walk => "Walk",
+                            CameraMode::Fly => "Fly",
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(180, 200, 180),
+                            format!(
+                                "MODE {}  {}",
+                                mode_str,
+                                if data.on_ground { "[ground]" } else { "" }
+                            ),
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(160, 175, 190),
+                            format!(
+                                "CHUNKS {}  MESH_Q {}",
+                                data.loaded_chunks, data.mesh_pending
+                            ),
+                        );
+                        // Phase 4：网络模式 + RTT + 房间号
+                        let mode_str = match data.game_mode {
+                            GameMode::Local => "LOCAL",
+                            GameMode::Host => "HOST",
+                            GameMode::Remote => "REMOTE",
+                        };
+                        let rtt_str = match data.rtt_ms {
+                            Some(rtt) => format!("{rtt:>5.1} ms"),
+                            None => "  --  ".to_string(),
+                        };
+                        let room_str = if data.room_id.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ROOM {}", data.room_id)
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 200, 160),
+                            format!("NET {mode_str}  RTT {rtt_str}{room_str}"),
+                        );
+                        if data.relayed_peer_count > 0 {
+                            // 醒目橙色：表示当前有 peer 走信令 Worker 中继
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 165, 80),
+                                format!("RELAY {} peer(s) (中继中)", data.relayed_peer_count),
+                            );
+                        }
+                    });
+            });
+    }
 
     // 准星
     egui::Area::new(egui::Id::new("hud_crosshair"))

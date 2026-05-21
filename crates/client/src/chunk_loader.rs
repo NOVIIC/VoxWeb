@@ -36,6 +36,16 @@ impl ChunkLoader {
         self.last_center = None;
     }
 
+    /// Phase 6：暂停菜单设置渲染距离后同步生效。
+    /// 调用此方法后 [`ChunkLoader::update`] 会在下一帧重算 desired 集合。
+    pub fn set_render_distance(&mut self, render_distance: u32) {
+        let new_r = render_distance as i32;
+        if self.render_distance != new_r {
+            self.render_distance = new_r;
+            self.invalidate();
+        }
+    }
+
     /// 根据相机位置同步加载集合。返回是否有变更（供调试 / 性能 stat）。
     pub fn update(
         &mut self,

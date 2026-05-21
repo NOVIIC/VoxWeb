@@ -8,14 +8,27 @@ use crate::app::GameMode;
 use voxweb_net::{LoadingStep, StepStatus};
 
 /// 大厅按钮触发的动作。lib.rs 主循环消费。
+///
+/// Phase 6：所有进入游戏的动作都额外携带 `display_name`，从大厅顶部的昵称输入框抓取，
+/// 经修剪后若为空则在主循环里回退为 "Player"。
 #[derive(Clone, Debug)]
 pub enum LobbyAction {
     /// 用户点了"单机模式"。seed 为 None 则随机生成。
-    StartSinglePlayer { seed: Option<u64> },
+    StartSinglePlayer {
+        seed: Option<u64>,
+        display_name: String,
+    },
     /// 用户点了"创建房间"。`room_id` 空时主循环自动生成 6 位随机字符。
-    CreateRoom { room_id: String, seed: Option<u64> },
+    CreateRoom {
+        room_id: String,
+        seed: Option<u64>,
+        display_name: String,
+    },
     /// 用户点了"加入房间"。
-    JoinRoom { room_id: String },
+    JoinRoom {
+        room_id: String,
+        display_name: String,
+    },
 }
 
 /// Connecting 视图触发的动作。
@@ -26,14 +39,37 @@ pub enum ConnectingAction {
 }
 
 /// 大厅 UI 持久状态（输入框文本等）。
-#[derive(Default)]
 pub struct LobbyState {
+    /// Phase 6：玩家昵称输入框。默认 "Player"，进入游戏时若 trim 后为空则回退为 "Player"。
+    pub display_name: String,
     pub seed_input: String,
     pub room_id_input: String,
     /// 简单错误提示（join 时校验失败、create 时空字段自动生成的回填等）。
     pub error_message: Option<String>,
     /// info 区显示的最近一次自动生成的房间号（让用户能记住分享）。
     pub last_generated_room: Option<String>,
+}
+
+impl Default for LobbyState {
+    fn default() -> Self {
+        Self {
+            display_name: "Player".to_string(),
+            seed_input: String::new(),
+            room_id_input: String::new(),
+            error_message: None,
+            last_generated_room: None,
+        }
+    }
+}
+
+/// 从输入框抓取昵称，trim 后若为空则回退到 "Player"。
+fn resolve_display_name(state: &LobbyState) -> String {
+    let trimmed = state.display_name.trim();
+    if trimmed.is_empty() {
+        "Player".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// 绘制大厅 UI。返回触发的动作（点击按钮时）。
@@ -58,6 +94,23 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
 
             ui.add_space(40.0);
 
+            // —— 昵称输入（Phase 6）——
+            // 放在所有进入游戏按钮上方，让用户先确定身份再选模式。
+            ui.horizontal(|ui| {
+                ui.add_space(120.0);
+                ui.label(
+                    egui::RichText::new("昵称：")
+                        .color(egui::Color32::from_rgb(180, 190, 200)),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.display_name)
+                        .desired_width(220.0)
+                        .hint_text("Player"),
+                );
+            });
+
+            ui.add_space(12.0);
+
             // —— 单机模式按钮 ——
             let btn = egui::Button::new(
                 egui::RichText::new("Single Player")
@@ -68,7 +121,8 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             .fill(egui::Color32::from_rgb(60, 90, 120));
             if ui.add(btn).clicked() {
                 let seed = parse_seed(&state.seed_input);
-                action = Some(LobbyAction::StartSinglePlayer { seed });
+                let display_name = resolve_display_name(state);
+                action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
             }
 
             ui.add_space(20.0);
@@ -101,8 +155,13 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                 if ui.add(create).clicked() {
                     let room_id = state.room_id_input.trim().to_string();
                     let seed = parse_seed(&state.seed_input);
+                    let display_name = resolve_display_name(state);
                     state.error_message = None;
-                    action = Some(LobbyAction::CreateRoom { room_id, seed });
+                    action = Some(LobbyAction::CreateRoom {
+                        room_id,
+                        seed,
+                        display_name,
+                    });
                 }
                 let join = egui::Button::new(
                     egui::RichText::new("Join Room")
@@ -116,8 +175,12 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     if let Err(msg) = validate_room_id(&room_id) {
                         state.error_message = Some(msg);
                     } else {
+                        let display_name = resolve_display_name(state);
                         state.error_message = None;
-                        action = Some(LobbyAction::JoinRoom { room_id });
+                        action = Some(LobbyAction::JoinRoom {
+                            room_id,
+                            display_name,
+                        });
                     }
                 }
             });

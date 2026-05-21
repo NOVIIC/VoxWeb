@@ -114,15 +114,19 @@ pub async fn start() -> Result<(), JsValue> {
 
 ```rust
 pub enum AppState {
-    Loading,            // [Phase 0+] 初始占位，实际未使用
-    Lobby,              // [Phase 2+] 大厅
-    Connecting,         // [Phase 4+] 网络协商 + 区块预载
-    InGame,             // [Phase 2+] 游戏中
-    EscMenu,            // [Phase 6]
-    ChatOpen,           // [Phase 6]
-    Disconnected,       // [Phase 4+]
+    Loading,                                      // [Phase 0+] 初始占位，实际未使用
+    Lobby,                                        // [Phase 2+] 大厅
+    Connecting,                                   // [Phase 4+] 网络协商 + 区块预载
+    InGame { paused: bool, chat_open: bool },     // [Phase 6+] 游戏中（可叠加暂停 / 聊天）
+    Disconnected,                                 // [Phase 6+] 连接断开页面
+}
+impl AppState {
+    pub fn is_in_game(&self) -> bool;             // 匹配任意 InGame 子状态
+    pub fn ingame_default() -> Self;              // InGame { paused: false, chat_open: false }
 }
 ```
+
+Phase 6 把原 `EscMenu` / `ChatOpen` unit variant 合入 `InGame` 结构变体，让 HUD 与名牌在暂停 / 聊天期间仍可绘制，且两个叠加层可并存。
 
 Connecting 期间不携带子状态结构体——进度信息由 `RoomSession::loading_steps()`（网络步骤）和 `App::preload_state`（区块预载步骤）联合提供。
 
@@ -187,8 +191,10 @@ pub struct Game {
     pub mesh_jobs: MeshJobQueue,       // [Phase 2]
     pub chunk_loader: ChunkLoader,     // [Phase 2]
     pub frame_clock: FrameClock,       // [Phase 2+]
-    pub settings: GameSettings,        // [Phase 2+]
-    pub entity_id: u32,                // [Phase 2] 由 Welcome 填充
+    pub settings: AppSettings,             // [Phase 6+] 用户设置（曾用名 GameSettings）
+    pub entity_id: u32,                    // [Phase 2] 由 Welcome 填充
+    pub display_name: String,              // [Phase 6] 由 lobby 注入
+    pub host_entity_id: EntityId,          // [Phase 6] Host=自己；Remote=Welcome 填
 
     // —— 以下为后续 Phase 引入 ——
     pub interp: PlayerInterp,          // [Phase 5 ✅]
@@ -196,18 +202,33 @@ pub struct Game {
     pub remote_players: HashMap<EntityId, RemotePlayerState>, // [Phase 5 ✅]
     pub input_history: InputHistory,   // [Phase 5 ✅]
     pub server_clock_offset_ms: i64,   // [Phase 5 ✅]
-    pub world_view: WorldView,         // [Phase N] Remote 模式用独立数据宿主（Phase 5 暂复用 Server.world）
-    pub storage: OpfsStorage,          // [Phase 8] 实现 WorldStorage trait
-    pub chat: ChatHistory,             // [Phase 6]
+    pub chat: ChatHistory,             // [Phase 6 ✅] 聊天历史（含本地合成的系统消息）
 }
 
-/// [Phase 2+]
-pub struct GameSettings {
-    pub render_distance: u32,          // 默认 6
-    pub mouse_sensitivity: f32,        // 默认 0.0025
-    pub fly_speed: f32,                // 默认 12.0 方块/秒
-    pub mesh_budget_ms: f32,           // 默认 4.0
-    pub min_action_interval_ms: f64,   // [Phase 3] 默认 100.0，连续挖掘冷却
+/// 用户设置（[Phase 6 ✅] 取代 [`GameSettings`]；serde JSON 持久化到 localStorage）。
+///
+/// 开发/调优字段（fly_speed / mesh_budget_ms / min_action_interval_ms）标 `#[serde(skip)]`，
+/// 不污染存储，仅在运行时可用。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub fov_degrees: f32,          // 默认 70.0，范围 30..=110
+    pub mouse_sensitivity: f32,    // 默认 1.0（乘以 BASE_SENSITIVITY_RAD_PER_PIXEL = 0.0025）
+    pub render_distance: u32,      // 默认 6，选项 2/4/6/8/10
+    pub interp_delay_ms: f32,      // 默认 100.0，选项 50 / 100 / 150
+    pub show_stats: bool,          // 默认 true，控制左上角统计面板
+    #[serde(skip)]
+    pub fly_speed: f32,
+    #[serde(skip)]
+    pub mesh_budget_ms: f32,
+    #[serde(skip)]
+    pub min_action_interval_ms: f64,
+}
+
+/// 设置 localStorage 持久化。
+/// 键 "voxweb.settings.v1"，schema 头字段版本 = 1；schema 不匹配视为不可读、回退默认。
+pub mod settings_storage {
+    pub fn load() -> Option<AppSettings>;
+    pub fn save(settings: &AppSettings);
 }
 
 /// [Phase 2+] 固定步长（1/60）累加器：渲染帧的 dt 累加到 `accumulator`，

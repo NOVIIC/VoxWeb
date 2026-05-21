@@ -22,10 +22,12 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2; // Phase 6 (2026-05-21): Welcome 携带完整 roster + host_entity_id
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
+
+| v2 (Phase 6) | Welcome 增加 `host_entity_id: u32` + `players: Vec<PlayerEntry>`；新增 `PlayerEntry { entity_id, display_name }` |
 
 ---
 
@@ -47,7 +49,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 | 消息 | 通道 | 频率 | 字段 | 接收对象 | 说明 |
 |---|---|---|---|---|---|
-| `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64` | 单一 | 加入握手响应 |
+| `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单） |
 | `ChunkSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 chunk 数据，分片 |
 | `BlockUpdate` | reliable | 按需 | `pos: Position, block: BlockID` | 广播 | 单方块变更 |
 | `ActionAck` | reliable | 应答 | `request_id: u32, accepted: bool, reason: AckReason` | 单一 | 挖放应答 |
@@ -247,10 +249,8 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 - `PlayerInput.position` 与上次相比 distance > `max_move_per_tick * dt` → 截断为合法距离，不接受
 - `Break.pos` 与玩家位置 distance > 6.0 → ActionAck rejected with `OutOfRange`
 - `Place.pos` 同上 + 不能与玩家 AABB 重叠 → ActionAck rejected with `Overlap`
-- `Chat.content.len() > 256` → 静默丢弃（不应答错误，避免被穷举）
-
-**不做**：
-- 速率限制（依赖 SCTP 自有限制）
+- `Chat.content.chars().count() > 256` → 静默丢弃（不应答错误，避免被穷举）
+- 速率限制：每玩家 5 条 / 3s（180 tick 滑窗），超出静默丢弃（Phase 6 起服务端实装；Protocol v1 没有）
 - 操作签名 / 加密令牌（DataChannel 已 DTLS 加密）
 
 ---

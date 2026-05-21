@@ -21,8 +21,8 @@ use glam::Vec3;
 
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Z, ChunkPos};
 use voxweb_core::protocol::{
-    CHUNK_SNAPSHOT_PAYLOAD_MAX, ClientMessage, EntityId, OutboundMessage, PlayerSnapshot,
-    Recipient, ServerMessage,
+    CHUNK_SNAPSHOT_PAYLOAD_MAX, ClientMessage, EntityId, OutboundMessage, PlayerEntry,
+    PlayerSnapshot, Recipient, ServerMessage,
 };
 
 /// 服务端权威的玩家实体（Phase 5 起完整版）。
@@ -89,10 +89,17 @@ pub struct Server {
     pub current_time_ms: u64,
     /// 下一个待分配的 entity_id（从 [`FIRST_ENTITY_ID`] 起步）。
     next_entity_id: EntityId,
+    /// 房间主机的 entity_id（首次 `add_player` 时设；用于 Welcome 标识 Host）。
+    /// Local-Only 模式下也会被设为 FIRST_ENTITY_ID，行为一致。
+    host_entity_id: Option<EntityId>,
     /// 出站消息队列（带 Recipient 标签）。
     /// `handle_message` / `add_player` / `broadcast_tick` 都向此队列追加，
     /// 由调用方（Local 直接消费 / Host 通过 net 层路由）每帧 `drain_outbox()` 取走。
     outbox: VecDeque<OutboundMessage>,
+    /// 聊天速率限制窗口：entity_id → 最近的发送 tick 列表（滑窗）。
+    /// Phase 6 起：每个 entity 在 [`CHAT_RATE_WINDOW_TICKS`] tick 内最多发
+    /// [`CHAT_RATE_LIMIT`] 条；超出静默丢弃。
+    chat_window: HashMap<EntityId, VecDeque<u32>>,
 }
 
 /// 第一个分配的 entity_id（Host 本人通常占这个值）。
@@ -111,6 +118,13 @@ const DELTA_ANGLE_THRESHOLD: f32 = 0.0087;
 /// Delta 广播：每 N tick 强制全量发送（0.5s @ 60Hz）。
 const FULL_BROADCAST_INTERVAL: u32 = 30;
 
+/// 聊天消息长度上限（Unicode scalar 数）。超过则静默丢弃（[`docs/networking/protocol.md`] §八）。
+const CHAT_MAX_CHARS: usize = 256;
+/// 聊天速率限制：滑窗 tick 数（60Hz × 3s ≈ 180 ticks）。
+const CHAT_RATE_WINDOW_TICKS: u32 = 180;
+/// 聊天速率限制：单玩家窗口内允许的最大消息数。
+const CHAT_RATE_LIMIT: usize = 5;
+
 impl Server {
     /// 根据种子创建世界。Phase 5 不再自动注册玩家：
     /// Client 启动时（Local/Host）显式调 [`Server::add_player`] 让 Host 本人入表。
@@ -122,7 +136,9 @@ impl Server {
             players: HashMap::new(),
             current_time_ms: 0,
             next_entity_id: FIRST_ENTITY_ID,
+            host_entity_id: None,
             outbox: VecDeque::new(),
+            chat_window: HashMap::new(),
         }
     }
 
@@ -153,8 +169,25 @@ impl Server {
             self.next_entity_id = FIRST_ENTITY_ID;
         }
 
+        // 首位入表的玩家即为 Host（Local-Only 也走这个路径）。
+        if self.host_entity_id.is_none() {
+            self.host_entity_id = Some(eid);
+        }
+
         let player = PlayerEntity::new(display_name.clone(), self.tick);
         self.players.insert(eid, player);
+
+        // Welcome 携带完整 roster（含本人），让新加入者一次性建好玩家表。
+        // Phase 6 协议 v2 起的扩展，替代了 v1 的"per-peer PeerJoined 到新加入者"逻辑。
+        let roster: Vec<PlayerEntry> = self
+            .players
+            .iter()
+            .map(|(id, p)| PlayerEntry {
+                entity_id: *id,
+                display_name: p.display_name.clone(),
+            })
+            .collect();
+        let host_eid = self.host_entity_id.unwrap_or(eid);
 
         self.enqueue(
             Recipient::One(eid),
@@ -162,8 +195,11 @@ impl Server {
                 entity_id: eid,
                 server_tick: self.tick,
                 world_seed: self.seed,
+                host_entity_id: host_eid,
+                players: roster,
             },
         );
+        // 老玩家依旧通过 PeerJoined 得知新人加入。
         self.enqueue(
             Recipient::Except(eid),
             ServerMessage::PeerJoined {
@@ -171,23 +207,6 @@ impl Server {
                 display_name,
             },
         );
-
-        // 把已在场的所有玩家告知新玩家，否则远端客户端不知道 Host 等人的存在
-        let existing: Vec<(EntityId, String)> = self
-            .players
-            .iter()
-            .filter(|(ex, _)| **ex != eid)
-            .map(|(ex, p)| (*ex, p.display_name.clone()))
-            .collect();
-        for (existing_eid, name) in existing {
-            self.enqueue(
-                Recipient::One(eid),
-                ServerMessage::PeerJoined {
-                    entity_id: existing_eid,
-                    display_name: name,
-                },
-            );
-        }
 
         // 初始快照：以出生点 (chunk 0,0) 为中心扩 INITIAL_SNAPSHOT_RADIUS 圈。
         let spawn_chunk = ChunkPos::new(
@@ -202,8 +221,14 @@ impl Server {
     /// 移除玩家：从 players 表删除，enqueue `PeerLeft` 到所有剩余玩家。
     pub fn remove_player(&mut self, eid: EntityId) {
         if self.players.remove(&eid).is_some() {
+            self.chat_window.remove(&eid);
             self.enqueue(Recipient::All, ServerMessage::PeerLeft { entity_id: eid });
         }
+    }
+
+    /// 当前房间主机的 entity_id（首次 `add_player` 时设；尚无玩家时返回 None）。
+    pub fn host_entity_id(&self) -> Option<EntityId> {
+        self.host_entity_id
     }
 
     /// 取走 outbox 中所有 OutboundMessage。
@@ -323,7 +348,18 @@ impl Server {
                 }
             }
             ClientMessage::Chat { content } => {
-                // Phase 5 协议层不做长度限制（Phase 6 加 256 字符 + 速率限制）
+                // Phase 6：256 字符上限 + 5 条 / 3s 速率限制；超出静默丢弃（不回错以避免被穷举）。
+                if content.chars().count() > CHAT_MAX_CHARS {
+                    log::debug!(
+                        "chat dropped (too long): eid={entity_id} chars={}",
+                        content.chars().count()
+                    );
+                    return;
+                }
+                if !self.chat_rate_limit_allow(entity_id) {
+                    log::debug!("chat dropped (rate limited): eid={entity_id}");
+                    return;
+                }
                 self.enqueue(
                     Recipient::All,
                     ServerMessage::Chat {
@@ -435,6 +471,32 @@ impl Server {
     fn enqueue(&mut self, recipient: Recipient, message: ServerMessage) {
         self.outbox
             .push_back(OutboundMessage { recipient, message });
+    }
+
+    /// 内部：聊天速率限制滑窗判定。
+    ///
+    /// 通过则把当前 tick 记入 `chat_window[eid]`，并清理窗口外的旧记录；
+    /// 超出 [`CHAT_RATE_LIMIT`] 条 / [`CHAT_RATE_WINDOW_TICKS`] tick 时返回 false。
+    ///
+    /// 使用 `self.tick`（60Hz 单调递增）作为时钟，便于 Local-Only 模式下也可工作
+    /// （`current_time_ms` 仅 Host 模式被驱动更新）。
+    fn chat_rate_limit_allow(&mut self, eid: EntityId) -> bool {
+        let now = self.tick;
+        let window = self.chat_window.entry(eid).or_default();
+        // 清理窗口外的旧记录（用 saturating_sub 防 u32 下溢，开服前几秒也安全）。
+        let cutoff = now.saturating_sub(CHAT_RATE_WINDOW_TICKS);
+        while let Some(&front) = window.front() {
+            if front < cutoff {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if window.len() >= CHAT_RATE_LIMIT {
+            return false;
+        }
+        window.push_back(now);
+        true
     }
 }
 
@@ -745,6 +807,140 @@ mod handle_message_tests {
             )
         });
         assert!(chat.is_some());
+    }
+
+    // ── Phase 6 ──
+
+    #[test]
+    fn host_eid_set_on_first_add_player() {
+        let mut server = Server::new(0);
+        assert!(server.host_entity_id().is_none());
+
+        let host = server.add_player("Alice".into());
+        assert_eq!(server.host_entity_id(), Some(host));
+
+        // 后续 add_player 不改 host_eid
+        let _ = server.add_player("Bob".into());
+        assert_eq!(server.host_entity_id(), Some(host));
+    }
+
+    #[test]
+    fn welcome_carries_full_roster_and_host_eid() {
+        let mut server = Server::new(0);
+        let alice = server.add_player("Alice".into());
+        server.drain_outbox(); // 清掉 Alice 自己的 Welcome
+
+        // Bob 加入后，给 Bob 发的 Welcome 应当包含 Alice + Bob 名单与 Alice 的 host_eid
+        let bob = server.add_player("Bob".into());
+        let welcome = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::Welcome { entity_id, .. })
+                    if *e == bob && *entity_id == bob
+            )
+        });
+        let (_, msg) = welcome.expect("missing Welcome to bob");
+        match msg {
+            ServerMessage::Welcome {
+                host_entity_id,
+                players,
+                ..
+            } => {
+                assert_eq!(host_entity_id, alice, "host_eid should be Alice");
+                let mut names: Vec<_> = players.iter().map(|p| p.display_name.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names, vec!["Alice", "Bob"]);
+                let ids: Vec<EntityId> = {
+                    let mut v: Vec<_> = players.iter().map(|p| p.entity_id).collect();
+                    v.sort_unstable();
+                    v
+                };
+                assert_eq!(ids, vec![alice, bob]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn chat_drops_messages_over_256_chars() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        // 257 个 ASCII 字符 → 静默丢弃
+        let too_long: String = std::iter::repeat_n('x', 257).collect();
+        server.handle_message(eid, ClientMessage::Chat { content: too_long });
+        let chat = find_outbox(&server, |m| matches!(m.message, ServerMessage::Chat { .. }));
+        assert!(
+            chat.is_none(),
+            "expected too-long chat to be silently dropped"
+        );
+
+        // 256 个 ASCII → 通过
+        let ok_long: String = std::iter::repeat_n('y', 256).collect();
+        server.handle_message(
+            eid,
+            ClientMessage::Chat {
+                content: ok_long.clone(),
+            },
+        );
+        let chat = find_outbox(
+            &server,
+            |m| matches!(&m.message, ServerMessage::Chat { content, .. } if content == &ok_long),
+        );
+        assert!(chat.is_some(), "256-char chat should pass");
+    }
+
+    #[test]
+    fn chat_drop_counts_unicode_scalars_not_bytes() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        // 256 个中文字符（UTF-8 字节数远超 256，但 chars().count() == 256，应通过）
+        let cn: String = std::iter::repeat_n('你', 256).collect();
+        server.handle_message(eid, ClientMessage::Chat { content: cn });
+        let chat = find_outbox(&server, |m| matches!(m.message, ServerMessage::Chat { .. }));
+        assert!(chat.is_some(), "256-char unicode should pass");
+    }
+
+    #[test]
+    fn chat_rate_limit_drops_after_5_per_3s() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        // 同一 tick 内连发 6 条：前 5 条通过，第 6 条被丢弃
+        for i in 0..6 {
+            server.handle_message(
+                eid,
+                ClientMessage::Chat {
+                    content: format!("m{i}"),
+                },
+            );
+        }
+        let count = server
+            .outbox
+            .iter()
+            .filter(|m| matches!(m.message, ServerMessage::Chat { .. }))
+            .count();
+        assert_eq!(count, 5, "expected 5 chats to pass, got {count}");
+
+        // 推进时间窗外（>180 ticks），再发应该重新允许
+        server.drain_outbox();
+        server.tick = server.tick.saturating_add(CHAT_RATE_WINDOW_TICKS + 1);
+        server.handle_message(
+            eid,
+            ClientMessage::Chat {
+                content: "after-window".into(),
+            },
+        );
+        let count_after = server
+            .outbox
+            .iter()
+            .filter(|m| matches!(&m.message, ServerMessage::Chat { content, .. } if content == "after-window"))
+            .count();
+        assert_eq!(count_after, 1, "expected chat to pass after window expiry");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 ```
 Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase 5 ─▶ Phase 6 ─▶ Phase 7 ─▶ Phase 8 ─▶ Phase 9 (stretch)
 脚手架      渲染骨架     体素单人     物理交互     P2P 通道     权威同步     多人 UI      渲染优化     多 Pass+存档   后处理/TURN/触屏
-  ✅          ✅          ✅          ✅          ✅          ✅
+  ✅          ✅          ✅          ✅          ✅          ✅          ✅
 ```
 
 每个 Phase **可独立验收**：完成时可以演示一个具体的、可观察的功能。后续 Phase 只增不破。
@@ -209,7 +209,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 6 · 多人 UI/HUD
+## Phase 6 · 多人 UI/HUD ✅
+
+> 完成日期：2026-05-21 · 详见 [`../PHASE_6_DONE.md`](../PHASE_6_DONE.md)
 
 ### 目标
 让多人体验完整：知道谁在线、能聊天、看到玩家名字。
@@ -219,15 +221,15 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`networking/protocol.md`](networking/protocol.md)（Chat 消息）
 
 ### 任务清单
-- [ ] HUD 玩家列表 widget
-- [ ] T 键打开聊天框
-- [ ] 聊天历史 + 系统消息（Join/Leave）
-- [ ] 平时显示最近 5 条聊天浮窗（5 秒淡出）
-- [ ] 远端玩家头顶名牌（egui Painter billboard）
-- [ ] 距离衰减（> 32m 不显示）
-- [ ] EscMenu 完整设置：FOV / 灵敏度 / 渲染距离 / 插值延迟 / 显示统计
-- [ ] 设置存到 localStorage
-- [ ] Disconnected 页面 + "返回大厅"按钮
+- [x] HUD 玩家列表 widget
+- [x] T 键打开聊天框
+- [x] 聊天历史 + 系统消息（Join/Leave）
+- [x] 平时显示最近 5 条聊天浮窗（5 秒淡出）
+- [x] 远端玩家头顶名牌（egui Painter billboard）
+- [x] 距离衰减（> 32m 不显示）
+- [x] EscMenu 完整设置：FOV / 灵敏度 / 渲染距离 / 插值延迟 / 显示统计
+- [x] 设置存到 localStorage
+- [x] Disconnected 页面 + "返回大厅"按钮
 
 ### 验证
 - 4 人同房间，HUD 右上角列表显示 4 行
