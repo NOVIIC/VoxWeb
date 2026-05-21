@@ -115,6 +115,11 @@ impl PlayerInterp {
         }
     }
 
+    /// Phase 6：从设置菜单同步插值延迟（毫秒）。
+    pub fn set_delay_ms(&mut self, ms: f64) {
+        self.delay_ms = ms;
+    }
+
     /// 主循环入口：每逻辑 tick 把 Host 发来的 PlayerTick 中包含的所有 player snapshot
     /// 喂进对应的 buffer。`server_time_ms` 是 PlayerTick 携带的 Host 时钟。
     pub fn ingest_tick(

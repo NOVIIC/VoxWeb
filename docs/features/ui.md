@@ -19,16 +19,30 @@
 
 ## 二、UI 状态路由
 
-每帧 `client::ui::draw` 按 `AppState` 决定渲染什么。Phase 3 的实际枚举为全部 unit variant，参见 [`crates/client/src/app.rs`](../../crates/client/src/app.rs)：
+每帧 `client::ui::draw` 按 `AppState` 决定渲染什么。Phase 6 的终态枚举把 `EscMenu` / `ChatOpen` 升级为 `InGame` 子状态位，让 HUD / 名牌可无视暂停 / 聊天叠加层始终绘制。参见 [`crates/client/src/app.rs:48-66`](../../crates/client/src/app.rs)：
 
 ```rust
 pub enum AppState {
-    Loading, Lobby, Connecting, InGame,
-    EscMenu, ChatOpen, Disconnected,
+    Loading,
+    Lobby,
+    Connecting,
+    /// 游戏进行中（可叠加暂停 / 聊天两个子状态）
+    InGame {
+        paused: bool,
+        chat_open: bool,
+    },
+    Disconnected,
+}
+
+impl AppState {
+    pub fn is_in_game(&self) -> bool {
+        matches!(self, AppState::InGame { .. })
+    }
+    pub fn ingame_default() -> Self {
+        AppState::InGame { paused: false, chat_open: false }
+    }
 }
 ```
-
-Phase 6 起会把 `EscMenu` / `ChatOpen` 升级为 `InGame` 的子状态位（`InGame { paused, chat_open }`）。当前下面的路由示意是 Phase 6 终态：
 
 ```rust
 pub fn draw(app: &mut App, ctx: &egui::Context) {
@@ -229,23 +243,36 @@ FPS: 60.2
 ```
 
 ```rust
-pub fn draw_player_list(app: &App, ctx: &egui::Context) {
+// 实际定义见 crate::ui::players
+pub struct PlayerListEntry {
+    pub entity_id: EntityId,
+    pub display_name: String,
+    pub color_rgb: [f32; 3],   // 由 app::entity_color(eid) 确定性派生
+    pub is_host: bool,         // entity_id == game.host_entity_id
+    pub is_me: bool,           // entity_id == game.entity_id
+}
+
+pub fn draw_player_list(ctx: &egui::Context, entries: &[PlayerListEntry]) {
     egui::Area::new(egui::Id::new("player_list"))
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.label(format!("在线玩家 ({})", app.world_view.players.len()));
+                ui.label(format!("在线玩家 ({})", entries.len()));
                 ui.separator();
-                for p in app.world_view.players.values() {
-                    let role = if p.entity_id == app.host_id { "（主机）" } else { "" };
-                    let me = if p.entity_id == app.self_id { "（你）" } else { "" };
-                    ui.label(format!("{} {}{}", p.display_name, role, me));
+                for entry in entries {
+                    // 彩色圆点 + 显示名 + 「（主机 / 你 / 主机, 你）」后缀
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("⚫").color(color_for(entry.color_rgb)));
+                        ui.label(format_with_suffix(entry));
+                    });
                 }
             });
         });
 }
 ```
+
+`lib.rs` 每帧从 `game.remote_players` + 自身条目构造按 `entity_id` 升序排列的 `Vec<PlayerListEntry>`；`is_host` 由 `entity_id == game.host_entity_id` 判定，`is_me` 由 `entity_id == game.entity_id` 判定。
 
 ### 屏幕中心：准星
 
@@ -371,6 +398,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 ```
 
 `resume_game` 必须重新发起 `request_pointer_lock`（在按钮的点击 closure 内同步发起）。
+
+> **Phase 6 实装差异**：
+> - 上图与示例代码里的「☐ 启用 Depth Pre-Pass」复选框**Phase 6 内未暴露**，留到 Phase 8 的多 Pass 重构一起加（届时整个渲染管线会切到 Render Graph）。当前 [`crates/client/src/ui/pause.rs`](../../crates/client/src/ui/pause.rs) 只渲染 FOV / 灵敏度 / 渲染距离 / 插值延迟 / 显示统计 5 项。
+> - 实际函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 切回大厅 / 重新请求指针锁。
+> - 设置在 `Resume` / `ExitToLobby` 时通过 [`settings_storage::save`](../../crates/client/src/settings_storage.rs) 写入 localStorage（键 `voxweb.settings.v1`，JSON 编码 + schema 版本头）。下次进入大厅时由 `settings_storage::load()` 读回，失败回退 `AppSettings::default()`。
 
 ---
 

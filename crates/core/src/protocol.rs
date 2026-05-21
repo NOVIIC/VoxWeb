@@ -11,7 +11,10 @@ use crate::chunk::{ChunkPos, Position};
 
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2（Phase 6）：Welcome 携带完整 roster + host_entity_id，
+/// 让新加入的 Remote 一次性建好玩家表（包括早于自己加入的 Host）。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// ChunkSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -78,11 +81,17 @@ pub enum ClientMessage {
 /// Server → Client 的消息。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// 加入握手响应（分配 entity_id + 服务器当前 tick + 世界种子）
+    /// 加入握手响应（分配 entity_id + 服务器当前 tick + 世界种子 + 房间内现存玩家名单）
+    ///
+    /// Phase 6（v2）扩展：
+    /// - `host_entity_id`：房间主机的 eid（用于 UI 标 "（主机）" 标签）
+    /// - `players`：包括本人在内的全员名单，避免 Remote 错过早于自己加入的玩家信息
     Welcome {
         entity_id: u32,
         server_tick: u32,
         world_seed: u64,
+        host_entity_id: u32,
+        players: Vec<PlayerEntry>,
     },
     /// 全量 Chunk 快照（分片传输，接收端按 frag_index 组装）
     ChunkSnapshot {
@@ -150,6 +159,16 @@ pub struct PlayerSnapshot {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+}
+
+/// Welcome 中携带的单个玩家身份（Phase 6 起）。
+///
+/// 不包含位置 / 朝向：那些信息会在下一帧 PlayerTick 广播中带到；
+/// Welcome 只承担 "新加入者一次性拿到当前 roster" 的职责。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlayerEntry {
+    pub entity_id: EntityId,
+    pub display_name: String,
 }
 
 /// ActionAck 中的拒绝（或通过）原因。
@@ -234,7 +253,40 @@ mod tests {
             entity_id: 1,
             server_tick: 0,
             world_seed: 123456789,
+            host_entity_id: 1,
+            players: Vec::new(),
         });
+    }
+
+    #[test]
+    fn roundtrip_welcome_with_roster() {
+        // Phase 6：Welcome 携带 host_entity_id + 完整 roster（含本人）。
+        roundtrip(&ServerMessage::Welcome {
+            entity_id: 3,
+            server_tick: 600,
+            world_seed: 0xDEADBEEF,
+            host_entity_id: 1,
+            players: vec![
+                PlayerEntry {
+                    entity_id: 1,
+                    display_name: "Alice".into(),
+                },
+                PlayerEntry {
+                    entity_id: 2,
+                    display_name: "Bob".into(),
+                },
+                PlayerEntry {
+                    entity_id: 3,
+                    display_name: "Carol".into(),
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        // Phase 6 起为 2；任何破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

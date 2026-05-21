@@ -108,6 +108,8 @@ mod tests {
                 entity_id: 1,
                 server_tick: 0,
                 world_seed: 0,
+                host_entity_id: 1,
+                players: Vec::new(),
             }),
             ChannelKind::Reliable
         );
