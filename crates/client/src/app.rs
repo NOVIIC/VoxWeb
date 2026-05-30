@@ -388,9 +388,11 @@ impl Game {
         display_name: String,
         room_id: String,
     ) -> Self {
-        let mut camera = Camera::default();
         // Phase 6：FOV / 插值延迟从 AppSettings 派生（之前是硬编码）。
-        camera.fov = settings.fov_degrees.to_radians();
+        let camera = Camera {
+            fov: settings.fov_degrees.to_radians(),
+            ..Camera::default()
+        };
         let physics = LocalPhysics::new(Vec3::new(8.0, 100.0, 8.0));
         let render_distance = settings.render_distance;
         let mut interp = PlayerInterp::new();

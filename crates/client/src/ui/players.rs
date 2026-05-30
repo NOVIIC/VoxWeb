@@ -39,7 +39,7 @@ pub fn draw_player_list(ctx: &egui::Context, entries: &[PlayerListEntry]) {
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.label(format!("在线玩家 ({})", entries.len()));
+                ui.label(format!("Online Players ({})", entries.len()));
                 ui.separator();
                 for entry in entries {
                     let color = rgb_to_color32(entry.color_rgb);
@@ -152,9 +152,9 @@ fn rgb_to_color32(rgb: [f32; 3]) -> egui::Color32 {
 /// 拼接玩家列表显示名后缀（主机 / 你 / 主机且你 / 无）。
 fn role_suffix(is_host: bool, is_me: bool) -> &'static str {
     match (is_host, is_me) {
-        (true, true) => "（主机, 你）",
-        (true, false) => "（主机）",
-        (false, true) => "（你）",
+        (true, true) => " (Host, You)",
+        (true, false) => " (Host)",
+        (false, true) => " (You)",
         (false, false) => "",
     }
 }

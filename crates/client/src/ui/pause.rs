@@ -33,7 +33,7 @@ pub enum PauseAction {
 pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> PauseAction {
     let mut action = PauseAction::None;
 
-    egui::Window::new("已暂停")
+    egui::Window::new("Paused")
         // 始终居中、不可拉伸 / 折叠，模态感更强。
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .resizable(false)
@@ -44,12 +44,13 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
 
             // 鼠标灵敏度倍率：1.0 为默认，乘到 BASE_SENSITIVITY_RAD_PER_PIXEL 上。
             ui.add(
-                egui::Slider::new(&mut settings.mouse_sensitivity, 0.1..=5.0).text("鼠标灵敏度"),
+                egui::Slider::new(&mut settings.mouse_sensitivity, 0.1..=5.0)
+                    .text("Mouse Sensitivity"),
             );
 
             // 渲染距离：离散选项，使用 ComboBox 而非连续滑条，避免触发频繁的
             // ChunkLoader 半径重算。
-            egui::ComboBox::from_label("渲染距离")
+            egui::ComboBox::from_label("Render Distance")
                 .selected_text(format!("{}", settings.render_distance))
                 .show_ui(ui, |ui| {
                     for d in [2u32, 4, 6, 8, 10] {
@@ -60,14 +61,14 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             // 远端玩家位置插值延迟：50/100/150 ms 三档单选。
             // 数值越大越平滑但越滞后；推荐 100ms（典型 RTT + 抖动余量）。
             ui.horizontal(|ui| {
-                ui.label("插值延迟：");
+                ui.label("Interpolation Delay:");
                 ui.radio_value(&mut settings.interp_delay_ms, 50.0, "50ms");
                 ui.radio_value(&mut settings.interp_delay_ms, 100.0, "100ms");
                 ui.radio_value(&mut settings.interp_delay_ms, 150.0, "150ms");
             });
 
             // F3 也可以切换；这里给鼠标用户一个显式开关。
-            ui.checkbox(&mut settings.show_stats, "显示统计信息 (F3)");
+            ui.checkbox(&mut settings.show_stats, "Show Stats (F3)");
 
             ui.add_space(20.0);
 
@@ -76,10 +77,10 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             // 这里只返回 Action，由调用方在同一帧的事件处理路径中调用
             // canvas.request_pointer_lock()。
             ui.horizontal(|ui| {
-                if ui.button("继续游戏").clicked() {
+                if ui.button("Resume").clicked() {
                     action = PauseAction::Resume;
                 }
-                if ui.button("退出到大厅").clicked() {
+                if ui.button("Exit to Lobby").clicked() {
                     action = PauseAction::ExitToLobby;
                 }
             });

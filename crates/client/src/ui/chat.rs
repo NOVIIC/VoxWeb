@@ -49,7 +49,7 @@ pub fn draw_chat_window(ctx: &egui::Context, history: &mut ChatHistory) -> ChatU
                                     ChatKind::System => {
                                         ui.colored_label(
                                             egui::Color32::from_rgb(160, 170, 180),
-                                            format!("[系统] {}", msg.content),
+                                            format!("[System] {}", msg.content),
                                         );
                                     }
                                     ChatKind::User { from_name, .. } => {
@@ -74,12 +74,11 @@ pub fn draw_chat_window(ctx: &egui::Context, history: &mut ChatHistory) -> ChatU
                     let resp = ui.text_edit_singleline(&mut history.input_buffer);
                     resp.request_focus();
 
-                    // 提交判定：text_edit 失焦的同帧 + Enter 按下
-                    // （egui 的单行输入默认按 Enter 时会自动 lost_focus）。
+                    // Submit: Enter pressed. input_buffer already contains the typed text.
                     let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
-                    if resp.lost_focus() && enter {
+                    if enter {
                         let content = std::mem::take(&mut history.input_buffer);
                         if content.trim().is_empty() {
                             // 空消息：丢弃并取消（外层关闭聊天框）。
@@ -127,7 +126,7 @@ pub fn draw_recent_overlay(ctx: &egui::Context, history: &ChatHistory, now_ms: f
                         // 系统消息：淡灰色。
                         let color = egui::Color32::from_rgba_unmultiplied(170, 180, 195, alpha);
                         ui.label(
-                            egui::RichText::new(format!("[系统] {}", msg.content)).color(color),
+                            egui::RichText::new(format!("[System] {}", msg.content)).color(color),
                         );
                     }
                     ChatKind::User { from_name, .. } => {

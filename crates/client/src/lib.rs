@@ -230,18 +230,32 @@ fn install_event_listeners(
         let input_clone = input.clone();
         let document_clone = document.clone();
         let canvas_id = canvas.clone();
+        let app_clone = app.clone();
         let on_lock_change = Closure::<dyn FnMut()>::new(move || {
             let locked = document_clone
                 .pointer_lock_element()
                 .map(|el| el == *canvas_id.as_ref())
                 .unwrap_or(false);
             let mut s = input_clone.borrow_mut();
-            // 锁状态切换时清掉所有 held 输入。
-            // ESC 释放锁的瞬间浏览器焦点会变化，期间按住的键松开时
-            // keyup 事件可能丢失（document 收不到），下次恢复锁时会出现
-            // "卡键"自动飞 / 走 / 挖。这里在切换时统一复位。
-            if s.pointer_locked != locked {
+            let was_locked = s.pointer_locked;
+            if was_locked != locked {
                 s.clear_held();
+                // 当指针锁因为用户按 ESC 而无预期释放时（纯游戏态、未暂停未聊天），
+                // 浏览器可能吞掉 ESC keydown 事件，导致 esc_menu 边沿永远不会被设。
+                // 这里从 pointerlockchange 补设 esc_menu，保证暂停菜单能正常弹出。
+                if !locked && was_locked {
+                    let a = app_clone.borrow();
+                    if matches!(
+                        a.state,
+                        AppState::InGame {
+                            paused: false,
+                            chat_open: false
+                        }
+                    ) {
+                        drop(a);
+                        s.esc_menu = true;
+                    }
+                }
             }
             s.pointer_locked = locked;
         });
@@ -874,7 +888,7 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
     let seed = seed.unwrap_or_else(random_seed);
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
-            "未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into(),
+            "Signaling URL not configured (missing ?signaling= param or <meta name=\"signaling-url\">)".into(),
         );
         return;
     };
@@ -907,7 +921,7 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
 fn start_remote(app: &Rc<RefCell<App>>, room_id: &str, display_name: &str) {
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
-            "未配置信令服务地址（缺少 ?signaling= 参数或 <meta name=\"signaling-url\">）".into(),
+            "Signaling URL not configured (missing ?signaling= param or <meta name=\"signaling-url\">)".into(),
         );
         return;
     };
@@ -1693,11 +1707,13 @@ fn render_game_frame(
     let mut pause_exit_to_lobby = false;
     let (paint_jobs, pixels_per_point, textures_delta) = {
         let mut a = app.borrow_mut();
+        let events: Vec<egui::Event> = std::mem::take(&mut *a.egui_events.borrow_mut());
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
                 egui::vec2(cw as f32, ch as f32),
             )),
+            events,
             ..Default::default()
         };
         // 提前抓出本帧 HUD 用的只读快照（避免后续 closure 内对 game 同时持有可变和不可变借用）
@@ -2229,7 +2245,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 .entry(entity_id)
                 .or_insert_with(|| RemotePlayerState::new(display_name.clone(), entity_id));
             game.chat
-                .push_system(format!("{display_name} 加入了房间"), now_ms());
+                .push_system(format!("{display_name} joined the room"), now_ms());
         }
         ServerMessage::PeerLeft { entity_id } => {
             // 在 remove 之前先取一下名字，PeerLeft 系统消息才能拿到原名
@@ -2239,7 +2255,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 .map(|r| r.display_name.clone())
                 .unwrap_or_else(|| format!("Player {entity_id}"));
             game.chat
-                .push_system(format!("{name} 离开了房间"), now_ms());
+                .push_system(format!("{name} left the room"), now_ms());
             game.remote_players.remove(&entity_id);
             game.interp.remove(entity_id);
         }
@@ -2360,7 +2376,7 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             // 醒目橙色：表示当前有 peer 走信令 Worker 中继
                             ui.colored_label(
                                 egui::Color32::from_rgb(240, 165, 80),
-                                format!("RELAY {} peer(s) (中继中)", data.relayed_peer_count),
+                                format!("RELAY {} peer(s) (relaying)", data.relayed_peer_count),
                             );
                         }
                     });

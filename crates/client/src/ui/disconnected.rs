@@ -23,7 +23,7 @@ pub fn draw_disconnected(ctx: &egui::Context, reason: &str) -> DisconnectedActio
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
             ui.heading(
-                egui::RichText::new("已断开连接")
+                egui::RichText::new("Disconnected")
                     .size(32.0)
                     .color(egui::Color32::from_rgb(230, 240, 245)),
             );
@@ -32,7 +32,7 @@ pub fn draw_disconnected(ctx: &egui::Context, reason: &str) -> DisconnectedActio
             if reason.is_empty() {
                 ui.colored_label(
                     egui::Color32::from_rgb(180, 190, 200),
-                    "与房间的连接已中断。",
+                    "Connection to the room was interrupted.",
                 );
             } else {
                 // 原因可能较长（例如 "ICE failed: ..."），允许 wrap。
@@ -49,7 +49,7 @@ pub fn draw_disconnected(ctx: &egui::Context, reason: &str) -> DisconnectedActio
             ui.add_space(30.0);
 
             let btn = egui::Button::new(
-                egui::RichText::new("返回大厅")
+                egui::RichText::new("Back to Lobby")
                     .size(16.0)
                     .color(egui::Color32::from_rgb(230, 240, 245)),
             )
