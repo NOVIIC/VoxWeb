@@ -28,7 +28,7 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 | 序列化 | `bincode`（little-endian、定长配置） | 与 DataChannel 二进制传输契合，体积比 JSON 小一个数量级 |
 | 构建工具 | `trunk`（首选）或 `wasm-pack` | trunk 集成 HTML 模板与资源管线，开箱即用 |
 | P2P 兜底 | CF Worker 应用层字节中继 | ICE 失败 / 15s 协商超时自动切换；无需部署 TURN（详见 [`docs/networking/signaling.md`](docs/networking/signaling.md) §九） |
-| 当前 Phase | Phase 6 ✅ 多人 UI/HUD（2026-05-21） | 见 [`PHASE_6_DONE.md`](PHASE_6_DONE.md) |
+| 当前 Phase | Phase 7 ✅ 渲染优化（2026-05-31） | 见 [`PHASE_7_DONE.md`](PHASE_7_DONE.md) |
 
 ---
 
@@ -80,20 +80,6 @@ docs/
 
 ---
 
-## 五、不在范围（Out of Scope）
-
-明确**不做**的内容（避免后续 agent 误判）：
-
-- **Mod 系统 / JSON 方块定义** — 方块类型直接硬编码在 `core::blocks`
-- **着色器热重载** — 浏览器无文件系统监听 API；开发期依赖 `trunk serve` 整体重载
-- **独立 server 二进制** — `server` crate 仅作 lib
-- **触屏 / 移动端控件** — 列入 `docs/roadmap.md` Phase 9 stretch goal
-- **语音聊天** — 仅文字聊天（Phase 6 实装）
-- **WebGL2 兜底** — Firefox 稳定版需提示切换 nightly 或换浏览器
-- **加密 / 反作弊高级机制** — 仅做最低限度的输入合法性校验
-
----
-
 ## 六、给后续 agent 的工作纪律
 
 1. **修改源代码前先读文档**：跨多个 crate 至少读 `docs/architecture.md` + 对应 `docs/modules/*.md`
@@ -101,3 +87,4 @@ docs/
 3. **文档冲突**：以本 README 决策表为准；其余冲突时 `docs/architecture.md` > `docs/modules/*` > `docs/features/*` > 其它
 4. **代码注释**：必须加上详细的中文注释以供没有图形学基础的人学习，但架构说明只放文档不写进注释
 5. **API 变化**：WGPU 等库新版 API 可能有变化，注意查阅最新文档
+6. **代码检查**：完成代码编辑后必须要通过 fmt 和 clippy 检查
