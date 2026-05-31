@@ -8,6 +8,8 @@ use std::num::NonZeroU64;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use voxweb_core::Aabb;
+
 use crate::vertex::{PackedVertex, vertex_buffer_layout};
 
 /// 每帧上传的全局 uniform：view-projection 矩阵 + 当前绘制 chunk 的 origin。
@@ -25,7 +27,10 @@ pub struct GlobalsUniform {
 /// 同一 buffer 会被合并到最后一次写入，导致所有 chunk 用同一个 chunk_origin 渲染（视觉上"全叠在一起"）。
 pub struct ChunkMeshGpu {
     pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
     pub vertex_count: u32,
+    pub index_count: u32,
+    pub bounds: Aabb,
     pub globals_buffer: wgpu::Buffer,
     pub globals_bind_group: wgpu::BindGroup,
 }
@@ -123,14 +128,21 @@ impl OpaquePass {
         &self,
         device: &wgpu::Device,
         vertices: &[PackedVertex],
+        indices: &[u32],
+        bounds: Aabb,
     ) -> Option<ChunkMeshGpu> {
-        if vertices.is_empty() {
+        if vertices.is_empty() || indices.is_empty() {
             return None;
         }
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk.vbuf"),
             contents: bytemuck::cast_slice(vertices),
             usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chunk.ibuf"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
         });
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk.globals"),
@@ -148,7 +160,10 @@ impl OpaquePass {
         });
         Some(ChunkMeshGpu {
             vertex_buffer,
+            index_buffer,
             vertex_count: vertices.len() as u32,
+            index_count: indices.len() as u32,
+            bounds,
             globals_buffer,
             globals_bind_group,
         })

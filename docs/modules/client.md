@@ -415,7 +415,7 @@ impl InputState {
 
 **指针锁**：进入 InGame 时调用 `canvas.request_pointer_lock()`（必须由用户手势触发，故"开始游戏"按钮的点击事件中发起）。`pointerlockchange` 监听器写回 `pointer_locked`，主循环只在 `pointer_locked=true` 时消费 `mouse_dx/dy` 和 WASD（避免后台移动）。ESC 释放。
 
-### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`（[Phase 2]）
+### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`（[Phase 2 / Phase 7]）
 
 **MeshJobQueue**：
 
@@ -430,7 +430,7 @@ pub enum MeshPriority {
 
 pub struct MeshJobQueue {
     queues: [VecDeque<ChunkPos>; 4],   // 按 MeshPriority 索引
-    pending: HashSet<ChunkPos>,        // 防重 / cancel
+    pending: HashMap<ChunkPos, MeshPriority>, // 防重 / cancel / 优先级升级
 }
 
 impl MeshJobQueue {
@@ -445,13 +445,13 @@ impl MeshJobQueue {
         server: &Server,
         renderer: &mut Renderer,
         now_ms: &dyn Fn() -> f64,
-    );
+    ) -> MeshRunStats;
 }
 ```
 
-`run_until_budget` 每次取最高优先级队列 head，从 `server.world.chunks.get(&pos)` 取出 chunk（若已被卸载就跳过），调 `chunk_mesh::generate_with_neighbors(chunk, pos, &|wx,wy,wz| server.world.get_block_world(...))`，结果通过 `renderer.upload_chunk_mesh` 上传。`(now_ms() - start) as f32 >= budget_ms` 时退出。
+`run_until_budget` 每次取最高优先级队列 head，从 `server.world.chunks.get(&pos)` 取出 chunk（若已被卸载就跳过），调 `chunk_mesh::generate_with_neighbors(chunk, pos, &|wx,wy,wz| server.world.get_block_world(...))`，结果通过 `renderer.upload_chunk_mesh` 上传。`(now_ms() - start) as f32 >= budget_ms` 时退出，并返回本批 `MeshRunStats` 给 HUD。
 
-> **防重语义**：同 chunk 二次 `enqueue` 被忽略，保留最早的优先级（不"升级"）。如需调整优先级，先 `cancel` 再 `enqueue`。
+> **防重语义**：同 chunk 二次 `enqueue` 默认去重；若新优先级高于旧优先级，则从旧队列移除并升级。玩家脚下 chunk 因此能及时进入 `Critical`。
 
 **ChunkLoader**：
 

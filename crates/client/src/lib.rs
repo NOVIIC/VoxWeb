@@ -41,7 +41,7 @@ use crate::app::{
 use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
-use crate::mesh_jobs::MeshPriority;
+use crate::mesh_jobs::{MeshPriority, MeshRunStats};
 use crate::prediction::{PendingAction, PendingKind, reconcile_self};
 use crate::raycast::raycast;
 use crate::ui::lobby::{
@@ -57,6 +57,42 @@ const PING_INTERVAL_MS: f64 = 5000.0;
 
 /// 信令服务 URL meta tag 名称。
 const SIGNALING_META_NAME: &str = "signaling-url";
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FramePerfStats {
+    mesh_ms: f32,
+    mesh_jobs: u32,
+    mesh_vertices: u32,
+    mesh_indices: u32,
+    mesh_phase2_vertices: u32,
+    world_pass_ms: f32,
+    player_pass_ms: f32,
+    selection_pass_ms: f32,
+    egui_pass_ms: f32,
+    visible_chunks: usize,
+    culled_chunks: usize,
+    drawn_vertices: u32,
+    drawn_indices: u32,
+}
+
+impl FramePerfStats {
+    fn record_mesh(&mut self, stats: MeshRunStats) {
+        self.mesh_ms = stats.elapsed_ms;
+        self.mesh_jobs = stats.jobs_processed;
+        self.mesh_vertices = stats.vertices_uploaded;
+        self.mesh_indices = stats.indices_uploaded;
+        self.mesh_phase2_vertices = stats.phase2_vertices;
+    }
+
+    fn mesh_reduction_percent(&self) -> Option<f32> {
+        if self.mesh_phase2_vertices == 0 {
+            return None;
+        }
+        Some(
+            ((1.0 - self.mesh_vertices as f32 / self.mesh_phase2_vertices as f32) * 100.0).max(0.0),
+        )
+    }
+}
 
 /// 全局 App：跨 state 持有 renderer / egui / input；InGame 时持有 Game。
 struct App {
@@ -96,6 +132,9 @@ struct App {
 
     /// 已被升级为信令中继的 peer 集合。仅供 UI 在玩家名牌 / 列表里加「中继中」徽标。
     relayed_peers: HashSet<u32>,
+
+    /// Phase 7：上一帧的 CPU pass / 网格化统计，用于 HUD。
+    perf: FramePerfStats,
 }
 
 #[wasm_bindgen(start)]
@@ -161,6 +200,7 @@ pub async fn start() -> Result<(), JsValue> {
         request_pointer_lock_next: false,
         preload_state: None,
         relayed_peers: HashSet::new(),
+        perf: FramePerfStats::default(),
     }));
 
     install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
@@ -1685,7 +1725,7 @@ fn render_game_frame(
     }
 
     // —— 6. mesh_jobs run_until_budget ——
-    {
+    let mesh_stats = {
         let mut a = app.borrow_mut();
         let App {
             ref mut renderer,
@@ -1697,8 +1737,9 @@ fn render_game_frame(
         };
         let server_borrow = game.server.borrow();
         game.mesh_jobs
-            .run_until_budget(mesh_budget, &server_borrow, renderer, &now_ms);
-    }
+            .run_until_budget(mesh_budget, &server_borrow, renderer, &now_ms)
+    };
+    app.borrow_mut().perf.record_mesh(mesh_stats);
 
     // —— 7. egui HUD（Phase 6：含玩家列表 / 名牌 / 聊天浮窗 / 聊天框 / 暂停菜单） ——
     let pointer_locked = app.borrow().input.borrow().pointer_locked;
@@ -1717,6 +1758,7 @@ fn render_game_frame(
             ..Default::default()
         };
         // 提前抓出本帧 HUD 用的只读快照（避免后续 closure 内对 game 同时持有可变和不可变借用）
+        let perf = a.perf;
         let hud_data = a.game.as_ref().map(|g| HudData {
             fps: fps_display,
             pos: (
@@ -1738,6 +1780,7 @@ fn render_game_frame(
             room_id: g.room_id.clone(),
             relayed_peer_count: a.relayed_peers.len(),
             show_stats: g.settings.show_stats,
+            perf,
         });
         // 装配 PlayerListEntry：自己（is_me=true）+ 远端，按 entity_id 升序
         let player_list_entries: Vec<ui::players::PlayerListEntry> =
@@ -1929,10 +1972,14 @@ fn render_game_frame(
         });
 
         // 世界 Pass
-        a.renderer
-            .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+        let world_start = now_ms();
+        let world_stats =
+            a.renderer
+                .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+        let world_pass_ms = (now_ms() - world_start) as f32;
 
         // Phase 5 玩家实体 Pass：从插值器拿远端位置 → instance buffer → 渲染
+        let player_start = now_ms();
         {
             let now = now_ms();
             let mut instances: Vec<voxweb_render::passes::player::PlayerInstance> = Vec::new();
@@ -1956,12 +2003,16 @@ fn render_game_frame(
             a.renderer.upload_player_instances(&instances);
             a.renderer.render_players(&mut encoder, &view, view_proj);
         }
+        let player_pass_ms = (now_ms() - player_start) as f32;
 
         // 选中方块线框（命中时）
+        let selection_start = now_ms();
         a.renderer
             .render_selection(&mut encoder, &view, view_proj, current_hit_pos);
+        let selection_pass_ms = (now_ms() - selection_start) as f32;
 
         // egui Pass
+        let egui_start = now_ms();
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [cw, ch],
             pixels_per_point,
@@ -1994,6 +2045,16 @@ fn render_game_frame(
             a.egui_renderer
                 .render(&mut pass, &paint_jobs, &screen_descriptor);
         }
+        let egui_pass_ms = (now_ms() - egui_start) as f32;
+
+        a.perf.world_pass_ms = world_pass_ms;
+        a.perf.player_pass_ms = player_pass_ms;
+        a.perf.selection_pass_ms = selection_pass_ms;
+        a.perf.egui_pass_ms = egui_pass_ms;
+        a.perf.visible_chunks = world_stats.visible_chunks;
+        a.perf.culled_chunks = world_stats.culled_chunks;
+        a.perf.drawn_vertices = world_stats.drawn_vertices;
+        a.perf.drawn_indices = world_stats.drawn_indices;
 
         queue.submit(
             extra_cmds
@@ -2307,6 +2368,8 @@ struct HudData {
     relayed_peer_count: usize,
     /// Phase 6：[`AppSettings::show_stats`] 透传。false 时跳过左上角统计面板（保留准星 / hotbar）。
     show_stats: bool,
+    /// Phase 7：上一帧渲染 / 网格化统计。
+    perf: FramePerfStats,
 }
 
 fn draw_hud(ctx: &egui::Context, data: HudData) {
@@ -2351,6 +2414,43 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             format!(
                                 "CHUNKS {}  MESH_Q {}",
                                 data.loaded_chunks, data.mesh_pending
+                            ),
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(160, 175, 190),
+                            format!(
+                                "VISIBLE {}  CULLED {}  DRAW_V/I {}/{}",
+                                data.perf.visible_chunks,
+                                data.perf.culled_chunks,
+                                data.perf.drawn_vertices,
+                                data.perf.drawn_indices
+                            ),
+                        );
+                        let reduction = data
+                            .perf
+                            .mesh_reduction_percent()
+                            .map(|v| format!("{v:>5.1}%"))
+                            .unwrap_or_else(|| "  -- ".to_string());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(170, 200, 210),
+                            format!(
+                                "MESH {:>4.1}ms  jobs {}  v {}→{}  i {}  -{}",
+                                data.perf.mesh_ms,
+                                data.perf.mesh_jobs,
+                                data.perf.mesh_phase2_vertices,
+                                data.perf.mesh_vertices,
+                                data.perf.mesh_indices,
+                                reduction
+                            ),
+                        );
+                        ui.colored_label(
+                            egui::Color32::from_rgb(170, 190, 220),
+                            format!(
+                                "PASS world {:>4.1}  player {:>4.1}  sel {:>4.1}  ui {:>4.1} ms",
+                                data.perf.world_pass_ms,
+                                data.perf.player_pass_ms,
+                                data.perf.selection_pass_ms,
+                                data.perf.egui_pass_ms
                             ),
                         );
                         // Phase 4：网络模式 + RTT + 房间号

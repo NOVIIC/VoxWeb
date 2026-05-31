@@ -320,7 +320,7 @@ WebGPU 状态、当前后端、错误日志。
 
 ### 6.4 性能 overlay（项目内）
 
-启用 `RenderSettings.show_stats` 或按 F3，HUD 显示各阶段耗时。
+启用 `AppSettings.show_stats`（暂停菜单）后，HUD 显示 FPS、chunk/mesh 队列、Phase 7 视锥剔除数量、draw 顶点/索引数、mesh 批次耗时和各 pass 的 CPU 编码耗时。
 
 ### 6.5 远程 Source Map
 

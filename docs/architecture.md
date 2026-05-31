@@ -168,7 +168,7 @@ VoxWeb/
 │   │       │   ├── skybox.rs   # 天空盒 Pass（Phase 8 实装）
 │   │       │   ├── transparent.rs # 半透明 Pass（Phase 8 实装）
 │   │       │   └── selection.rs   # 选中方块线框 Pass（Phase 3）
-│   │       ├── chunk_mesh.rs   # 朴素逐面网格化 + 跨区块面剔除（贪婪算法 Phase 7）
+│   │       ├── chunk_mesh.rs   # 贪婪网格化 + 跨区块面剔除 + AO + bounds（Phase 7）
 │   │       ├── vertex.rs       # u32 压缩格式
 │   │       ├── texture.rs      # 纹理图集
 │   │       └── shaders/

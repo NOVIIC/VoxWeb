@@ -226,9 +226,12 @@ FPS: 60.2
 朝向: yaw=45° pitch=-12°
 延迟: 78ms (peer)
 状态: Connected
+VISIBLE / CULLED / DRAW_V/I
+MESH ms / jobs / Phase2→Greedy 顶点
+PASS world / player / selection / ui ms
 ```
 
-仅在 `app.settings.show_stats == true` 显示（按 F3 切换）。
+仅在 `app.settings.show_stats == true` 显示（暂停菜单可切换）。Phase 7 起左上角统计面板也显示视锥剔除数量、draw 顶点/索引数、网格化批次耗时和各 pass 的 CPU 编码耗时。
 
 ### 右上角：玩家列表
 
@@ -349,7 +352,7 @@ egui::Area::new(egui::Id::new("hud_hotbar"))
 │                                              │
 │   插值延迟：  ( ) 50ms  (●) 100ms  ( ) 150ms   │
 │                                              │
-│   ☑ 显示统计信息 (F3)                          │
+│   ☑ 显示统计信息                              │
 │   ☐ 启用 Depth Pre-Pass                       │
 │                                              │
 │   [继续游戏]    [退出到大厅]                    │
@@ -381,7 +384,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
                 ui.radio_value(&mut app.settings.interp_delay_ms, 150.0, "150ms");
             });
 
-            ui.checkbox(&mut app.settings.show_stats, "显示统计信息 (F3)");
+            ui.checkbox(&mut app.settings.show_stats, "显示统计信息");
             ui.checkbox(&mut app.settings.depth_prepass, "启用 Depth Pre-Pass");
 
             ui.add_space(20.0);

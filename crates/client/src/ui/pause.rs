@@ -67,8 +67,7 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
                 ui.radio_value(&mut settings.interp_delay_ms, 150.0, "150ms");
             });
 
-            // F3 也可以切换；这里给鼠标用户一个显式开关。
-            ui.checkbox(&mut settings.show_stats, "Show Stats (F3)");
+            ui.checkbox(&mut settings.show_stats, "Show Stats");
 
             ui.add_space(20.0);
 

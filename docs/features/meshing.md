@@ -23,9 +23,9 @@
 |---|---|
 | **Phase 1 ✅** | u32 顶点压缩格式（§2）；朴素逐面（`generate_opaque_mesh`） |
 | **Phase 2 ✅** | `generate_with_neighbors`（§4 跨区块面剔除）；`MeshJobQueue` + `MeshPriority` 4 档枚举（§6） |
-| Phase 7 | 贪婪网格化（§3 替换朴素逐面）；AO（§5）；视锥剔除（§9） |
+| **Phase 7 ✅** | 贪婪网格化（§3 替换朴素逐面）；AO（§5）；视锥剔除（§9）；index buffer + 性能统计 |
 
-下面 §3 贪婪算法、§5 AO、§9 视锥剔除均为 **Phase 7 设计**；Phase 2 实装使用朴素逐面 + 跨区块剔除。
+Phase 7 已将默认路径切到贪婪网格化 + AO + index buffer；`ChunkMeshCpu::visible_faces` 保留 Phase 2 等价顶点数，供 HUD 展示优化比例。
 
 ---
 
@@ -34,40 +34,24 @@
 ### 位段布局
 
 ```
-位 31 ────────────────────────────── 位 0
-┌─────────────────────────────────────────┐
-│  AO  │ Tex │  Face  │   z   │   y    │   x   │
-│ 2bit │8bit │  3bit  │ 4bit  │ 8bit   │ 4bit  │
-└─────────────────────────────────────────┘
-       未使用：3 位（位段从右往左排列）
+位 31 ─────────────────────────────────────── 位 0
+┌──────────────────────────────────────────────┐
+│ AO  │ Tex │ Face │    z   │    y    │   x   │
+│2bit │8bit │3bit  │ 5bit   │ 9bit    │ 5bit  │
+└──────────────────────────────────────────────┘
+   = 2 + 8 + 3 + 5 + 9 + 5 = 32 bits
 ```
 
 | 字段 | 位数 | 含义 | 范围 |
 |---|---|---|---|
-| `local_x` | 4 | 区块内 X | 0..16（含边界 16，故需 4+1 即可，但贪婪合并后位置可达 16，故用 5 位也行；保险用 4 位时把"16"用单独一位标记。本期方案：实际上贪婪面合并后顶点 x 范围 0..16，含 16 → 至少 5 位。**调整：x 用 5 bit，z 用 5 bit，face 占 3 bit，y 用 8 bit, tex 8 bit, ao 2 bit, 余 1 bit**） |
-
-> **修正布局**（贪婪合并要求顶点能取到边界值，含 16）：
-
-```
-位 31 ─────────────────────────────────────── 位 0
-┌──────────────────────────────────────────────┐
-│ rsv │ AO  │ Tex │ Face │   z   │   y   │   x  │
-│ 1bit│2bit │8bit │ 3bit │ 5bit  │ 8bit  │ 5bit │
-└──────────────────────────────────────────────┘
-   = 1 + 2 + 8 + 3 + 5 + 8 + 5 = 32 bits ✓
-```
-
-| 字段 | 位数 | 范围 | 含义 |
-|---|---|---|---|
 | `local_x` | 5 | 0..32 | 区块内 X（含上界 16）|
-| `local_y` | 8 | 0..256 | 区块内 Y |
+| `local_y` | 9 | 0..512 | 区块内 Y（含上界 256） |
 | `local_z` | 5 | 0..32 | 区块内 Z |
 | `face` | 3 | 0..7 | 法线方向（PosX/NegX/PosY/NegY/PosZ/NegZ） |
 | `texture_index` | 8 | 0..256 | 纹理图集槽位 |
 | `ao_factor` | 2 | 0..4 | 4 等级 AO |
-| `reserved` | 1 | — | 预留 |
 
-> 5 位 X/Z 略奢侈（实际只用 0..17），但保留扩展余量更安全。
+> 5 位 X/Z 略奢侈（实际只用 0..16），但保留扩展余量更安全；Y 需要 9 位，因为贪婪面顶点可落在 `ly = 256` 顶界。
 
 ### Rust 编码
 
@@ -75,18 +59,17 @@
 pub fn pack(local_x: u8, local_y: u8, local_z: u8,
             face: Face, texture: u8, ao: u8) -> u32 {
     debug_assert!(local_x <= 31);
-    debug_assert!(local_y <= 255);
+    debug_assert!(local_y <= 256);
     debug_assert!(local_z <= 31);
     debug_assert!(face as u8 <= 7);
     debug_assert!(ao <= 3);
 
     (local_x as u32) & 0x1F
-        | ((local_y as u32) & 0xFF) << 5
-        | ((local_z as u32) & 0x1F) << 13
-        | ((face as u32) & 0x7) << 18
-        | ((texture as u32) & 0xFF) << 21
-        | ((ao as u32) & 0x3) << 29
-        // 第 31 位 reserved
+        | ((local_y as u32) & 0x1FF) << 5
+        | ((local_z as u32) & 0x1F) << 14
+        | ((face as u32) & 0x7) << 19
+        | ((texture as u32) & 0xFF) << 22
+        | ((ao as u32) & 0x3) << 30
 }
 ```
 
@@ -102,11 +85,11 @@ struct UnpackedVertex {
 
 fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex {
     let lx = f32(packed & 0x1Fu);
-    let ly = f32((packed >> 5u) & 0xFFu);
-    let lz = f32((packed >> 13u) & 0x1Fu);
-    let face = (packed >> 18u) & 0x7u;
-    let tex = (packed >> 21u) & 0xFFu;
-    let ao_raw = (packed >> 29u) & 0x3u;
+    let ly = f32((packed >> 5u) & 0x1FFu);
+    let lz = f32((packed >> 14u) & 0x1Fu);
+    let face = (packed >> 19u) & 0x7u;
+    let tex = (packed >> 22u) & 0xFFu;
+    let ao_raw = (packed >> 30u) & 0x3u;
 
     var out: UnpackedVertex;
     out.world_pos = chunk_origin + vec3<f32>(lx, ly, lz);
@@ -131,7 +114,7 @@ UV 计算：贪婪合并后的大矩形，UV 从 (0,0) 一直平铺到 (w, h) �
 
 ## 三、贪婪网格化算法
 
-> **Phase 7** 引入。Phase 2 实装使用 `generate_with_neighbors` 朴素逐面（每方块 6 面遍历），先把跨区块剔除做对，再在 Phase 7 替换为贪婪算法。下面是 Phase 7 设计。
+> **Phase 7 已实装**。`generate_with_neighbors` 保持原入口，但内部已从逐面遍历切换为贪婪 mask 合并；同材质且 4 个角点 AO 完全一致的单位面才会合并。
 
 ### 思路
 对每个面方向（6 个），按层（如 PosY 面就按 Y 层）扫描每一层 16×16 平面，把"需要绘制此面"的格子加入 mask，然后从 mask 中提取最大矩形（贪婪扩展宽高），生成一个大四边形。
@@ -228,8 +211,8 @@ for ly in 0..CHUNK_Y {
 `generate_with_neighbors` 接收一个回调，能查询世界坐标的方块：
 
 ```rust
-/// [Phase 2] 跨区块面剔除版本的网格化。
-/// 朴素逐面遍历 chunk 内每个方块，对每个面查询 get_block_world 决定是否发射。
+/// 跨区块面剔除版本的网格化。
+/// Phase 7 内部使用贪婪 mask 合并；每个候选面仍通过 get_block_world 判断可见性。
 /// 同 chunk 内的查询也走这个回调（统一接口，回调内部自行判断 chunk 内/外）。
 pub fn generate_with_neighbors(
     chunk: &Chunk,
@@ -256,7 +239,7 @@ let mesh = chunk_mesh::generate_with_neighbors(
 
 ## 五、AO 计算
 
-> **Phase 7** 引入。Phase 2 顶点 AO 一律为 3（最亮，无遮蔽）。
+> **Phase 7 已实装**。Phase 2 顶点 AO 一律为 3（最亮，无遮蔽）；Phase 7 起 AO 写入 packed vertex 的最高 2 bit，并由 `chunk.wgsl` 做亮度衰减。
 
 每个顶点的 AO 取决于附近 3 个方块（同面方向的两个邻接边 + 一个对角）：
 
@@ -300,8 +283,9 @@ pub fn run_until_budget(
     server: &Server,
     renderer: &mut Renderer,
     now_ms: &dyn Fn() -> f64,        // 注入 performance.now() 便于测试
-) {
+) -> MeshRunStats {
     let start = now_ms();
+    let mut stats = MeshRunStats::default();
     loop {
         if (now_ms() - start) as f32 >= budget_ms { break; }
         let Some(pos) = self.pop_highest() else { break; };
@@ -310,12 +294,18 @@ pub fn run_until_budget(
             chunk, pos,
             &|wx, wy, wz| server.world.get_block_world(wx, wy, wz),
         );
+        stats.jobs_processed += 1;
+        stats.vertices_uploaded += mesh.vertex_count();
+        stats.indices_uploaded += mesh.index_count();
+        stats.phase2_vertices += mesh.phase2_vertex_count();
         renderer.upload_chunk_mesh(pos, &mesh);
     }
+    stats.elapsed_ms = (now_ms() - start) as f32;
+    stats
 }
 ```
 
-`now_ms` 在运行期是 `web_sys::Performance::now()` 的薄包装；单元测试可注入受控时钟。
+`now_ms` 在运行期是 `web_sys::Performance::now()` 的薄包装；单元测试可注入受控时钟。`MeshRunStats` 被 HUD 用来显示本批 mesh 的耗时、上传顶点/索引数和相对 Phase 2 的顶点减少比例。
 
 ### 触发条件
 
@@ -325,8 +315,8 @@ pub fn run_until_budget(
 - 邻居 chunk 由"未加载"变"已加载"时 — Phase 2 由 `ChunkLoader.update` 显式触发（见 `docs/modules/client.md` §6.7）
 - 玩家走出后再回来 — Phase 2 由 `ChunkLoader.update` 触发
 
-### 防重复
-`pending: HashSet<ChunkPos>` 防止同一 chunk 入队两次。需要重新网格化时设 `dirty` 标记，下一帧 dequeue 后再判断是否仍 dirty。
+### 防重复 / 优先级升级
+`pending: HashMap<ChunkPos, MeshPriority>` 防止同一 chunk 入队两次；若已排队的 chunk 又以更高优先级入队，则从旧队列移除并升级到新队列。这样玩家脚下的 `Critical` chunk 不会被早先的 `Medium/Low` 任务卡住。
 
 ---
 
@@ -359,44 +349,32 @@ fn enqueue_with_neighbors(&mut self, pos: Position, priority: Priority) {
 
 ## 八、CPU 数据结构
 
-### Phase 2 实装（朴素逐面 + 跨区块剔除）
+### Phase 7 实装（贪婪网格 + index buffer + bounds）
 
 ```rust
 pub struct ChunkMeshCpu {
-    pub vertices: Vec<PackedVertex>,   // PackedVertex 等价 u32
-}
-
-impl ChunkMeshCpu {
-    pub fn vertex_count(&self) -> u32 { self.vertices.len() as u32 }
-}
-```
-
-每个面发射 6 个顶点（2 个三角形，索引顺序 (0,1,2)+(0,2,3)）。Phase 2 不使用 index buffer：暴露率约 10-30% 下顶点量可控，省一次 buffer 上传更划算。
-
-### Phase 7+ 目标形态
-
-```rust
-pub struct ChunkMeshCpu {
-    pub vertices: Vec<u32>,        // packed
+    pub vertices: Vec<PackedVertex>, // packed u32
     pub indices: Vec<u32>,         // 贪婪合并后每 quad 6 个索引
     pub bounds: Aabb,              // 视锥剔除用
+    pub visible_faces: u32,         // Phase 2 等价可见单位面数量
 }
 
 pub struct ChunkMeshGpu {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
+    pub vertex_count: u32,
     pub index_count: u32,
-    pub bounds: Aabb,
+    pub bounds: Aabb,               // 世界坐标 AABB
 }
 ```
 
-`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 buffers + 写数据）。Phase 2 的 `ChunkMeshGpu` 已经为每个 chunk 持有独立 `globals_buffer + bind_group`，以规避 `queue.write_buffer` 合并写入问题（详见 [`docs/reference.md` §3.1](../reference.md#31-webgpu)）。
+`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 vertex/index buffers + 写入世界坐标 bounds）。每个 chunk 继续持有独立 `globals_buffer + bind_group`，以规避 `queue.write_buffer` 合并写入问题（详见 [`docs/reference.md` §3.1](../reference.md#31-webgpu)）。Phase 7 的 OpaquePass 在单个 render pass 内循环 `set_bind_group` + `draw_indexed`，不再为每个 chunk 开一个 render pass。
 
 ---
 
 ## 九、视锥剔除
 
-> **Phase 7** 引入。Phase 2 渲染距离 6 时 chunk 数 ≈ 169，朴素逐面 + 跨区块剔除下顶点量可控，本期不做视锥剔除。
+> **Phase 7 已实装**。`Renderer::render_world` 从 `view_proj` 抽取 6 个平面，按 chunk 的世界 AABB 做正顶点测试，HUD 显示 `VISIBLE / CULLED / DRAW_V/I`。
 
 每帧渲染前根据相机视锥过滤需要 draw 的 chunk：
 
