@@ -156,7 +156,7 @@ pub struct AppSettings {
     pub render_distance: u32,
     /// 远端玩家位置插值延迟（毫秒）。选项 50 / 100 / 150。
     pub interp_delay_ms: f32,
-    /// 是否显示左上角统计 HUD（F3 切换）。
+    /// 是否显示左上角统计 HUD（暂停菜单切换）。
     pub show_stats: bool,
 
     /// Fly 模式速度（方块/秒）；不持久化。

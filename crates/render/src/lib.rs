@@ -19,9 +19,9 @@ pub mod vertex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Mat4, Vec3};
-use voxweb_core::ChunkPos;
+use glam::{Mat4, Vec3, Vec4};
 use voxweb_core::chunk::Position;
+use voxweb_core::{Aabb, ChunkPos};
 
 use crate::chunk_mesh::ChunkMeshCpu;
 use crate::passes::opaque::{ChunkMeshGpu, GlobalsUniform, OpaquePass};
@@ -30,6 +30,16 @@ use crate::passes::selection::{SelectionGlobals, SelectionPass};
 
 /// 深度纹理格式（与 OpaquePass 中的 DepthStencilState 对齐）。
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
+/// 本帧世界渲染统计。CPU 侧编码时统计，用于 Phase 7 HUD。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorldRenderStats {
+    pub total_chunks: usize,
+    pub visible_chunks: usize,
+    pub culled_chunks: usize,
+    pub drawn_vertices: u32,
+    pub drawn_indices: u32,
+}
 
 /// 顶层渲染器。持有 wgpu 设备、Surface、Pipeline、所有 Chunk 网格 GPU 资源。
 pub struct Renderer {
@@ -106,10 +116,21 @@ impl Renderer {
 
     /// 把一个 Chunk 的 CPU 网格上传到 GPU。空网格会显式从缓存中删除。
     pub fn upload_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMeshCpu) {
-        match self
-            .opaque_pass
-            .upload_chunk_mesh(&self.device, &mesh.vertices)
-        {
+        let chunk_origin_world = Vec3::new(
+            pos.x as f32 * voxweb_core::CHUNK_X as f32,
+            0.0,
+            pos.z as f32 * voxweb_core::CHUNK_Z as f32,
+        );
+        let world_bounds = Aabb::new(
+            mesh.bounds.min + chunk_origin_world,
+            mesh.bounds.max + chunk_origin_world,
+        );
+        match self.opaque_pass.upload_chunk_mesh(
+            &self.device,
+            &mesh.vertices,
+            &mesh.indices,
+            world_bounds,
+        ) {
             Some(gpu) => {
                 self.chunk_meshes.insert(pos, gpu);
             }
@@ -133,6 +154,22 @@ impl Renderer {
     /// 已上传的 chunk 数量。
     pub fn loaded_chunk_count(&self) -> usize {
         self.chunk_meshes.len()
+    }
+
+    /// 已上传 chunk 的顶点总数（贪婪合并后）。
+    pub fn uploaded_vertex_count(&self) -> u32 {
+        self.chunk_meshes
+            .values()
+            .map(|mesh| mesh.vertex_count)
+            .sum()
+    }
+
+    /// 已上传 chunk 的索引总数。
+    pub fn uploaded_index_count(&self) -> u32 {
+        self.chunk_meshes
+            .values()
+            .map(|mesh| mesh.index_count)
+            .sum()
     }
 
     /// 取得本帧 surface texture。失败（Outdated/Lost）时自动重配 Surface 并返回 None。
@@ -170,11 +207,13 @@ impl Renderer {
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
         clear_color: [f64; 4],
-    ) {
+    ) -> WorldRenderStats {
         let pass_label = "opaque_pass";
+        let mut stats = WorldRenderStats {
+            total_chunks: self.chunk_meshes.len(),
+            ..WorldRenderStats::default()
+        };
 
-        // 每个 chunk 上传不同的 chunk_origin → 多次 draw 之间需要刷新 globals
-        // Phase 1：chunk 数量极少（演示用 1 个），简单地循环上传 + 单 draw
         if self.chunk_meshes.is_empty() {
             // 仍然要"清屏 + 清深度"，否则 surface 上会留旧帧像素
             let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -205,19 +244,29 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            return;
+            return stats;
         }
 
-        // 取出 (pos, gpu) 列表的"键引用"：原 HashMap 借用必须早于 begin_render_pass 之前结束
-        // —— 为简化生命周期，先收集到 Vec<(ChunkPos, &ChunkMeshGpu)>
-        let entries: Vec<(ChunkPos, &ChunkMeshGpu)> =
-            self.chunk_meshes.iter().map(|(p, m)| (*p, m)).collect();
+        let frustum = Frustum::from_view_proj(view_proj);
+        let entries: Vec<(ChunkPos, &ChunkMeshGpu)> = self
+            .chunk_meshes
+            .iter()
+            .filter(|(_, mesh)| frustum.intersects_aabb(&mesh.bounds))
+            .map(|(p, m)| (*p, m))
+            .collect();
 
-        // 每个 chunk 自带一个 globals uniform buffer，避免 queue.write_buffer 在 submit 前
-        // 被合并到最后一次写入（那会让所有 chunk 用同一个 chunk_origin → 视觉上"全叠在一起"）。
-        // 仍然每个 chunk 一个独立 RenderPass：第一个清屏，后续 Load。
+        stats.visible_chunks = entries.len();
+        stats.culled_chunks = stats.total_chunks.saturating_sub(stats.visible_chunks);
+        stats.drawn_vertices = entries
+            .iter()
+            .map(|(_, mesh)| mesh.vertex_count)
+            .sum::<u32>();
+        stats.drawn_indices = entries
+            .iter()
+            .map(|(_, mesh)| mesh.index_count)
+            .sum::<u32>();
 
-        for (i, (pos, mesh)) in entries.iter().enumerate() {
+        for (pos, mesh) in &entries {
             let chunk_origin_world = Vec3::new(
                 pos.x as f32 * voxweb_core::CHUNK_X as f32,
                 0.0,
@@ -235,51 +284,44 @@ impl Renderer {
             // 写到该 chunk 自己的 uniform buffer
             self.queue
                 .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        }
 
-            let load_op = if i == 0 {
-                wgpu::LoadOp::Clear(wgpu::Color {
-                    r: clear_color[0],
-                    g: clear_color[1],
-                    b: clear_color[2],
-                    a: clear_color[3],
-                })
-            } else {
-                wgpu::LoadOp::Load
-            };
-            let depth_load = if i == 0 {
-                wgpu::LoadOp::Clear(1.0)
-            } else {
-                wgpu::LoadOp::Load
-            };
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(pass_label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: load_op,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: depth_load,
-                        store: wgpu::StoreOp::Store,
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(pass_label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: clear_color[0],
+                        g: clear_color[1],
+                        b: clear_color[2],
+                        a: clear_color[3],
                     }),
-                    stencil_ops: None,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
                 }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.opaque_pass.pipeline);
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.opaque_pass.pipeline);
+        for (_, mesh) in entries {
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.draw(0..mesh.vertex_count, 0..1);
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
+        stats
     }
 
     /// 渲染选中方块的线框。`block_pos = None` 时跳过（玩家未瞄准任何方块）。
@@ -352,6 +394,84 @@ impl Renderer {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Plane {
+    normal: Vec3,
+    d: f32,
+}
+
+impl Plane {
+    fn from_vec4(v: Vec4) -> Self {
+        let normal = Vec3::new(v.x, v.y, v.z);
+        let len = normal.length();
+        if len > 0.0 {
+            Self {
+                normal: normal / len,
+                d: v.w / len,
+            }
+        } else {
+            Self { normal, d: v.w }
+        }
+    }
+
+    fn distance_to_positive_vertex(&self, aabb: &Aabb) -> f32 {
+        let p = Vec3::new(
+            if self.normal.x >= 0.0 {
+                aabb.max.x
+            } else {
+                aabb.min.x
+            },
+            if self.normal.y >= 0.0 {
+                aabb.max.y
+            } else {
+                aabb.min.y
+            },
+            if self.normal.z >= 0.0 {
+                aabb.max.z
+            } else {
+                aabb.min.z
+            },
+        );
+        self.normal.dot(p) + self.d
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Frustum {
+    planes: [Plane; 6],
+}
+
+impl Frustum {
+    fn from_view_proj(view_proj: Mat4) -> Self {
+        // glam::Mat4 是列主序；先取出四个 row，再按 WebGPU 0..1 深度范围抽取平面。
+        let c0 = view_proj.x_axis;
+        let c1 = view_proj.y_axis;
+        let c2 = view_proj.z_axis;
+        let c3 = view_proj.w_axis;
+        let row0 = Vec4::new(c0.x, c1.x, c2.x, c3.x);
+        let row1 = Vec4::new(c0.y, c1.y, c2.y, c3.y);
+        let row2 = Vec4::new(c0.z, c1.z, c2.z, c3.z);
+        let row3 = Vec4::new(c0.w, c1.w, c2.w, c3.w);
+
+        Self {
+            planes: [
+                Plane::from_vec4(row3 + row0), // left
+                Plane::from_vec4(row3 - row0), // right
+                Plane::from_vec4(row3 + row1), // bottom
+                Plane::from_vec4(row3 - row1), // top
+                Plane::from_vec4(row2),        // near: z >= 0
+                Plane::from_vec4(row3 - row2), // far: z <= w
+            ],
+        }
+    }
+
+    fn intersects_aabb(&self, aabb: &Aabb) -> bool {
+        self.planes
+            .iter()
+            .all(|plane| plane.distance_to_positive_vertex(aabb) >= 0.0)
+    }
+}
+
 /// 读取 canvas 的 client width/height，作为 surface 的 logical pixel 尺寸。
 fn canvas_size(canvas: &web_sys::HtmlCanvasElement) -> (u32, u32) {
     let w = (canvas.client_width().max(1)) as u32;
@@ -381,4 +501,23 @@ fn create_depth(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_frustum_accepts_ndc_unit_box() {
+        let f = Frustum::from_view_proj(Mat4::IDENTITY);
+        let inside = Aabb::new(Vec3::new(-0.5, -0.5, 0.1), Vec3::new(0.5, 0.5, 0.9));
+        assert!(f.intersects_aabb(&inside));
+    }
+
+    #[test]
+    fn identity_frustum_rejects_box_past_right_plane() {
+        let f = Frustum::from_view_proj(Mat4::IDENTITY);
+        let outside = Aabb::new(Vec3::new(1.2, -0.5, 0.1), Vec3::new(2.0, 0.5, 0.9));
+        assert!(!f.intersects_aabb(&outside));
+    }
 }

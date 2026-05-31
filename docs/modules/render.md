@@ -34,7 +34,7 @@ crates/render/src/
 │   ├── skybox.rs       天空盒 Pass（Phase 8 实装）
 │   ├── transparent.rs  半透明 Pass（Phase 8 实装）
 │   └── selection.rs    选中方块线框 Pass（Phase 3）
-├── chunk_mesh.rs       朴素逐面网格化 + 跨区块面剔除（贪婪算法 Phase 7）
+├── chunk_mesh.rs       贪婪网格化 + 跨区块面剔除 + AO + bounds（Phase 7）
 ├── vertex.rs           u32 压缩格式 + 解包工具
 ├── texture.rs          纹理图集
 └── shaders/
@@ -205,11 +205,11 @@ graph.add_pass(Box::new(UiPass::new(...)));            // egui-wgpu 容器
 **输出**：写入 color + depth（`Less`，`store`）
 **Pipeline 设置**：
 - 深度比较：`Less`（如果有 Depth Pre-Pass，可改 `Equal` 进一步省 fragment work）
-- Cull 模式：`Back`
+- Cull 模式：当前为 `None`（贪婪网格 winding 已保持外侧 CCW，但 Phase 7 优先保证可视正确性；后续可单独启用 Back-face culling 验证收益）
 - Blend：禁用
-- 顶点格式：`PackedVertex`（u32）
+- 顶点格式：`PackedVertex`（u32）+ `u32` index buffer
 
-**Draw 调用顺序**：按 chunk 距离从近到远排序（虽然有深度测试，但近处先 draw 能让远处更多 fragment 被剔除）。
+**Draw 调用顺序**：Phase 7 先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 
@@ -301,9 +301,10 @@ impl Renderer {
     /// 取得本帧 surface texture（失败时自动重配 Surface）
     pub fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture>;
 
-    /// 渲染世界（OpaquePass）：清屏 + 遍历所有 chunk_meshes 绘制
+    /// 渲染世界（OpaquePass）：清屏 + 视锥剔除 + 单 render pass 内 draw_indexed
     pub fn render_world(&mut self, encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView, view_proj: Mat4, clear_color: [f64; 4]);
+        color_view: &wgpu::TextureView, view_proj: Mat4, clear_color: [f64; 4])
+        -> WorldRenderStats;
 
     /// 渲染选中方块线框（在 render_world 之后调用）
     pub fn render_selection(&mut self, encoder: &mut wgpu::CommandEncoder,
@@ -311,10 +312,12 @@ impl Renderer {
 
     pub fn depth_view(&self) -> &wgpu::TextureView;
     pub fn loaded_chunk_count(&self) -> usize;
+    pub fn uploaded_vertex_count(&self) -> u32;
+    pub fn uploaded_index_count(&self) -> u32;
 }
 ```
 
-> **注**：当前 Renderer 未持有 egui renderer / camera buffer / RenderSettings。egui 渲染由 client 自行管理；camera uniform 通过 `render_world` 的 `view_proj` 参数每帧传入。`RenderGraph` trait 在 [graph.rs](graph.rs) 中已定义但渲染路径未使用（直接调用 `render_world`/`render_selection`），待 Phase 8 多 Pass 接入。
+> **注**：当前 Renderer 未持有 egui renderer / camera buffer / RenderSettings。egui 渲染由 client 自行管理；camera uniform 通过 `render_world` 的 `view_proj` 参数每帧传入。`RenderGraph` trait 在 [graph.rs](graph.rs) 中已定义但渲染路径未使用（直接调用 `render_world`/`render_selection`），待 Phase 8 多 Pass 接入。Phase 7 的 `WorldRenderStats` 是 CPU 侧统计（可见/剔除 chunk、draw 顶点/索引数），不是 GPU timestamp query。
 
 ---
 
@@ -344,7 +347,7 @@ impl Renderer {
 | 网格化（每帧最多） | 4ms |
 | 其余（输入、相机、UI build） | < 2ms |
 
-监测手段：`RenderSettings.show_stats` 开启时，HUD 显示每项耗时。详见 [`features/ui.md`](../features/ui.md)。
+监测手段：`AppSettings.show_stats` 开启时，HUD 显示 mesh / world / player / selection / ui 的 CPU 编码耗时，以及视锥剔除和 draw 顶点/索引统计。详见 [`features/ui.md`](../features/ui.md)。
 
 ---
 

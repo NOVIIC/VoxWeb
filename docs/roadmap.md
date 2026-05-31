@@ -10,7 +10,7 @@
 ```
 Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase 5 ─▶ Phase 6 ─▶ Phase 7 ─▶ Phase 8 ─▶ Phase 9 (stretch)
 脚手架      渲染骨架     体素单人     物理交互     P2P 通道     权威同步     多人 UI      渲染优化     多 Pass+存档   后处理/TURN/触屏
-  ✅          ✅          ✅          ✅          ✅          ✅          ✅
+  ✅          ✅          ✅          ✅          ✅          ✅          ✅          ✅
 ```
 
 每个 Phase **可独立验收**：完成时可以演示一个具体的、可观察的功能。后续 Phase 只增不破。
@@ -240,7 +240,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 7 · 渲染优化
+## Phase 7 · 渲染优化 ✅
+
+> 完成日期：2026-05-31 · 详见 [`../PHASE_7_DONE.md`](../PHASE_7_DONE.md)
 
 ### 目标
 让渲染距离能开到 8-10 仍然 60 fps。
@@ -249,13 +251,13 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`features/meshing.md`](features/meshing.md)
 
 ### 任务清单
-- [ ] 贪婪网格化算法（替换 Phase 2 的朴素逐面）
-- [ ] 顶点压缩（Phase 1 已写位段编码，此处确认全链路用上）
-- [ ] AO 计算（顶点级 4 等级）
-- [ ] mesh_jobs 优先级队列优化（玩家附近 critical / high 优先）
-- [ ] 视锥剔除（每帧根据 camera frustum 过滤 chunk）
-- [ ] 网格化分帧 budget tuning（默认 4ms/帧）
-- [ ] 性能 stat HUD（每个 Pass 耗时）
+- [x] 贪婪网格化算法（替换 Phase 2 的朴素逐面）
+- [x] 顶点压缩（Phase 1 已写位段编码，此处确认全链路用上）
+- [x] AO 计算（顶点级 4 等级）
+- [x] mesh_jobs 优先级队列优化（玩家附近 critical / high 优先）
+- [x] 视锥剔除（每帧根据 camera frustum 过滤 chunk）
+- [x] 网格化分帧 budget tuning（默认 4ms/帧）
+- [x] 性能 stat HUD（每个 Pass 耗时）
 
 ### 验证
 - 渲染距离 8、复杂地形、4 人房间、稳定 60 fps（M2 mac）
