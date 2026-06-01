@@ -54,7 +54,7 @@ pub fn player_aabb(position: Vec3) -> Aabb {
 ```rust
 pub enum CameraMode {
     Walk,    // 受重力，碰撞
-    Fly,     // 调试用，无重力，无碰撞；WASD 仅沿水平面，Space/Shift 控制升降
+    Fly,     // 无重力，有碰撞（分轴扫动）；WASD 仅沿水平面，Space/Shift 控制升降
 }
 ```
 
@@ -222,7 +222,7 @@ fn check_ground(world: &WorldView, position: Vec3) -> bool {
 
 简化版（实际实装见 [`crates/client/src/physics.rs::step_fly`](../../crates/client/src/physics.rs)）：
 ```rust
-fn tick_fly(&mut self, camera: &Camera, input: &InputState, dt: f32) {
+fn step_fly(&mut self, get_block: &dyn Fn(i32, i32, i32) -> BlockID, camera: &Camera, input: &InputState, dt: f32) {
     let mut dir = Vec3::ZERO;
     // WASD 沿水平面（不含 pitch），避免视角朝下时按 W 反而往地里钻
     let f = camera.forward_horizontal();
@@ -234,14 +234,21 @@ fn tick_fly(&mut self, camera: &Camera, input: &InputState, dt: f32) {
     if input.right { dir += r; }
     if input.jump_held { dir += u; }   // Space 上升
     if input.sneak { dir -= u; }       // Shift 下降
-    if dir.length_squared() > 0.0 { dir = dir.normalize(); }
-    self.feet_position += dir * FLY_SPEED * dt;
+    if dir.length_squared() > 0.0 {
+        let disp = dir.normalize() * FLY_SPEED * dt;
+        // 分轴碰撞（与 Walk 一致）：先 Y 再 X 再 Z
+        self.move_axis_y(get_block, disp.y);
+        self.move_axis_x(get_block, disp.x);
+        self.move_axis_z(get_block, disp.z);
+    }
     self.velocity = Vec3::ZERO;
     self.on_ground = false;
 }
 ```
 
 `FLY_SPEED = 12.0 m/s`。垂直方向单独由 Space/Shift 控制，让"看哪里"和"飞哪里"解耦——观察俯视地形时按 W 仍只前进，需要下降时按 Shift。
+
+Fly 模式同样执行 Y/X/Z 分轴碰撞检测，避免穿墙。X/Z 轴碰撞时会吸附到墙面（与 Y 轴吸附到方块面同理），解决浮点累积误差导致的穿墙问题。
 
 ---
 
@@ -482,4 +489,4 @@ pub struct Hotbar {
 - 流体推动（玩家被水冲走）— 不做
 - 摔伤 / 血量 / 死亡 — 不做
 - 工具耐久 / 挖掘速度差异 — 不做
-- 头顶上方撞天花板 — 当前实现已正确处理（Y 轴正向碰撞 → 速度归零）
+- 头顶上方撞天花板 — 当前实现已正确处理（Y 轴正向碰撞 → 吸附到方块底面 + 速度归零；已嵌入方块时搜索最近安全位置）

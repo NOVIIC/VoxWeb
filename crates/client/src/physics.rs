@@ -1,7 +1,8 @@
 //! 客户端物理：玩家 AABB 与世界方块的分轴扫动碰撞，含 Walk / Fly 双模式。
 //!
 //! Walk 模式：重力 + 跳跃 + lerp 平滑的水平加速 + Y/X/Z 三轴依次扫动；
-//! Fly 模式：WASD 沿水平面方向（不含 pitch）飞行，Space/Shift 控制升/降，速度归零不受重力。
+//! Fly 模式：WASD 沿水平面方向（不含 pitch）飞行，Space/Shift 控制升/降，速度归零不受重力，
+//! 同样执行 Y/X/Z 分轴碰撞检测，避免穿墙。
 //!
 //! 服务端权威物理在 `voxweb_server::physics`（仅做范围/重叠校验）。
 //! 此处客户端物理为本地预测：在 Phase 3 单机模式下与 server 共享同一份 world，
@@ -95,7 +96,7 @@ impl LocalPhysics {
         while remaining > 0.0 {
             let step_dt = remaining.min(MAX_SUBSTEP_DT);
             match self.mode {
-                CameraMode::Fly => self.step_fly(camera, input, step_dt),
+                CameraMode::Fly => self.step_fly(get_block, camera, input, step_dt),
                 CameraMode::Walk => self.step_walk(get_block, camera, input, step_dt),
             }
             remaining -= step_dt;
@@ -104,7 +105,13 @@ impl LocalPhysics {
 
     // —— Fly ——
 
-    fn step_fly(&mut self, camera: &Camera, input: &InputState, dt: f32) {
+    fn step_fly(
+        &mut self,
+        get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        camera: &Camera,
+        input: &InputState,
+        dt: f32,
+    ) {
         let mut dir = Vec3::ZERO;
         // Fly 模式下 WASD 仅控制水平面方向（与 Walk 一致），避免视线朝下时按 W
         // 反而往地里钻。垂直方向交给 Space（上升）/ Shift（下降）。
@@ -130,8 +137,11 @@ impl LocalPhysics {
             dir -= u;
         }
         if dir.length_squared() > 0.0 {
-            dir = dir.normalize() * FLY_SPEED * dt;
-            self.feet_position += dir;
+            let disp = dir.normalize() * FLY_SPEED * dt;
+            // 分轴扫动碰撞（与 Walk 一致）：先 Y 再 X 再 Z，撞墙时吸附并停止该轴
+            self.move_axis_y(get_block, disp.y);
+            self.move_axis_x(get_block, disp.x);
+            self.move_axis_z(get_block, disp.z);
         }
         self.velocity = Vec3::ZERO;
         self.on_ground = false;
@@ -200,13 +210,38 @@ impl LocalPhysics {
         let new_feet = self.feet_position + Vec3::Y * dy;
         let candidate = player_aabb(new_feet);
         if collides_with_world(get_block, &candidate) {
-            // 撞顶或撞地：把脚底/头顶吸附到所撞方块整数面附近，避免穿插
-            self.feet_position.y = if dy < 0.0 {
-                self.feet_position.y.floor()
-            } else {
-                self.feet_position.y.ceil()
-            };
             self.velocity.y = 0.0;
+            // 吸附到最近的整数 Y 面：floor 脚底 →
+            //   下落时站在方块顶面；上跳时头顶刚好在方块底面以下
+            // （因玩家高度 >1 格，ceil 会穿入方块，故统一用 floor）。
+            let snap = self.feet_position.y.floor();
+            if !collides_with_world(
+                get_block,
+                &player_aabb(Vec3::new(self.feet_position.x, snap, self.feet_position.z)),
+            ) {
+                self.feet_position.y = snap;
+                return;
+            }
+            // 仍碰撞（玩家已嵌入方块）：向搜索最近安全位置
+            for i in 1i32..=4 {
+                // 优先向下（重力方向更常见）
+                let down = snap - i as f32;
+                let aabb_down =
+                    player_aabb(Vec3::new(self.feet_position.x, down, self.feet_position.z));
+                if !collides_with_world(get_block, &aabb_down) {
+                    self.feet_position.y = down;
+                    return;
+                }
+                // 再试向上
+                let up = snap + i as f32;
+                let aabb_up =
+                    player_aabb(Vec3::new(self.feet_position.x, up, self.feet_position.z));
+                if !collides_with_world(get_block, &aabb_up) {
+                    self.feet_position.y = up;
+                    return;
+                }
+            }
+            // 极端情况找不到安全位置，保持原位
         } else {
             self.feet_position.y = new_feet.y;
         }
@@ -223,6 +258,12 @@ impl LocalPhysics {
         );
         let candidate = player_aabb(new_feet);
         if collides_with_world(get_block, &candidate) {
+            // 吸附到墙面：在位移方向上找到最近的 solid 方块，把玩家 AABB 贴到其面上。
+            // 直接零速度不吸附会导致浮点累积误差让玩家逐渐"远离"墙壁。
+            let half = voxweb_core::geometry::PLAYER_WIDTH * 0.5;
+            if let Some(snap_x) = find_wall_snap_x(get_block, &candidate, dx, half) {
+                self.feet_position.x = snap_x;
+            }
             self.velocity.x = 0.0;
         } else {
             self.feet_position.x = new_feet.x;
@@ -240,6 +281,10 @@ impl LocalPhysics {
         );
         let candidate = player_aabb(new_feet);
         if collides_with_world(get_block, &candidate) {
+            let half = voxweb_core::geometry::PLAYER_WIDTH * 0.5;
+            if let Some(snap_z) = find_wall_snap_z(get_block, &candidate, dz, half) {
+                self.feet_position.z = snap_z;
+            }
             self.velocity.z = 0.0;
         } else {
             self.feet_position.z = new_feet.z;
@@ -294,6 +339,101 @@ fn block_solid(id: BlockID) -> bool {
     properties(id).solid
 }
 
+/// X 轴墙面吸附：在位移方向上找到最近的 solid 方块，返回吸附后的 feet.x。
+fn find_wall_snap_x(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    aabb: &Aabb,
+    dx: f32,
+    half_width: f32,
+) -> Option<f32> {
+    let min_x = aabb.min.x.floor() as i32;
+    let max_x = aabb.max.x.ceil() as i32; // 用 ceil 确保覆盖触碰面的方块
+    let min_y = aabb.min.y.floor() as i32;
+    let max_y = aabb.max.y.ceil() as i32;
+    let min_z = aabb.min.z.floor() as i32;
+    let max_z = aabb.max.z.ceil() as i32;
+    let mut best: Option<f32> = None;
+    for bx in min_x..max_x {
+        for by in min_y..max_y {
+            for bz in min_z..max_z {
+                if !block_solid(get_block(bx, by, bz)) {
+                    continue;
+                }
+                let block_min_x = bx as f32;
+                let block_max_x = bx as f32 + 1.0;
+                if !aabb.intersects(&Aabb::new(
+                    Vec3::new(block_min_x, by as f32, bz as f32),
+                    Vec3::new(block_max_x, by as f32 + 1.0, bz as f32 + 1.0),
+                )) {
+                    continue;
+                }
+                // 只在位移方向上吸附：右移贴左面，左移贴右面
+                let snap = if dx > 0.0 {
+                    block_min_x - half_width
+                } else {
+                    block_max_x + half_width
+                };
+                let closer = match best {
+                    None => true,
+                    Some(prev) if dx > 0.0 => snap < prev,
+                    Some(prev) => snap > prev,
+                };
+                if closer {
+                    best = Some(snap);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Z 轴墙面吸附：与 find_wall_snap_x 对称。
+fn find_wall_snap_z(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    aabb: &Aabb,
+    dz: f32,
+    half_width: f32,
+) -> Option<f32> {
+    let min_x = aabb.min.x.floor() as i32;
+    let max_x = aabb.max.x.ceil() as i32;
+    let min_y = aabb.min.y.floor() as i32;
+    let max_y = aabb.max.y.ceil() as i32;
+    let min_z = aabb.min.z.floor() as i32;
+    let max_z = aabb.max.z.ceil() as i32;
+    let mut best: Option<f32> = None;
+    for bx in min_x..max_x {
+        for by in min_y..max_y {
+            for bz in min_z..max_z {
+                if !block_solid(get_block(bx, by, bz)) {
+                    continue;
+                }
+                let block_min_z = bz as f32;
+                let block_max_z = bz as f32 + 1.0;
+                if !aabb.intersects(&Aabb::new(
+                    Vec3::new(bx as f32, by as f32, block_min_z),
+                    Vec3::new(bx as f32 + 1.0, by as f32 + 1.0, block_max_z),
+                )) {
+                    continue;
+                }
+                let snap = if dz > 0.0 {
+                    block_min_z - half_width
+                } else {
+                    block_max_z + half_width
+                };
+                let closer = match best {
+                    None => true,
+                    Some(prev) if dz > 0.0 => snap < prev,
+                    Some(prev) => snap > prev,
+                };
+                if closer {
+                    best = Some(snap);
+                }
+            }
+        }
+    }
+    best
+}
+
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
@@ -305,6 +445,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::input::InputState;
+    use voxweb_core::geometry::PLAYER_HEIGHT;
 
     /// 构造测试用 get_block 闭包：在 y=64 平面填一整层 STONE，其它都是 AIR。
     fn floor_at_y64() -> impl Fn(i32, i32, i32) -> BlockID {
@@ -397,10 +538,10 @@ mod tests {
         p.move_axis_y(&getter, disp.y);
         p.move_axis_x(&getter, disp.x);
         p.move_axis_z(&getter, disp.z);
-        // x 被卡住（撞 x=1 墙），位置不变
+        // x 被墙吸附：AABB.max.x 贴到 x=1 墙面（feet.x = 1.0 - 0.3 = 0.7）
         assert!(
-            (p.feet_position.x - 0.5).abs() < 1e-6,
-            "x={} 应当被墙卡住",
+            (p.feet_position.x - 0.7).abs() < 0.01,
+            "x={} 应当被墙吸附到 0.7",
             p.feet_position.x
         );
         assert!(p.velocity.x.abs() < 1e-6, "x 方向速度被清零");
@@ -495,5 +636,122 @@ mod tests {
             y_landed
         );
         assert!(p.on_ground, "玩家应仍在地面上，而不是悬空下坠");
+    }
+
+    #[test]
+    fn jump_into_low_ceiling_does_not_get_stuck() {
+        // 回归测试：头顶有方块时跳跃，玩家不应卡在方块内部。
+        // 构造：地面 y=64，天花板 y=68（方块占 [68,69)），玩家脚底 y=65。
+        // 玩家高度 1.8，跳跃峰值约 1.1m，头顶会触及天花板。
+        let getter = |_x: i32, y: i32, _z: i32| {
+            if y == 64 || y == 68 {
+                BlockID::STONE
+            } else {
+                BlockID::AIR
+            }
+        };
+        let mut p = LocalPhysics::new(Vec3::new(0.5, 65.0, 0.5));
+        let mut input = InputState::default();
+        let camera = Camera::default();
+        // 先 tick 一次让 on_ground=true
+        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        assert!(p.on_ground, "前置：玩家应在地面");
+
+        // 跳跃
+        input.jump_just_pressed = true;
+        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        // 持续几帧让玩家上升撞到天花板
+        for _ in 0..20 {
+            p.step(&getter, &camera, &input, 1.0 / 60.0);
+        }
+        // 玩家不应卡在天花板内部：头顶（feet.y + 1.8）不应超过天花板底面（y=68）
+        assert!(
+            p.feet_position.y + PLAYER_HEIGHT <= 68.0 + 0.01,
+            "玩家头顶 ({}) 不应穿入天花板方块 (y=68~69)",
+            p.feet_position.y + PLAYER_HEIGHT
+        );
+        // 玩家也不应低于地面
+        assert!(
+            p.feet_position.y >= 65.0 - 0.01,
+            "玩家脚底 ({}) 不应低于地面 (y=65)",
+            p.feet_position.y
+        );
+    }
+
+    #[test]
+    fn fly_into_wall_stops_at_wall() {
+        // 回归测试：飞行模式不应穿墙。
+        // 构造：x=2 处有一面墙（y=64~68 都是 STONE），玩家从 x=0 飞向 +X。
+        // 注意：不放地面，否则地面方块会阻挡水平飞行（AABB 触面碰撞）。
+        let getter = |x: i32, y: i32, _z: i32| {
+            if x == 2 && (64..=68).contains(&y) {
+                BlockID::STONE
+            } else {
+                BlockID::AIR
+            }
+        };
+        let mut p = LocalPhysics::new(Vec3::new(0.5, 65.0, 0.5));
+        p.mode = CameraMode::Fly;
+        let camera = Camera {
+            yaw: 0.0, // 朝 +X
+            pitch: 0.0,
+            ..Camera::default()
+        };
+        let mut input = InputState::default();
+        input.forward = true;
+        // 飞行足够长时间确保撞墙
+        for frame in 0..60 {
+            let old_x = p.feet_position.x;
+            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            if frame < 10 || (p.feet_position.x - old_x).abs() > 1e-6 {
+                eprintln!(
+                    "frame {}: x {:.6} -> {:.6} (dx={:.6})",
+                    frame,
+                    old_x,
+                    p.feet_position.x,
+                    p.feet_position.x - old_x
+                );
+            }
+        }
+        // 玩家 AABB.max.x = feet.x + 0.3，不应超过 x=2（墙 min.x）
+        // 触面不算碰撞（strict inequality），所以 AABB.max.x 可以 == 2.0
+        assert!(
+            p.feet_position.x + 0.3 <= 2.0 + 0.01,
+            "玩家 ({}) 不应穿入墙壁 (x=2)",
+            p.feet_position.x
+        );
+        // 但应紧贴墙壁（feet.x + 0.3 ≈ 2.0，即 feet.x ≈ 1.7）
+        assert!(
+            p.feet_position.x + 0.3 >= 1.99,
+            "玩家应紧贴墙壁，feet.x={}",
+            p.feet_position.x
+        );
+    }
+
+    #[test]
+    fn fly_up_blocked_by_ceiling() {
+        // 回归测试：飞行模式上升不应穿过天花板。
+        let getter = |_x: i32, y: i32, _z: i32| {
+            if y == 70 || y == 64 {
+                BlockID::STONE
+            } else {
+                BlockID::AIR
+            }
+        };
+        let mut p = LocalPhysics::new(Vec3::new(0.5, 65.0, 0.5));
+        p.mode = CameraMode::Fly;
+        let camera = Camera::default();
+        let mut input = InputState::default();
+        input.jump_held = true; // 上升
+        // 飞行足够长时间确保撞天花板
+        for _ in 0..60 {
+            p.step(&getter, &camera, &input, 1.0 / 60.0);
+        }
+        // 玩家头顶（feet.y + 1.8）不应超过天花板底面（y=70）
+        assert!(
+            p.feet_position.y + PLAYER_HEIGHT <= 70.0 + 0.01,
+            "玩家头顶 ({}) 不应穿入天花板 (y=70)",
+            p.feet_position.y + PLAYER_HEIGHT
+        );
     }
 }
