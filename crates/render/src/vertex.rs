@@ -50,6 +50,19 @@ impl PackedVertex {
     }
 }
 
+impl Face {
+    pub fn from_index(index: u8) -> Self {
+        match index {
+            0 => Face::PosX,
+            1 => Face::NegX,
+            2 => Face::PosY,
+            3 => Face::NegY,
+            4 => Face::PosZ,
+            _ => Face::NegZ,
+        }
+    }
+}
+
 /// wgpu 顶点缓冲布局描述：单个 u32 attribute。
 pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
     // VertexAttribute 数组需 'static，使用 const 数组。

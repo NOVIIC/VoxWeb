@@ -21,6 +21,8 @@ pub const CHUNK_Y: usize = 256;
 pub const CHUNK_Z: usize = 16;
 /// 单个 Chunk 的方块总数
 pub const CHUNK_SIZE: usize = CHUNK_X * CHUNK_Y * CHUNK_Z; // 65536
+/// OPFS 存盘格式版本。网络 ChunkSnapshot 继续使用协议版本，不受此常量影响。
+pub const STORAGE_VERSION: u8 = 1;
 
 // —— 世界坐标 ——
 
@@ -92,7 +94,7 @@ impl ChunkPos {
 // —— Chunk ——
 
 /// 一个 16×256×16 的方块列柱。
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Chunk {
     /// 长度恒为 CHUNK_SIZE 的方块数组
     pub blocks: Vec<BlockID>,
@@ -136,14 +138,66 @@ struct CompressedChunk {
     runs: Vec<(u16, u32)>,
 }
 
+/// OPFS 存盘 chunk 包装。外层带版本号，避免未来格式升级时误读旧数据。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredChunk {
+    version: u8,
+    compressed: CompressedChunk,
+}
+
+/// 存盘 chunk 解码错误。所有错误都返回给调用方处理，不 panic。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    Corrupted(String),
+    VersionMismatch { found: u8, expected: u8 },
+    InvalidPaletteIndex(u16),
+    LengthMismatch(usize),
+}
+
 /// 将 Chunk 的 blocks 数组编码为 palette+RLE 压缩字节。
 ///
 /// 算法：遍历 65536 个方块，将连续相同 BlockID 合并为一个 run；
 /// 每个 BlockID 查找/插入 palette，记录 (palette_index, run_length)。
 pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String> {
+    let compressed = compress_blocks(blocks)?;
+    crate::protocol::encode(&compressed).map_err(|e| format!("encode_chunk bincode: {e}"))
+}
+
+/// 将 `encode_chunk` 的压缩字节还原为 `Vec<BlockID>`（长度恒为 CHUNK_SIZE）。
+pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<BlockID>, String> {
+    let compressed: CompressedChunk =
+        crate::protocol::decode(bytes).map_err(|e| format!("decode_chunk bincode: {e}"))?;
+    expand_compressed(&compressed).map_err(|e| format!("{e:?}"))
+}
+
+/// OPFS 存盘用编码：`StoredChunk { version, compressed }`。
+pub fn encode(chunk: &Chunk) -> Vec<u8> {
+    let compressed = compress_blocks(&chunk.blocks).expect("Chunk blocks length is always valid");
+    let stored = StoredChunk {
+        version: STORAGE_VERSION,
+        compressed,
+    };
+    crate::protocol::encode(&stored).expect("StoredChunk serialization should not fail")
+}
+
+/// OPFS 存盘用解码。版本不匹配时返回结构化错误，调用方可显示“需升级”。
+pub fn decode(bytes: &[u8]) -> Result<Chunk, DecodeError> {
+    let stored: StoredChunk =
+        crate::protocol::decode(bytes).map_err(|e| DecodeError::Corrupted(e.to_string()))?;
+    if stored.version != STORAGE_VERSION {
+        return Err(DecodeError::VersionMismatch {
+            found: stored.version,
+            expected: STORAGE_VERSION,
+        });
+    }
+    let blocks = expand_compressed(&stored.compressed)?;
+    Ok(Chunk { blocks })
+}
+
+fn compress_blocks(blocks: &[BlockID]) -> Result<CompressedChunk, String> {
     if blocks.len() != CHUNK_SIZE {
         return Err(format!(
-            "encode_chunk: expected {CHUNK_SIZE} blocks, got {}",
+            "compress_blocks: expected {CHUNK_SIZE} blocks, got {}",
             blocks.len()
         ));
     }
@@ -154,14 +208,12 @@ pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String> {
     let mut cursor = 0usize;
     while cursor < CHUNK_SIZE {
         let current = blocks[cursor];
-        // 扫描连续相同方块的 run
         let mut run_len: u32 = 1;
         while cursor + (run_len as usize) < CHUNK_SIZE
             && blocks[cursor + (run_len as usize)] == current
         {
             run_len += 1;
         }
-        // palette 下标
         let pi = match palette.iter().position(|b| *b == current) {
             Some(i) => i as u16,
             None => {
@@ -174,31 +226,23 @@ pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String> {
         cursor += run_len as usize;
     }
 
-    let compressed = CompressedChunk { palette, runs };
-    crate::protocol::encode(&compressed).map_err(|e| format!("encode_chunk bincode: {e}"))
+    Ok(CompressedChunk { palette, runs })
 }
 
-/// 将 `encode_chunk` 的压缩字节还原为 `Vec<BlockID>`（长度恒为 CHUNK_SIZE）。
-pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<BlockID>, String> {
-    let compressed: CompressedChunk =
-        crate::protocol::decode(bytes).map_err(|e| format!("decode_chunk bincode: {e}"))?;
-
+fn expand_compressed(compressed: &CompressedChunk) -> Result<Vec<BlockID>, DecodeError> {
     let mut blocks: Vec<BlockID> = Vec::with_capacity(CHUNK_SIZE);
     for (pi, run_len) in &compressed.runs {
         let block = compressed
             .palette
             .get(*pi as usize)
-            .ok_or_else(|| format!("decode_chunk: palette index {pi} out of range"))?;
+            .ok_or(DecodeError::InvalidPaletteIndex(*pi))?;
         for _ in 0..*run_len {
             blocks.push(*block);
         }
     }
 
     if blocks.len() != CHUNK_SIZE {
-        return Err(format!(
-            "decode_chunk: expected {CHUNK_SIZE} blocks, got {}",
-            blocks.len()
-        ));
+        return Err(DecodeError::LengthMismatch(blocks.len()));
     }
     Ok(blocks)
 }
@@ -358,5 +402,31 @@ mod tests {
     #[test]
     fn decode_corrupt_bytes() {
         assert!(decode_chunk(b"garbage data not valid").is_err());
+    }
+
+    #[test]
+    fn stored_chunk_roundtrip() {
+        let mut chunk = Chunk::empty();
+        chunk.set(1, 2, 3, BlockID::GLASS);
+        chunk.set(4, 5, 6, BlockID::WATER);
+        let bytes = encode(&chunk);
+        let decoded = decode(&bytes).expect("decode stored chunk");
+        assert_eq!(decoded.blocks, chunk.blocks);
+    }
+
+    #[test]
+    fn stored_chunk_rejects_future_version() {
+        let stored = StoredChunk {
+            version: STORAGE_VERSION + 1,
+            compressed: compress_blocks(&vec![BlockID::AIR; CHUNK_SIZE]).unwrap(),
+        };
+        let bytes = crate::protocol::encode(&stored).unwrap();
+        assert_eq!(
+            decode(&bytes),
+            Err(DecodeError::VersionMismatch {
+                found: STORAGE_VERSION + 1,
+                expected: STORAGE_VERSION,
+            })
+        );
     }
 }

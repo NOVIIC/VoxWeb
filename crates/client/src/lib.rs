@@ -44,6 +44,7 @@ use crate::input::InputState;
 use crate::mesh_jobs::{MeshPriority, MeshRunStats};
 use crate::prediction::{PendingAction, PendingKind, reconcile_self};
 use crate::raycast::raycast;
+use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
     validate_room_id,
@@ -66,6 +67,8 @@ struct FramePerfStats {
     mesh_indices: u32,
     mesh_phase2_vertices: u32,
     world_pass_ms: f32,
+    depth_pass_ms: f32,
+    transparent_pass_ms: f32,
     player_pass_ms: f32,
     selection_pass_ms: f32,
     egui_pass_ms: f32,
@@ -204,6 +207,7 @@ pub async fn start() -> Result<(), JsValue> {
     }));
 
     install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
+    install_debug_hooks(app.clone());
     spawn_raf_loop(app);
 
     Ok(())
@@ -663,6 +667,29 @@ fn update_clock(app: &Rc<RefCell<App>>) -> f32 {
 // ============================================================
 
 fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 异步加载存档列表（仅首次进入 Lobby 时触发）——
+    {
+        let mut a = app.borrow_mut();
+        if a.lobby_state.saved_worlds.is_empty() && !a.lobby_state.saves_loading {
+            a.lobby_state.saves_loading = true;
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                a.lobby_state.saves_loading = false;
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 加载存档列表失败: {e:?}");
+                        a.lobby_state.error_message = Some(format!("加载存档失败: {e:?}"));
+                    }
+                }
+            });
+        }
+    }
+
     // —— 跑 egui Lobby UI ——
     let (action, paint_jobs, pixels_per_point, textures_delta) = {
         let mut a = app.borrow_mut();
@@ -691,9 +718,12 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     };
 
     // —— 处理动作 ——
+    // 获取当前选中的存档 key
+    let selected_save_key = app.borrow().lobby_state.selected_save.clone();
+
     match action {
         Some(LobbyAction::StartSinglePlayer { seed, display_name }) => {
-            start_single_player(app, seed, &display_name);
+            start_single_player(app, seed, &display_name, selected_save_key.as_deref());
         }
         Some(LobbyAction::CreateRoom {
             room_id,
@@ -724,7 +754,13 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                 }
             };
-            start_host(app, &final_room, seed, &display_name);
+            start_host(
+                app,
+                &final_room,
+                seed,
+                &display_name,
+                selected_save_key.as_deref(),
+            );
         }
         Some(LobbyAction::JoinRoom {
             room_id,
@@ -736,6 +772,44 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                 return Ok(());
             }
             start_remote(app, &room_id, &display_name);
+        }
+        Some(LobbyAction::SelectSave { key }) => {
+            app.borrow_mut().lobby_state.selected_save = key;
+        }
+        Some(LobbyAction::DeleteSave { key }) => {
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::storage::delete_world_by_key(&key).await {
+                    log::warn!("[lobby] 删除存档失败: {e:?}");
+                }
+                // 刷新列表
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                        a.lobby_state.selected_save = None; // 重置选择
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                    }
+                }
+            });
+        }
+        Some(LobbyAction::RefreshSaves) => {
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                    }
+                }
+            });
         }
         None => {}
     }
@@ -832,9 +906,16 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     Ok(())
 }
 
-fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>, display_name: &str) {
+fn start_single_player(
+    app: &Rc<RefCell<App>>,
+    seed: Option<u64>,
+    display_name: &str,
+    save_key: Option<&str>,
+) {
     let seed = seed.unwrap_or_else(random_seed);
-    log::info!("启动单机游戏，seed = {seed}, display_name = {display_name}");
+    log::info!(
+        "启动单机游戏，seed = {seed}, display_name = {display_name}, save_key = {save_key:?}"
+    );
 
     let settings = settings_storage::load().unwrap_or_default();
     let mut game = Game::new_local(seed, settings, display_name);
@@ -859,6 +940,51 @@ fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>, display_name: 
     });
     a.state = AppState::Connecting;
     log::info!("[local] 进入加载界面，开始区块预载 (total={total})");
+    drop(a);
+
+    // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
+    if let Some(key) = save_key {
+        attach_storage_for_load(app.clone(), key.to_string());
+    } else {
+        attach_storage_for_new(app.clone(), seed);
+    }
+}
+
+fn install_debug_hooks(app: Rc<RefCell<App>>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let obj = js_sys::Object::new();
+
+    let fill_app = app.clone();
+    let fill = Closure::wrap(Box::new(move |n: u32| {
+        let mut a = fill_app.borrow_mut();
+        let Some(g) = a.game.as_mut() else {
+            return;
+        };
+        let count = n.min(20_000);
+        for i in 0..count {
+            let x = (i as i32 % 160) - 80;
+            let z = (i as i32 / 160) - 80;
+            let pos = voxweb_core::ChunkPos::new(x, z);
+            g.server.borrow_mut().world.ensure_chunk_generated(pos);
+            g.server.borrow_mut().world.persistence.mark_dirty(pos);
+        }
+        log::info!("[debug] filled dirty chunks: {count}");
+    }) as Box<dyn FnMut(u32)>);
+    let _ = js_sys::Reflect::set(&obj, &"fillDirty".into(), fill.as_ref().unchecked_ref());
+    fill.forget();
+
+    let quota = Closure::wrap(Box::new(move || {
+        wasm_bindgen_futures::spawn_local(async move {
+            let q = crate::storage::quota().await;
+            log::info!("[debug] quota: {q:?}");
+        });
+    }) as Box<dyn FnMut()>);
+    let _ = js_sys::Reflect::set(&obj, &"quota".into(), quota.as_ref().unchecked_ref());
+    quota.forget();
+
+    let _ = js_sys::Reflect::set(&window, &"voxwebDebug".into(), &obj);
 }
 
 /// 用 getrandom 生成一个 u64 随机种子。失败时退化为 0。
@@ -924,7 +1050,13 @@ fn set_room_in_url(room_id: &str) {
     let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
 }
 
-fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_name: &str) {
+fn start_host(
+    app: &Rc<RefCell<App>>,
+    room_id: &str,
+    seed: Option<u64>,
+    display_name: &str,
+    save_key: Option<&str>,
+) {
     let seed = seed.unwrap_or_else(random_seed);
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
@@ -932,7 +1064,9 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
         );
         return;
     };
-    log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}, name={display_name}");
+    log::info!(
+        "启动 Host：room={room_id}, signaling={url}, seed={seed}, name={display_name}, save_key={save_key:?}"
+    );
 
     let settings = settings_storage::load().unwrap_or_default();
     let game_result = Game::new_host(seed, settings, &url, room_id, display_name);
@@ -950,6 +1084,15 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
             a.connecting_error = None;
             // 把房间号写回 URL（history.replaceState），方便用户直接复制 URL 分享
             set_room_in_url(room_id);
+            drop(a);
+
+            // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
+            if let Some(key) = save_key {
+                attach_storage_for_load(app.clone(), key.to_string());
+            } else {
+                // Host 模式：使用 room_id + seed 创建存档
+                attach_storage_async(app.clone(), room_id.to_string(), seed);
+            }
         }
         Err(e) => {
             log::warn!("[host] new_host failed: {e:?}");
@@ -995,6 +1138,152 @@ fn start_remote(app: &Rc<RefCell<App>>, room_id: &str, display_name: &str) {
             a.lobby_state.error_message = Some(format!("Failed to join: {e:?}"));
         }
     }
+}
+
+fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = OpfsStorage::request_persistence().await;
+        match OpfsStorage::open(&room_id, seed).await {
+            Ok(storage) => {
+                let known = storage.list_chunks().await.unwrap_or_default();
+                let known_set: HashSet<_> = known.iter().copied().collect();
+                let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                let mut loaded = Vec::new();
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let pos = voxweb_core::ChunkPos::new(spawn.x + dx, spawn.z + dz);
+                        if !known_set.contains(&pos) {
+                            continue;
+                        }
+                        match storage.load_chunk(pos).await {
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
+                                Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
+                            },
+                            Ok(None) => {}
+                            Err(e) => log::warn!("[storage] load {pos:?} failed: {e:?}"),
+                        }
+                    }
+                }
+                let quota = storage.quota().await;
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                        g.mesh_jobs.enqueue(pos, MeshPriority::High);
+                    }
+                    g.known_persisted = known_set;
+                    g.quota = quota;
+                    g.storage = Some(storage);
+                    g.storage_error = None;
+                }
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    g.storage_error = Some(format!("{e:?}"));
+                }
+            }
+        }
+    });
+}
+
+/// 创建新存档（用当前时间戳 + seed 生成 key）
+fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = OpfsStorage::request_persistence().await;
+        match OpfsStorage::create_new(seed).await {
+            Ok(storage) => {
+                let known = storage.list_chunks().await.unwrap_or_default();
+                let known_set: HashSet<_> = known.iter().copied().collect();
+                let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                let mut loaded = Vec::new();
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let pos = voxweb_core::ChunkPos::new(spawn.x + dx, spawn.z + dz);
+                        if !known_set.contains(&pos) {
+                            continue;
+                        }
+                        match storage.load_chunk(pos).await {
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
+                                Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
+                            },
+                            Ok(None) => {}
+                            Err(e) => log::warn!("[storage] load {pos:?} failed: {e:?}"),
+                        }
+                    }
+                }
+                let quota = storage.quota().await;
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                        g.mesh_jobs.enqueue(pos, MeshPriority::High);
+                    }
+                    g.known_persisted = known_set;
+                    g.quota = quota;
+                    g.storage = Some(storage);
+                    g.storage_error = None;
+                }
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    g.storage_error = Some(format!("{e:?}"));
+                }
+            }
+        }
+    });
+}
+
+/// 通过 key 加载已有存档
+fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = OpfsStorage::request_persistence().await;
+        match OpfsStorage::open_by_key(&key).await {
+            Ok(storage) => {
+                let known = storage.list_chunks().await.unwrap_or_default();
+                let known_set: HashSet<_> = known.iter().copied().collect();
+                let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                let mut loaded = Vec::new();
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let pos = voxweb_core::ChunkPos::new(spawn.x + dx, spawn.z + dz);
+                        if !known_set.contains(&pos) {
+                            continue;
+                        }
+                        match storage.load_chunk(pos).await {
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
+                                Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
+                            },
+                            Ok(None) => {}
+                            Err(e) => log::warn!("[storage] load {pos:?} failed: {e:?}"),
+                        }
+                    }
+                }
+                let quota = storage.quota().await;
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                        g.mesh_jobs.enqueue(pos, MeshPriority::High);
+                    }
+                    g.known_persisted = known_set;
+                    g.quota = quota;
+                    g.storage = Some(storage);
+                    g.storage_error = None;
+                }
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    g.storage_error = Some(format!("{e:?}"));
+                }
+            }
+        }
+    });
 }
 
 // ============================================================
@@ -1741,6 +2030,8 @@ fn render_game_frame(
     };
     app.borrow_mut().perf.record_mesh(mesh_stats);
 
+    pump_persistence(app);
+
     // —— 7. egui HUD（Phase 6：含玩家列表 / 名牌 / 聊天浮窗 / 聊天框 / 暂停菜单） ——
     let pointer_locked = app.borrow().input.borrow().pointer_locked;
     // 本帧 egui 内可能触发的动作
@@ -1780,6 +2071,9 @@ fn render_game_frame(
             room_id: g.room_id.clone(),
             relayed_peer_count: a.relayed_peers.len(),
             show_stats: g.settings.show_stats,
+            depth_prepass_enabled: g.settings.depth_prepass_enabled,
+            quota: g.quota,
+            storage_error: g.storage_error.clone(),
             perf,
         });
         // 装配 PlayerListEntry：自己（is_me=true）+ 远端，按 entity_id 升序
@@ -1825,6 +2119,14 @@ fn render_game_frame(
                     continue;
                 };
                 let dist = (pos - cam_pos).length();
+                let head_pos = pos + glam::Vec3::new(0.0, voxweb_core::PLAYER_HEIGHT + 0.3, 0.0);
+                let dir = (head_pos - cam_pos).normalize_or_zero();
+                let occluded = {
+                    let server = g.server.borrow();
+                    let getter = |x: i32, y: i32, z: i32| server.world.get_block_world(x, y, z);
+                    raycast(cam_pos, dir, dist.max(0.0), &getter)
+                        .is_some_and(|hit| hit.distance + 0.15 < dist)
+                };
                 let name = g
                     .remote_players
                     .get(&eid)
@@ -1834,6 +2136,7 @@ fn render_game_frame(
                     world_position: pos,
                     display_name: name,
                     distance: dist,
+                    occluded,
                 });
             }
         }
@@ -1907,6 +2210,22 @@ fn render_game_frame(
                 }
                 pause_exit_to_lobby = true;
             }
+            ui::pause::PauseAction::SaveNow => {
+                if let Some(g) = a.game.as_mut() {
+                    g.last_persist_ms = 0.0;
+                }
+            }
+            ui::pause::PauseAction::DeleteWorld => {
+                if let Some(storage) = a.game.as_ref().and_then(|g| g.storage.clone()) {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = storage.delete_world().await {
+                            log::warn!("[storage] delete world failed: {e:?}");
+                        } else {
+                            log::info!("[storage] world deleted");
+                        }
+                    });
+                }
+            }
             ui::pause::PauseAction::None => {}
         }
 
@@ -1971,7 +2290,20 @@ fn render_game_frame(
             label: Some("game_frame"),
         });
 
-        // 世界 Pass
+        // 天空 + 可选 Depth Pre-Pass + 世界 Pass
+        a.renderer
+            .render_skybox(&mut encoder, &view, view_proj, (now_ms() / 1000.0) as f32);
+        let depth_start = now_ms();
+        let depth_enabled = a
+            .game
+            .as_ref()
+            .map(|g| g.settings.depth_prepass_enabled)
+            .unwrap_or(false);
+        if depth_enabled {
+            a.renderer.render_depth_prepass(&mut encoder, view_proj);
+        }
+        let depth_pass_ms = (now_ms() - depth_start) as f32;
+
         let world_start = now_ms();
         let world_stats =
             a.renderer
@@ -2004,6 +2336,11 @@ fn render_game_frame(
             a.renderer.render_players(&mut encoder, &view, view_proj);
         }
         let player_pass_ms = (now_ms() - player_start) as f32;
+
+        let transparent_start = now_ms();
+        a.renderer
+            .render_transparent(&mut encoder, &view, view_proj, camera_pos);
+        let transparent_pass_ms = (now_ms() - transparent_start) as f32;
 
         // 选中方块线框（命中时）
         let selection_start = now_ms();
@@ -2048,6 +2385,8 @@ fn render_game_frame(
         let egui_pass_ms = (now_ms() - egui_start) as f32;
 
         a.perf.world_pass_ms = world_pass_ms;
+        a.perf.depth_pass_ms = depth_pass_ms;
+        a.perf.transparent_pass_ms = transparent_pass_ms;
         a.perf.player_pass_ms = player_pass_ms;
         a.perf.selection_pass_ms = selection_pass_ms;
         a.perf.egui_pass_ms = egui_pass_ms;
@@ -2071,6 +2410,69 @@ fn render_game_frame(
     }
 
     Ok(())
+}
+
+fn pump_persistence(app: &Rc<RefCell<App>>) {
+    let now = now_ms();
+    let maybe_job = {
+        let mut a = app.borrow_mut();
+        let Some(g) = a.game.as_mut() else {
+            return;
+        };
+        if matches!(g.mode, GameMode::Remote) || now - g.last_persist_ms < 1000.0 {
+            return;
+        }
+        if let Some(q) = g.quota {
+            g.server
+                .borrow_mut()
+                .world
+                .persistence
+                .set_quota_pause_dirty(q.usage_ratio() > 0.95);
+        }
+        let Some(storage) = g.storage.clone() else {
+            return;
+        };
+        let tick = g.server.borrow().world.tick_count;
+        if !g.server.borrow().world.persistence.should_flush(tick) {
+            return;
+        }
+        let positions = g
+            .server
+            .borrow_mut()
+            .world
+            .persistence
+            .snapshot_dirty(4, tick);
+        if positions.is_empty() {
+            return;
+        }
+        let server = g.server.clone();
+        let mut encoded = Vec::new();
+        {
+            let server_ref = server.borrow();
+            for pos in &positions {
+                if let Some(chunk) = server_ref.world.chunks.get(pos) {
+                    encoded.push((*pos, voxweb_core::chunk::encode(chunk)));
+                }
+            }
+        }
+        g.last_persist_ms = now;
+        Some((storage, server, positions, encoded, tick))
+    };
+
+    let Some((storage, server, positions, encoded, tick)) = maybe_job else {
+        return;
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = storage.save_chunks(encoded).await;
+        let mut s = server.borrow_mut();
+        match result {
+            Ok(()) => s.world.persistence.commit_flushed(&positions),
+            Err(e) => {
+                log::warn!("[storage] save failed: {e:?}");
+                s.world.persistence.record_flush_failure(&positions, tick);
+            }
+        }
+    });
 }
 
 /// 把方向输入清零的输入快照副本（用于失去指针锁时仍跑物理但不响应方向）。
@@ -2368,6 +2770,9 @@ struct HudData {
     relayed_peer_count: usize,
     /// Phase 6：[`AppSettings::show_stats`] 透传。false 时跳过左上角统计面板（保留准星 / hotbar）。
     show_stats: bool,
+    depth_prepass_enabled: bool,
+    quota: Option<crate::storage::QuotaInfo>,
+    storage_error: Option<String>,
     /// Phase 7：上一帧渲染 / 网格化统计。
     perf: FramePerfStats,
 }
@@ -2419,6 +2824,31 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                         ui.colored_label(
                             egui::Color32::from_rgb(160, 175, 190),
                             format!(
+                                "DEPTH_PRE {}",
+                                if data.depth_prepass_enabled { "ON" } else { "OFF" }
+                            ),
+                        );
+                        if let Some(q) = data.quota {
+                            let mb = q.usage as f32 / (1024.0 * 1024.0);
+                            let gb = q.quota as f32 / (1024.0 * 1024.0 * 1024.0);
+                            let color = if q.usage_ratio() > 0.95 {
+                                egui::Color32::from_rgb(240, 80, 80)
+                            } else if q.usage_ratio() > 0.80 {
+                                egui::Color32::from_rgb(230, 190, 80)
+                            } else {
+                                egui::Color32::from_rgb(160, 200, 170)
+                            };
+                            ui.colored_label(color, format!("SAVE {:>6.1} MB / {:>4.1} GB", mb, gb));
+                        }
+                        if let Some(err) = data.storage_error.as_deref() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 120, 120),
+                                format!("SAVE ERR {err}"),
+                            );
+                        }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(160, 175, 190),
+                            format!(
                                 "VISIBLE {}  CULLED {}  DRAW_V/I {}/{}",
                                 data.perf.visible_chunks,
                                 data.perf.culled_chunks,
@@ -2446,9 +2876,11 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                         ui.colored_label(
                             egui::Color32::from_rgb(170, 190, 220),
                             format!(
-                                "PASS world {:>4.1}  player {:>4.1}  sel {:>4.1}  ui {:>4.1} ms",
+                                "PASS depth {:>4.1}  world {:>4.1}  player {:>4.1}  trans {:>4.1}  sel {:>4.1}  ui {:>4.1} ms",
+                                data.perf.depth_pass_ms,
                                 data.perf.world_pass_ms,
                                 data.perf.player_pass_ms,
+                                data.perf.transparent_pass_ms,
                                 data.perf.selection_pass_ms,
                                 data.perf.egui_pass_ms
                             ),

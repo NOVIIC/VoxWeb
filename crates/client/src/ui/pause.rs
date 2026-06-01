@@ -21,6 +21,10 @@ pub enum PauseAction {
     None,
     /// 继续游戏：调用方关闭菜单并请求重新锁定指针。
     Resume,
+    /// 立即保存当前 dirty chunks。
+    SaveNow,
+    /// 删除当前世界存档。调用方负责二次确认状态和真实副作用。
+    DeleteWorld,
     /// 退出到大厅：调用方 drop game + state = Lobby。
     ExitToLobby,
 }
@@ -68,6 +72,11 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             });
 
             ui.checkbox(&mut settings.show_stats, "Show Stats");
+            ui.checkbox(&mut settings.depth_prepass_enabled, "Depth Pre-Pass");
+            ui.add(
+                egui::Slider::new(&mut settings.chunk_cache_capacity, 512..=10_000)
+                    .text("Chunk Cache"),
+            );
 
             ui.add_space(20.0);
 
@@ -76,6 +85,12 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             // 这里只返回 Action，由调用方在同一帧的事件处理路径中调用
             // canvas.request_pointer_lock()。
             ui.horizontal(|ui| {
+                if ui.button("Save Now").clicked() {
+                    action = PauseAction::SaveNow;
+                }
+                if ui.button("Delete Save").clicked() {
+                    action = PauseAction::DeleteWorld;
+                }
                 if ui.button("Resume").clicked() {
                     action = PauseAction::Resume;
                 }

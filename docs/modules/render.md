@@ -317,7 +317,7 @@ impl Renderer {
 }
 ```
 
-> **注**：当前 Renderer 未持有 egui renderer / camera buffer / RenderSettings。egui 渲染由 client 自行管理；camera uniform 通过 `render_world` 的 `view_proj` 参数每帧传入。`RenderGraph` trait 在 [graph.rs](graph.rs) 中已定义但渲染路径未使用（直接调用 `render_world`/`render_selection`），待 Phase 8 多 Pass 接入。Phase 7 的 `WorldRenderStats` 是 CPU 侧统计（可见/剔除 chunk、draw 顶点/索引数），不是 GPU timestamp query。
+> **Phase 8 更新**：Renderer 已接入固定顺序多 Pass：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI（UI 仍由 client 持有 egui-wgpu renderer 编码）。透明方块拥有独立 mesh buffer，并按 chunk 中心到相机距离远到近绘制。`RenderGraph` trait 继续作为扩展点保留，当前主路径使用显式方法调用以减少 egui 生命周期改动。Pass 耗时仍是 CPU 编码耗时，不是 GPU timestamp query。
 
 ---
 

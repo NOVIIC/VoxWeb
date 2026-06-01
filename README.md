@@ -28,7 +28,7 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 | 序列化 | `bincode`（little-endian、定长配置） | 与 DataChannel 二进制传输契合，体积比 JSON 小一个数量级 |
 | 构建工具 | `trunk`（首选）或 `wasm-pack` | trunk 集成 HTML 模板与资源管线，开箱即用 |
 | P2P 兜底 | CF Worker 应用层字节中继 | ICE 失败 / 15s 协商超时自动切换；无需部署 TURN（详见 [`docs/networking/signaling.md`](docs/networking/signaling.md) §九） |
-| 当前 Phase | Phase 7 ✅ 渲染优化（2026-05-31） | 见 [`PHASE_7_DONE.md`](PHASE_7_DONE.md) |
+| 当前 Phase | Phase 8 ✅ 多 Pass + 存档完善（2026-06-01） | 见 [`PHASE_8_DONE.md`](PHASE_8_DONE.md) |
 
 ---
 

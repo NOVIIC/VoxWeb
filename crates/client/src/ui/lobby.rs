@@ -1,10 +1,12 @@
 //! 大厅 UI：
 //! - 单机模式（Phase 2）
 //! - 创建房间 / 加入房间（Phase 4）
+//! - 我的存档列表（Phase 8）
 //!
 //! 还提供"Connecting…"视图：[`draw_connecting`]。
 
 use crate::app::GameMode;
+use crate::storage::{WorldSummary, format_creation_time};
 use voxweb_net::{LoadingStep, StepStatus};
 
 /// 大厅按钮触发的动作。lib.rs 主循环消费。
@@ -29,6 +31,12 @@ pub enum LobbyAction {
         room_id: String,
         display_name: String,
     },
+    /// 用户选择了某个存档（None = New World）
+    SelectSave { key: Option<String> },
+    /// 用户点击删除存档
+    DeleteSave { key: String },
+    /// 刷新存档列表
+    RefreshSaves,
 }
 
 /// Connecting 视图触发的动作。
@@ -48,6 +56,16 @@ pub struct LobbyState {
     pub error_message: Option<String>,
     /// info 区显示的最近一次自动生成的房间号（让用户能记住分享）。
     pub last_generated_room: Option<String>,
+
+    // —— 存档选择 ——
+    /// 已保存的世界列表（按创建时间倒序）
+    pub saved_worlds: Vec<WorldSummary>,
+    /// 是否正在加载存档列表
+    pub saves_loading: bool,
+    /// 选中的存档 key（None = New World）
+    pub selected_save: Option<String>,
+    /// 正在确认删除的 key
+    pub delete_confirm_key: Option<String>,
 }
 
 impl Default for LobbyState {
@@ -58,6 +76,10 @@ impl Default for LobbyState {
             room_id_input: String::new(),
             error_message: None,
             last_generated_room: None,
+            saved_worlds: Vec::new(),
+            saves_loading: false,
+            selected_save: None,
+            delete_confirm_key: None,
         }
     }
 }
@@ -119,7 +141,13 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             .min_size(egui::vec2(260.0, 44.0))
             .fill(egui::Color32::from_rgb(60, 90, 120));
             if ui.add(btn).clicked() {
-                let seed = parse_seed(&state.seed_input);
+                let seed = if let Some(key) = &state.selected_save {
+                    // 从存档 key 获取 seed
+                    crate::storage::seed_from_key(key)
+                } else {
+                    // New World：从输入框获取或随机生成
+                    parse_seed(&state.seed_input)
+                };
                 let display_name = resolve_display_name(state);
                 action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
             }
@@ -153,7 +181,13 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                 .fill(egui::Color32::from_rgb(90, 60, 120));
                 if ui.add(create).clicked() {
                     let room_id = state.room_id_input.trim().to_string();
-                    let seed = parse_seed(&state.seed_input);
+                    let seed = if let Some(key) = &state.selected_save {
+                        // 从存档 key 获取 seed
+                        crate::storage::seed_from_key(key)
+                    } else {
+                        // New World：从输入框获取或随机生成
+                        parse_seed(&state.seed_input)
+                    };
                     let display_name = resolve_display_name(state);
                     state.error_message = None;
                     action = Some(LobbyAction::CreateRoom {
@@ -199,19 +233,95 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
 
             ui.add_space(24.0);
 
-            // —— 种子输入（折叠区）——
-            egui::CollapsingHeader::new("Advanced / Seed")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Seed (u64, blank = random):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut state.seed_input)
-                                .desired_width(180.0)
-                                .hint_text("e.g. 1234567"),
-                        );
-                    });
+            // —— 我的存档区块 ——
+            ui.separator();
+            ui.add_space(8.0);
+            let save_count = state.saved_worlds.len();
+            let header_text = if state.saves_loading {
+                "我的存档 (加载中...)".to_string()
+            } else {
+                format!("我的存档 ({})", save_count)
+            };
+            ui.label(
+                egui::RichText::new(&header_text)
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(180, 190, 200)),
+            );
+            ui.add_space(4.0);
+
+            // New World 选项（默认选中）
+            let is_new_world = state.selected_save.is_none();
+            let radio = egui::RadioButton::new(is_new_world, "New World (创建新世界)");
+            if ui.add(radio).clicked() {
+                action = Some(LobbyAction::SelectSave { key: None });
+            }
+
+            // 已有存档列表
+            for world in &state.saved_worlds {
+                let is_selected = state.selected_save.as_deref() == Some(&world.key);
+                let time_str = format_creation_time(&world.key);
+
+                ui.horizontal(|ui| {
+                    let radio = egui::RadioButton::new(is_selected, &time_str);
+                    if ui.add(radio).clicked() {
+                        action = Some(LobbyAction::SelectSave {
+                            key: Some(world.key.clone()),
+                        });
+                    }
+                    // 删除按钮
+                    if ui
+                        .small_button("删除")
+                        .on_hover_text("删除此存档")
+                        .clicked()
+                    {
+                        state.delete_confirm_key = Some(world.key.clone());
+                    }
                 });
+            }
+
+            // 空列表提示
+            if !state.saves_loading && save_count == 0 {
+                ui.label(
+                    egui::RichText::new("暂无存档")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(120, 130, 140)),
+                );
+            }
+
+            // 删除确认对话框
+            if let Some(key) = &state.delete_confirm_key.clone() {
+                ui.add_space(8.0);
+                ui.colored_label(egui::Color32::from_rgb(220, 180, 100), "确认删除此存档？");
+                ui.horizontal(|ui| {
+                    if ui.button("确认删除").clicked() {
+                        action = Some(LobbyAction::DeleteSave { key: key.clone() });
+                        state.delete_confirm_key = None;
+                    }
+                    if ui.button("取消").clicked() {
+                        state.delete_confirm_key = None;
+                    }
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // —— 种子输入（折叠区，仅 New World 时显示）——
+            if state.selected_save.is_none() {
+                egui::CollapsingHeader::new("Advanced / Seed")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Seed (u64, blank = random):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.seed_input)
+                                    .desired_width(180.0)
+                                    .hint_text("e.g. 1234567"),
+                            );
+                        });
+                    });
+            }
         });
     });
 

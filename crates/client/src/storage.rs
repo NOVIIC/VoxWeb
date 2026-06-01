@@ -1,81 +1,615 @@
 //! OPFS（Origin Private File System）异步读写包装。
 //!
-//! Host 与 Local-Only 角色使用 OPFS 存储世界数据：
-//! - 启动时拉文件名清单 + prime 出生点周围 chunk
-//! - 运行时按需 load 玩家走到的区域
-//! - 周期性 flush dirty chunk
-//! - `pagehide` 退出时尽力 flush
-//!
-//! 完整设计见 `docs/features/persistence.md`。Phase 2 仅占位以保证模块名稳定；
-//! Phase 5 由 `WorldStorage` trait + OPFS 实现取代。
+//! Phase 8 默认走 Variant A：主线程 async OPFS。这里不保存 `Chunk` 本体，
+//! 只保存 `voxweb_core::chunk::encode` 产出的字节，调用方负责 encode/decode。
 
-use voxweb_core::chunk::ChunkPos;
+use js_sys::{Array, Reflect, Uint8Array};
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+    Blob, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
+    FileSystemGetFileOptions, FileSystemRemoveOptions, FileSystemWritableFileStream,
+};
 
-/// 持久化层错误（Phase 5 实装时按 OPFS / 浏览器异常补全分支）。
-#[derive(Debug)]
+use voxweb_core::chunk::{self, ChunkPos, STORAGE_VERSION};
+use voxweb_core::protocol::PROTOCOL_VERSION;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
-    /// 浏览器不支持 OPFS（理论上 wasm 加载前的能力检测已拦截）
     NotSupported,
-    /// 文件/目录不存在
     NotFound,
-    /// 配额耗尽
     QuotaExceeded,
-    /// 包装底层 DOMException
+    NeedsUpgrade { found: u8, supported: u8 },
+    Decode(chunk::DecodeError),
     Io(String),
 }
 
-/// `navigator.storage.estimate()` 返回的配额信息（UI 显示用）。
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct QuotaInfo {
     pub quota: u64,
     pub usage: u64,
 }
 
-/// OPFS 存储句柄。一个实例对应一个 (room_id, seed) 世界。
-///
-/// Phase 5 实装后字段将包含：
-/// - `root: web_sys::FileSystemDirectoryHandle`           opfs:/voxweb/<world_key>/
-/// - `chunks_dir: web_sys::FileSystemDirectoryHandle`     .../chunks/
-/// - `world_key: String`
+impl QuotaInfo {
+    pub fn usage_ratio(self) -> f32 {
+        if self.quota == 0 {
+            0.0
+        } else {
+            self.usage as f32 / self.quota as f32
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorldRecord {
+    pub key: String,
+    pub room_id: String,
+    pub seed: String,
+    pub display_name: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub storage_version: u8,
+    pub protocol_version: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct MetaRecord {
+    pub worlds: Vec<WorldSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorldSummary {
+    pub key: String,
+    pub display_name: String,
+    pub updated_at_ms: u64,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait WorldStorage {
+    async fn open(room_id: &str, seed: u64) -> Result<Self, StorageError>
+    where
+        Self: Sized;
+    async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError>;
+    async fn load_chunk(&self, pos: ChunkPos) -> Result<Option<Vec<u8>>, StorageError>;
+    async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError>;
+    async fn delete_world(&self) -> Result<(), StorageError>;
+    async fn quota(&self) -> Option<QuotaInfo>;
+}
+
+#[derive(Clone)]
 pub struct OpfsStorage {
-    // Phase 5: 真实字段
+    worlds_root: FileSystemDirectoryHandle,
+    chunks_dir: FileSystemDirectoryHandle,
+    world_key: String,
 }
 
 impl OpfsStorage {
-    /// 打开（或创建）某个世界的 OPFS 目录。
-    pub async fn open(_room_id: &str, _seed: u64) -> Result<Self, StorageError> {
-        // Phase 5: navigator.storage.getDirectory() → getDirectoryHandle 递归到 world dir
-        Ok(Self {})
+    pub fn world_key(&self) -> &str {
+        &self.world_key
     }
 
-    /// 拉取已存档 chunk 的文件名清单（不读内容）。供启动时构建 known_persisted 集合。
-    pub async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError> {
-        // Phase 5: 异步迭代 chunks_dir.entries()，解析 "<cx>_<cz>.bin"
-        Ok(Vec::new())
+    /// 内部方法：通过 key 打开世界目录
+    async fn open_impl_by_key(key: &str) -> Result<Self, StorageError> {
+        let storage = web_sys::window()
+            .ok_or(StorageError::NotSupported)?
+            .navigator()
+            .storage();
+        let root_value = JsFuture::from(storage.get_directory())
+            .await
+            .map_err(js_error)?;
+        let opfs_root: FileSystemDirectoryHandle = root_value.dyn_into().map_err(js_error)?;
+
+        let create_dir = {
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(true);
+            opts
+        };
+        let worlds_root = get_dir(&opfs_root, "voxweb", &create_dir).await?;
+        let root = get_dir(&worlds_root, key, &create_dir).await?;
+        let chunks_dir = get_dir(&root, "chunks", &create_dir).await?;
+
+        let now = now_ms() as u64;
+        let record = match load_world_record(&root).await? {
+            Some(record) if record.storage_version > STORAGE_VERSION => {
+                return Err(StorageError::NeedsUpgrade {
+                    found: record.storage_version,
+                    supported: STORAGE_VERSION,
+                });
+            }
+            Some(mut record) => {
+                record.updated_at_ms = now;
+                record
+            }
+            None => {
+                // 解析 key 获取 seed
+                let seed = seed_from_key(key).unwrap_or(0);
+                WorldRecord {
+                    key: key.to_string(),
+                    room_id: "local".to_string(),
+                    seed: seed.to_string(),
+                    display_name: "Unknown".to_string(),
+                    created_at_ms: parse_world_key(key).map(|(ts, _)| ts * 1000).unwrap_or(now),
+                    updated_at_ms: now,
+                    storage_version: STORAGE_VERSION,
+                    protocol_version: PROTOCOL_VERSION,
+                }
+            }
+        };
+        write_text_file(
+            &root,
+            "world.json",
+            &serde_json::to_string_pretty(&record).unwrap(),
+        )
+        .await?;
+        update_meta(&worlds_root, &record).await?;
+
+        Ok(Self {
+            worlds_root,
+            chunks_dir,
+            world_key: key.to_string(),
+        })
     }
 
-    /// 按 ChunkPos 读取单个 chunk 的 encoded 字节（未 decode）。
-    /// 调用方（client）拿到字节后用 voxweb_core::chunk::decode 还原。
-    pub async fn load_chunk(&self, _pos: ChunkPos) -> Result<Option<Vec<u8>>, StorageError> {
-        // Phase 5: getFileHandle(name).getFile().arrayBuffer()
-        Ok(None)
+    pub async fn request_persistence() -> Option<bool> {
+        let storage = web_sys::window()?.navigator().storage();
+        let promise = storage.persist().ok()?;
+        JsFuture::from(promise).await.ok()?.as_bool()
     }
 
-    /// 批量写入若干 encoded chunk。失败时调用方负责把失败的 ChunkPos 还回 dirty 集合。
-    pub async fn save_chunks(&self, _items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError> {
-        // Phase 5: 对每个 item 走 createWritable / write / close
+    /// 通过 key 直接打开已有存档（加载存档时用）
+    pub async fn open_by_key(key: &str) -> Result<Self, StorageError> {
+        Self::open_impl_by_key(key).await
+    }
+
+    /// 创建新存档（用当前时间戳 + seed 生成 key）
+    pub async fn create_new(seed: u64) -> Result<Self, StorageError> {
+        let created_at_s = (now_ms() / 1000.0) as u64;
+        let key = make_world_key(created_at_s, seed);
+        Self::open_impl_by_key(&key).await
+    }
+
+    /// 获取当前世界的 WorldRecord
+    pub async fn world_record(&self) -> Option<WorldRecord> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await
+        .ok()?;
+        load_world_record(&root).await.ok().flatten()
+    }
+}
+
+impl WorldStorage for OpfsStorage {
+    async fn open(_room_id: &str, seed: u64) -> Result<Self, StorageError> {
+        // 创建新存档（使用当前时间戳 + seed 生成 key）
+        Self::create_new(seed).await
+    }
+
+    async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError> {
+        let mut out = Vec::new();
+        let iter = self.chunks_dir.keys();
+        loop {
+            let next = JsFuture::from(iter.next().map_err(js_error)?)
+                .await
+                .map_err(js_error)?;
+            let done = Reflect::get(&next, &JsValue::from_str("done"))
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if done {
+                break;
+            }
+            let Some(name) = Reflect::get(&next, &JsValue::from_str("value"))
+                .ok()
+                .and_then(|v| v.as_string())
+            else {
+                continue;
+            };
+            if let Some(pos) = parse_chunk_filename(&name) {
+                out.push(pos);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_chunk(&self, pos: ChunkPos) -> Result<Option<Vec<u8>>, StorageError> {
+        let name = chunk_filename(pos);
+        let handle = match get_file(&self.chunks_dir, &name, false).await {
+            Ok(handle) => handle,
+            Err(StorageError::NotFound) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let file: Blob = JsFuture::from(handle.get_file())
+            .await
+            .map_err(js_error)?
+            .dyn_into()
+            .map_err(js_error)?;
+        let buffer = JsFuture::from(file.array_buffer())
+            .await
+            .map_err(js_error)?;
+        let bytes = Uint8Array::new(&buffer).to_vec();
+        Ok(Some(bytes))
+    }
+
+    async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError> {
+        for (pos, bytes) in items {
+            write_bytes_file(&self.chunks_dir, &chunk_filename(pos), &bytes).await?;
+        }
         Ok(())
     }
 
-    /// 删除整个世界（chunks 目录 + world.json）。
-    pub async fn delete_world(&self) -> Result<(), StorageError> {
-        // Phase 5: removeEntry({recursive: true})；旧 Safari 走逐文件 fallback
+    async fn delete_world(&self) -> Result<(), StorageError> {
+        let opts = FileSystemRemoveOptions::new();
+        opts.set_recursive(true);
+        JsFuture::from(
+            self.worlds_root
+                .remove_entry_with_options(&self.world_key, &opts),
+        )
+        .await
+        .map_err(js_error)?;
         Ok(())
     }
 
-    /// 当前 origin 的存储配额；浏览器不支持时返回 None。
-    pub async fn quota(&self) -> Option<QuotaInfo> {
-        // Phase 5: navigator.storage.estimate()
-        None
+    async fn quota(&self) -> Option<QuotaInfo> {
+        quota().await
+    }
+}
+
+pub async fn quota() -> Option<QuotaInfo> {
+    let storage = web_sys::window()?.navigator().storage();
+    let estimate = JsFuture::from(storage.estimate().ok()?).await.ok()?;
+    let quota = Reflect::get(&estimate, &JsValue::from_str("quota"))
+        .ok()?
+        .as_f64()? as u64;
+    let usage = Reflect::get(&estimate, &JsValue::from_str("usage"))
+        .ok()?
+        .as_f64()? as u64;
+    Some(QuotaInfo { quota, usage })
+}
+
+/// 列出所有已保存的世界（大厅用）
+pub async fn list_saved_worlds() -> Result<Vec<WorldSummary>, StorageError> {
+    let storage = web_sys::window()
+        .ok_or(StorageError::NotSupported)?
+        .navigator()
+        .storage();
+    let root_value = JsFuture::from(storage.get_directory())
+        .await
+        .map_err(js_error)?;
+    let opfs_root: FileSystemDirectoryHandle = root_value.dyn_into().map_err(js_error)?;
+
+    let create_dir = {
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(true);
+        opts
+    };
+    let worlds_root = get_dir(&opfs_root, "voxweb", &create_dir).await?;
+
+    let meta = load_meta(&worlds_root).await.unwrap_or_default();
+    Ok(meta.worlds)
+}
+
+/// 删除指定世界（通过 key）
+pub async fn delete_world_by_key(key: &str) -> Result<(), StorageError> {
+    let storage = web_sys::window()
+        .ok_or(StorageError::NotSupported)?
+        .navigator()
+        .storage();
+    let root_value = JsFuture::from(storage.get_directory())
+        .await
+        .map_err(js_error)?;
+    let opfs_root: FileSystemDirectoryHandle = root_value.dyn_into().map_err(js_error)?;
+
+    let worlds_root = get_dir(&opfs_root, "voxweb", &{
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(true);
+        opts
+    })
+    .await?;
+
+    // 删除世界目录
+    let opts = FileSystemRemoveOptions::new();
+    opts.set_recursive(true);
+    JsFuture::from(worlds_root.remove_entry_with_options(key, &opts))
+        .await
+        .map_err(js_error)?;
+
+    // 更新 _meta.json
+    let mut meta = load_meta(&worlds_root).await.unwrap_or_default();
+    meta.worlds.retain(|w| w.key != key);
+    write_text_file(
+        &worlds_root,
+        "_meta.json",
+        &serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// 生成世界目录 key：`<created_at_s>__<seed>`（秒级时间戳 + seed）
+pub fn make_world_key(created_at_s: u64, seed: u64) -> String {
+    format!("{created_at_s}__{seed}")
+}
+
+/// 解析 world_key 为 (created_at_s, seed)
+/// 格式: `<created_at_s>__<seed>`，如 `1746000000__1234567890`
+pub fn parse_world_key(key: &str) -> Option<(u64, u64)> {
+    let (ts_str, seed_str) = key.split_once("__")?;
+    let ts = ts_str.parse::<u64>().ok()?;
+    let seed = seed_str.parse::<u64>().ok()?;
+    Some((ts, seed))
+}
+
+/// 从 key 提取 seed（加载存档时用）
+pub fn seed_from_key(key: &str) -> Option<u64> {
+    parse_world_key(key).map(|(_, seed)| seed)
+}
+
+/// 从 key 提取创建时间并格式化为本地时间字符串
+/// 输入: "1746000000__1234567890"
+/// 输出: "2026-06-01 12:00:00"
+pub fn format_creation_time(key: &str) -> String {
+    let (ts_s, _) = parse_world_key(key).unwrap_or((0, 0));
+    // 使用 js_sys::Date 将秒级时间戳转换为日期字符串
+    let date = js_sys::Date::new(&JsValue::from_f64((ts_s as f64) * 1000.0));
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
+}
+
+/// 旧版兼容：从 room_id + seed 生成 key（用于迁移或兼容）
+pub fn make_world_key_legacy(room_id: &str, seed: u64) -> String {
+    format!("{}__{seed}", sanitize_key(room_id))
+}
+
+pub fn chunk_filename(pos: ChunkPos) -> String {
+    format!("{}_{}.bin", coord_part(pos.x), coord_part(pos.z))
+}
+
+pub fn parse_chunk_filename(name: &str) -> Option<ChunkPos> {
+    let stem = name.strip_suffix(".bin")?;
+    let (x, z) = stem.split_once('_')?;
+    Some(ChunkPos::new(parse_coord_part(x)?, parse_coord_part(z)?))
+}
+
+fn coord_part(v: i32) -> String {
+    if v < 0 {
+        format!("n{}", v.saturating_abs())
+    } else {
+        v.to_string()
+    }
+}
+
+fn parse_coord_part(s: &str) -> Option<i32> {
+    if let Some(rest) = s.strip_prefix('n') {
+        rest.parse::<i32>().ok().map(|v| -v)
+    } else {
+        s.parse().ok()
+    }
+}
+
+fn sanitize_key(s: &str) -> String {
+    let trimmed = s.trim();
+    let base = if trimmed.is_empty() { "local" } else { trimmed };
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+async fn get_dir(
+    parent: &FileSystemDirectoryHandle,
+    name: &str,
+    opts: &FileSystemGetDirectoryOptions,
+) -> Result<FileSystemDirectoryHandle, StorageError> {
+    JsFuture::from(parent.get_directory_handle_with_options(name, opts))
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)
+}
+
+async fn get_file(
+    parent: &FileSystemDirectoryHandle,
+    name: &str,
+    create: bool,
+) -> Result<FileSystemFileHandle, StorageError> {
+    let opts = FileSystemGetFileOptions::new();
+    opts.set_create(create);
+    JsFuture::from(parent.get_file_handle_with_options(name, &opts))
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)
+}
+
+async fn load_world_record(
+    root: &FileSystemDirectoryHandle,
+) -> Result<Option<WorldRecord>, StorageError> {
+    let handle = match get_file(root, "world.json", false).await {
+        Ok(handle) => handle,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let file: Blob = JsFuture::from(handle.get_file())
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)?;
+    let buffer = JsFuture::from(file.array_buffer())
+        .await
+        .map_err(js_error)?;
+    let bytes = Uint8Array::new(&buffer).to_vec();
+    let text = String::from_utf8(bytes).map_err(|e| StorageError::Io(e.to_string()))?;
+    serde_json::from_str(&text).map_err(|e| StorageError::Io(e.to_string()))
+}
+
+async fn update_meta(
+    worlds_root: &FileSystemDirectoryHandle,
+    record: &WorldRecord,
+) -> Result<(), StorageError> {
+    let mut meta = load_meta(worlds_root).await.unwrap_or_default();
+    meta.worlds.retain(|w| w.key != record.key);
+    meta.worlds.push(WorldSummary {
+        key: record.key.clone(),
+        display_name: record.display_name.clone(),
+        updated_at_ms: record.updated_at_ms,
+    });
+    meta.worlds
+        .sort_by_key(|w| std::cmp::Reverse(w.updated_at_ms));
+    write_text_file(
+        worlds_root,
+        "_meta.json",
+        &serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .await
+}
+
+async fn load_meta(root: &FileSystemDirectoryHandle) -> Result<MetaRecord, StorageError> {
+    let handle = get_file(root, "_meta.json", false).await?;
+    let file: Blob = JsFuture::from(handle.get_file())
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)?;
+    let buffer = JsFuture::from(file.array_buffer())
+        .await
+        .map_err(js_error)?;
+    let text = String::from_utf8(Uint8Array::new(&buffer).to_vec())
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+    serde_json::from_str(&text).map_err(|e| StorageError::Io(e.to_string()))
+}
+
+async fn write_text_file(
+    dir: &FileSystemDirectoryHandle,
+    name: &str,
+    text: &str,
+) -> Result<(), StorageError> {
+    write_bytes_file(dir, name, text.as_bytes()).await
+}
+
+async fn write_bytes_file(
+    dir: &FileSystemDirectoryHandle,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    let handle = get_file(dir, name, true).await?;
+    let stream: FileSystemWritableFileStream = JsFuture::from(handle.create_writable())
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)?;
+    JsFuture::from(stream.write_with_u8_array(bytes).map_err(js_error)?)
+        .await
+        .map_err(js_error)?;
+    let writable: web_sys::WritableStream = stream.unchecked_into();
+    JsFuture::from(writable.close()).await.map_err(js_error)?;
+    Ok(())
+}
+
+fn js_error(value: JsValue) -> StorageError {
+    let name = Reflect::get(&value, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    match name.as_str() {
+        "NotFoundError" => StorageError::NotFound,
+        "QuotaExceededError" => StorageError::QuotaExceeded,
+        _ => StorageError::Io(
+            value
+                .as_string()
+                .or_else(|| js_sys::JSON::stringify(&value).ok().map(String::from))
+                .unwrap_or_else(|| format!("{value:?}")),
+        ),
+    }
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn voxweb_debug_quota() -> JsValue {
+    match quota().await {
+        Some(q) => {
+            let obj = js_sys::Object::new();
+            let _ = Reflect::set(&obj, &"quota".into(), &JsValue::from_f64(q.quota as f64));
+            let _ = Reflect::set(&obj, &"usage".into(), &JsValue::from_f64(q.usage as f64));
+            obj.into()
+        }
+        None => JsValue::NULL,
+    }
+}
+
+#[allow(dead_code)]
+fn _array_from_bytes(bytes: &[u8]) -> Array {
+    let a = Array::new();
+    a.push(&Uint8Array::from(bytes).into());
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_filename_roundtrip() {
+        for pos in [
+            ChunkPos::new(0, 0),
+            ChunkPos::new(-1, 2),
+            ChunkPos::new(15, -23),
+        ] {
+            assert_eq!(parse_chunk_filename(&chunk_filename(pos)), Some(pos));
+        }
+    }
+
+    #[test]
+    fn invalid_chunk_filename_rejected() {
+        assert_eq!(parse_chunk_filename("1.bin"), None);
+        assert_eq!(parse_chunk_filename("x_1.bin"), None);
+        assert_eq!(parse_chunk_filename("1_2.txt"), None);
+    }
+
+    #[test]
+    fn world_key_format() {
+        // 新格式: <timestamp_s>__<seed>
+        assert_eq!(make_world_key(1000, 7), "1000__7");
+        assert_eq!(
+            make_world_key(1746000000, 1234567890),
+            "1746000000__1234567890"
+        );
+    }
+
+    #[test]
+    fn parse_world_key_roundtrip() {
+        let key = make_world_key(1746000000, 1234567890);
+        let (ts, seed) = parse_world_key(&key).unwrap();
+        assert_eq!(ts, 1746000000);
+        assert_eq!(seed, 1234567890);
+    }
+
+    #[test]
+    fn parse_world_key_invalid() {
+        assert_eq!(parse_world_key("invalid"), None);
+        assert_eq!(parse_world_key("abc__def"), None);
     }
 }

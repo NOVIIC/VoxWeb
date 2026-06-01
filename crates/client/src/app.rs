@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use glam::Vec3;
@@ -27,6 +28,7 @@ use crate::mesh_jobs::MeshJobQueue;
 use crate::physics::LocalPhysics;
 use crate::prediction::{InputHistory, PendingActions};
 use crate::raycast::RaycastHit;
+use crate::storage::{OpfsStorage, QuotaInfo};
 
 /// 区块预载进度（进入游戏前的最后一项加载步骤）。
 #[derive(Clone, Debug, Default)]
@@ -158,6 +160,12 @@ pub struct AppSettings {
     pub interp_delay_ms: f32,
     /// 是否显示左上角统计 HUD（暂停菜单切换）。
     pub show_stats: bool,
+    /// Phase 8：是否启用 Depth Pre-Pass。
+    #[serde(default = "default_depth_prepass_enabled")]
+    pub depth_prepass_enabled: bool,
+    /// Phase 8：server world 内存 chunk cache 容量。
+    #[serde(default = "default_chunk_cache_capacity")]
+    pub chunk_cache_capacity: usize,
 
     /// Fly 模式速度（方块/秒）；不持久化。
     #[serde(skip, default = "default_fly_speed")]
@@ -179,6 +187,12 @@ fn default_mesh_budget_ms() -> f32 {
 fn default_min_action_interval_ms() -> f64 {
     100.0
 }
+fn default_depth_prepass_enabled() -> bool {
+    true
+}
+fn default_chunk_cache_capacity() -> usize {
+    voxweb_server::world::DEFAULT_CHUNK_CACHE_CAPACITY
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -188,6 +202,8 @@ impl Default for AppSettings {
             render_distance: 6,
             interp_delay_ms: 100.0,
             show_stats: true,
+            depth_prepass_enabled: default_depth_prepass_enabled(),
+            chunk_cache_capacity: default_chunk_cache_capacity(),
             fly_speed: default_fly_speed(),
             mesh_budget_ms: default_mesh_budget_ms(),
             min_action_interval_ms: default_min_action_interval_ms(),
@@ -202,6 +218,8 @@ impl PartialEq for AppSettings {
             && self.render_distance == other.render_distance
             && self.interp_delay_ms == other.interp_delay_ms
             && self.show_stats == other.show_stats
+            && self.depth_prepass_enabled == other.depth_prepass_enabled
+            && self.chunk_cache_capacity == other.chunk_cache_capacity
     }
 }
 
@@ -292,6 +310,12 @@ pub struct Game {
     /// Host 时钟与本地时钟的瞬态偏移（ms）：server_time_ms - local_now_ms。
     /// PlayerTick 每帧覆盖；远端的 rendering target 用。
     pub server_clock_offset_ms: i64,
+    /// Phase 8：Local/Host 的 OPFS 存储句柄。Remote 不写存档。
+    pub storage: Option<OpfsStorage>,
+    pub known_persisted: HashSet<voxweb_core::ChunkPos>,
+    pub last_persist_ms: f64,
+    pub quota: Option<QuotaInfo>,
+    pub storage_error: Option<String>,
 }
 
 impl Game {
@@ -426,6 +450,11 @@ impl Game {
             chunk_assembler: ChunkAssembler::new(),
             input_history: InputHistory::new(120),
             server_clock_offset_ms: 0,
+            storage: None,
+            known_persisted: HashSet::new(),
+            last_persist_ms: 0.0,
+            quota: None,
+            storage_error: None,
         }
     }
 
@@ -437,6 +466,10 @@ impl Game {
             .set_delay_ms(self.settings.interp_delay_ms as f64);
         self.chunk_loader
             .set_render_distance(self.settings.render_distance);
+        self.server
+            .borrow_mut()
+            .world
+            .set_chunk_cache_capacity(self.settings.chunk_cache_capacity);
     }
 }
 

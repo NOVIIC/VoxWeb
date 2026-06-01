@@ -38,6 +38,7 @@ pub struct ChunkMeshGpu {
 /// 不透明方块渲染 Pass（Pipeline + bind group layout）。
 pub struct OpaquePass {
     pub pipeline: wgpu::RenderPipeline,
+    pub depth_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
 }
 
@@ -116,9 +117,40 @@ impl OpaquePass {
             multiview_mask: None,
             cache: None,
         });
+        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("opaque.depth_prepass_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[vertex_buffer_layout()],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
 
         Self {
             pipeline,
+            depth_pipeline,
             globals_layout,
         }
     }

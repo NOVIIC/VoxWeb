@@ -27,6 +27,8 @@ use crate::chunk_mesh::ChunkMeshCpu;
 use crate::passes::opaque::{ChunkMeshGpu, GlobalsUniform, OpaquePass};
 use crate::passes::player::{PlayerInstance, PlayerPass};
 use crate::passes::selection::{SelectionGlobals, SelectionPass};
+use crate::passes::skybox::{SkyboxGlobals, SkyboxPass};
+use crate::passes::transparent::{TransparentGlobals, TransparentMeshGpu, TransparentPass};
 
 /// 深度纹理格式（与 OpaquePass 中的 DepthStencilState 对齐）。
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -55,9 +57,12 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
 
     opaque_pass: OpaquePass,
+    skybox_pass: SkyboxPass,
+    transparent_pass: TransparentPass,
     player_pass: PlayerPass,
     selection_pass: SelectionPass,
     chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>,
+    transparent_meshes: HashMap<ChunkPos, TransparentMeshGpu>,
 }
 
 impl Renderer {
@@ -69,6 +74,8 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth(&ctx.device, w, h);
         let opaque_pass = OpaquePass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
+        let skybox_pass = SkyboxPass::new(&ctx.device, ctx.surface_format);
+        let transparent_pass = TransparentPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
         let player_pass = PlayerPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
         let selection_pass = SelectionPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
 
@@ -82,9 +89,12 @@ impl Renderer {
             depth_texture,
             depth_view,
             opaque_pass,
+            skybox_pass,
+            transparent_pass,
             player_pass,
             selection_pass,
             chunk_meshes: HashMap::new(),
+            transparent_meshes: HashMap::new(),
         })
     }
 
@@ -138,11 +148,24 @@ impl Renderer {
                 self.chunk_meshes.remove(&pos);
             }
         }
+        match self.transparent_pass.upload_mesh(
+            &self.device,
+            &mesh.transparent_vertices,
+            &mesh.transparent_indices,
+        ) {
+            Some(gpu) => {
+                self.transparent_meshes.insert(pos, gpu);
+            }
+            None => {
+                self.transparent_meshes.remove(&pos);
+            }
+        }
     }
 
     /// 卸载某个 Chunk 的 GPU 网格（玩家走远时调用）。
     pub fn drop_chunk_mesh(&mut self, pos: ChunkPos) {
         self.chunk_meshes.remove(&pos);
+        self.transparent_meshes.remove(&pos);
     }
 
     /// 查询某个 chunk 是否已有 GPU mesh。
@@ -206,7 +229,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        clear_color: [f64; 4],
+        _clear_color: [f64; 4],
     ) -> WorldRenderStats {
         let pass_label = "opaque_pass";
         let mut stats = WorldRenderStats {
@@ -222,12 +245,7 @@ impl Renderer {
                     view: color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear_color[0],
-                            g: clear_color[1],
-                            b: clear_color[2],
-                            a: clear_color[3],
-                        }),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -292,12 +310,7 @@ impl Renderer {
                 view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: clear_color[0],
-                        g: clear_color[1],
-                        b: clear_color[2],
-                        a: clear_color[3],
-                    }),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -322,6 +335,199 @@ impl Renderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
         stats
+    }
+
+    /// Depth Pre-Pass：只写深度，不写颜色。开启后 OpaquePass 仍会正常绘制颜色；
+    /// 这里主要为复杂场景提供 Early-Z 热身，同时给 Phase 8 设置项一个真实 GPU pass。
+    pub fn render_depth_prepass(&mut self, encoder: &mut wgpu::CommandEncoder, view_proj: Mat4) {
+        if self.chunk_meshes.is_empty() {
+            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth_prepass_clear"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            return;
+        }
+
+        let frustum = Frustum::from_view_proj(view_proj);
+        let entries: Vec<(ChunkPos, &ChunkMeshGpu)> = self
+            .chunk_meshes
+            .iter()
+            .filter(|(_, mesh)| frustum.intersects_aabb(&mesh.bounds))
+            .map(|(p, m)| (*p, m))
+            .collect();
+        for (pos, mesh) in &entries {
+            let chunk_origin_world = Vec3::new(
+                pos.x as f32 * voxweb_core::CHUNK_X as f32,
+                0.0,
+                pos.z as f32 * voxweb_core::CHUNK_Z as f32,
+            );
+            let globals = GlobalsUniform {
+                view_proj: view_proj.to_cols_array_2d(),
+                chunk_origin: [
+                    chunk_origin_world.x,
+                    chunk_origin_world.y,
+                    chunk_origin_world.z,
+                    0.0,
+                ],
+            };
+            self.queue
+                .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("depth_prepass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.opaque_pass.depth_pipeline);
+        for (_, mesh) in entries {
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
+    /// 程序化天空：在世界几何前绘制，负责填满 color target。
+    pub fn render_skybox(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        view_proj: Mat4,
+        time_seconds: f32,
+    ) {
+        let inv = view_proj.inverse();
+        let sun_dir = Vec3::new(0.35, 0.8, 0.25).normalize();
+        let globals = SkyboxGlobals {
+            inv_view_proj: inv.to_cols_array_2d(),
+            sun_dir_time: [sun_dir.x, sun_dir.y, sun_dir.z, time_seconds],
+        };
+        self.queue.write_buffer(
+            &self.skybox_pass.globals_buffer,
+            0,
+            bytemuck::bytes_of(&globals),
+        );
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("skybox_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.skybox_pass.pipeline);
+        pass.set_bind_group(0, &self.skybox_pass.globals_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// 半透明方块：按 chunk 中心到相机距离从远到近绘制。
+    pub fn render_transparent(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        view_proj: Mat4,
+        camera_pos: Vec3,
+    ) {
+        if self.transparent_meshes.is_empty() {
+            return;
+        }
+        let mut entries: Vec<(ChunkPos, f32)> = self
+            .transparent_meshes
+            .keys()
+            .map(|pos| {
+                let center = Vec3::new(
+                    pos.x as f32 * voxweb_core::CHUNK_X as f32 + 8.0,
+                    128.0,
+                    pos.z as f32 * voxweb_core::CHUNK_Z as f32 + 8.0,
+                );
+                (*pos, center.distance_squared(camera_pos))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        for (pos, _) in &entries {
+            let Some(mesh) = self.transparent_meshes.get(pos) else {
+                continue;
+            };
+            let chunk_origin_world = Vec3::new(
+                pos.x as f32 * voxweb_core::CHUNK_X as f32,
+                0.0,
+                pos.z as f32 * voxweb_core::CHUNK_Z as f32,
+            );
+            let globals = TransparentGlobals {
+                view_proj: view_proj.to_cols_array_2d(),
+                chunk_origin: [
+                    chunk_origin_world.x,
+                    chunk_origin_world.y,
+                    chunk_origin_world.z,
+                    0.0,
+                ],
+            };
+            self.queue
+                .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("transparent_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.transparent_pass.pipeline);
+        for (pos, _) in entries {
+            let Some(mesh) = self.transparent_meshes.get(&pos) else {
+                continue;
+            };
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
     }
 
     /// 渲染选中方块的线框。`block_pos = None` 时跳过（玩家未瞄准任何方块）。
