@@ -94,7 +94,7 @@ impl ChunkPos {
 // —— Chunk ——
 
 /// 一个 16×256×16 的方块列柱。
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Chunk {
     /// 长度恒为 CHUNK_SIZE 的方块数组
     pub blocks: Vec<BlockID>,

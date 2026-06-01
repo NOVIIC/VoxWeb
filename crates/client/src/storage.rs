@@ -590,8 +590,26 @@ mod tests {
     }
 
     #[test]
-    fn local_world_key_uses_local_prefix() {
-        assert_eq!(make_world_key("", 7), "local__7");
-        assert_eq!(make_world_key("room/a", 7), "room_a__7");
+    fn world_key_format() {
+        // 新格式: <timestamp_s>__<seed>
+        assert_eq!(make_world_key(1000, 7), "1000__7");
+        assert_eq!(
+            make_world_key(1746000000, 1234567890),
+            "1746000000__1234567890"
+        );
+    }
+
+    #[test]
+    fn parse_world_key_roundtrip() {
+        let key = make_world_key(1746000000, 1234567890);
+        let (ts, seed) = parse_world_key(&key).unwrap();
+        assert_eq!(ts, 1746000000);
+        assert_eq!(seed, 1234567890);
+    }
+
+    #[test]
+    fn parse_world_key_invalid() {
+        assert_eq!(parse_world_key("invalid"), None);
+        assert_eq!(parse_world_key("abc__def"), None);
     }
 }
