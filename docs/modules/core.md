@@ -222,6 +222,9 @@ pub enum RoomEvent {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub entity_id: u32,
+    /// 服务端已接受到该玩家的最新 PlayerInput.tick。
+    /// 本玩家收到自己的快照时用它与本地预测历史对齐，避免高延迟下用旧回声拉扯当前位置。
+    pub last_input_tick: u32,
     pub position: glam::Vec3,
     pub yaw: f32,
     pub pitch: f32,

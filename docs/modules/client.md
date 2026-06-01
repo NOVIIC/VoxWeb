@@ -200,7 +200,9 @@ pub struct Game {
     pub interp: PlayerInterp,          // [Phase 5 ✅]
     pub chunk_assembler: ChunkAssembler, // [Phase 5 ✅]
     pub remote_players: HashMap<EntityId, RemotePlayerState>, // [Phase 5 ✅]
-    pub input_history: InputHistory,   // [Phase 5 ✅]
+    pub local_input_tick: u32,         // [Phase 8] 本地输入序号；Remote 也单调递增
+    pub input_history: InputHistory,   // [Phase 5 ✅] 以 local_input_tick 记录预测位置
+    pub pending_position_correction: Vec3, // [Phase 8] 中等误差按帧软修正，避免高延迟回弹
     pub server_clock_offset_ms: i64,   // [Phase 5 ✅]
     pub chat: ChatHistory,             // [Phase 6 ✅] 聊天历史（含本地合成的系统消息）
 }

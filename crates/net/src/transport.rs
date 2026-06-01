@@ -118,6 +118,7 @@ mod tests {
                 tick: 0,
                 players: vec![PlayerSnapshot {
                     entity_id: 1,
+                    last_input_tick: 0,
                     position: Vec3::ZERO,
                     yaw: 0.0,
                     pitch: 0.0,

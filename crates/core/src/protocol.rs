@@ -12,9 +12,9 @@ use crate::chunk::{ChunkPos, Position};
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v2（Phase 6）：Welcome 携带完整 roster + host_entity_id，
-/// 让新加入的 Remote 一次性建好玩家表（包括早于自己加入的 Host）。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3（Phase 8）：PlayerSnapshot 携带 last_input_tick，
+/// 让客户端按同一条本地输入记录做预测协调，避免高延迟时被旧位置回声拉回。
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// ChunkSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -156,6 +156,9 @@ pub enum RoomEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub entity_id: u32,
+    /// 服务端已接受到该玩家的最新 PlayerInput.tick。
+    /// 客户端收到自己的快照时用它查本地 InputHistory，而不是用 server tick 对齐。
+    pub last_input_tick: u32,
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
@@ -284,9 +287,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        // Phase 6 起为 2；任何破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        // Phase 8 起为 3；任何破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -295,6 +298,7 @@ mod tests {
             tick: 60,
             players: vec![PlayerSnapshot {
                 entity_id: 1,
+                last_input_tick: 9,
                 position: Vec3::new(1.0, 64.0, 2.0),
                 yaw: 0.5,
                 pitch: -0.2,

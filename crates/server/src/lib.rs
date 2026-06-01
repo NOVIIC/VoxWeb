@@ -66,6 +66,7 @@ impl PlayerEntity {
     fn to_snapshot(&self, entity_id: EntityId) -> PlayerSnapshot {
         PlayerSnapshot {
             entity_id,
+            last_input_tick: self.last_input_tick,
             position: self.position,
             yaw: self.yaw,
             pitch: self.pitch,

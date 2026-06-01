@@ -170,10 +170,26 @@ impl InputHistory {
         }
     }
 
-    /// 丢弃所有 tick ≤ server_tick 的遗留记录（服务端已追上）。
-    pub fn drop_until(&mut self, server_tick: u32) {
-        while self.records.front().is_some_and(|r| r.tick <= server_tick) {
+    /// 丢弃所有 tick ≤ input_tick 的遗留记录（服务端已确认这些输入）。
+    pub fn drop_until(&mut self, input_tick: u32) {
+        while self.records.front().is_some_and(|r| r.tick <= input_tick) {
             self.records.pop_front();
+        }
+    }
+
+    /// 查找某个本地输入序号对应的预测位置。
+    pub fn position_at(&self, input_tick: u32) -> Option<Vec3> {
+        self.records
+            .iter()
+            .find(|r| r.tick == input_tick)
+            .map(|r| r.position)
+    }
+
+    /// 服务端确认某个输入后，若发现该输入时刻存在差值，后续未确认记录也要平移同样的差值。
+    /// 否则下一次回执会继续拿“旧基准线”比较，造成重复校正。
+    pub fn translate_remaining(&mut self, delta: Vec3) {
+        for record in &mut self.records {
+            record.position += delta;
         }
     }
 
@@ -189,38 +205,70 @@ pub const SOFT_THRESHOLD_M: f32 = 0.1;
 pub const HARD_THRESHOLD_M: f32 = 2.0;
 
 /// reconcile_self 的结果——方便调用方区分状态并在 HUD 上显示不同颜色。
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ReconcileResult {
     /// 误差可接受，不做修正。
     Ok,
-    /// 误差超过 HARD_THRESHOLD，已把 physics 瞬移回服务端位置。
-    Snap,
+    /// 本地已没有对应输入 tick 的历史，通常是旧包或历史过短；忽略以避免高延迟旧回声拉扯。
+    MissingHistory,
+    /// 误差中等，调用方应把该差值加入 pending correction，按帧软修正。
+    SoftCorrection(Vec3),
+    /// 误差过大，已把当前 physics 位置按同 tick 差值立即平移。
+    HardCorrection(Vec3),
 }
 
-/// 对比服务端权威位置与本地 physics，决定是接受还是 Snap。
+/// 对比服务端权威位置与同一输入 tick 的本地预测记录，决定是否校正。
 ///
 /// * `server_position` — PlayerTick 中与自己 entity_id 对应的权威位置（脚底）
-/// * `server_tick` — 该 PlayerTick 的 server tick（用于清历史）
+/// * `acked_input_tick` — 服务端已处理到的本地 PlayerInput.tick
 /// * `physics` — 本地物理状态（feet_position 在此被修正）
-/// * `history` — 输入记录历史（用于清掉 server 已处理过的步数）
+/// * `history` — 输入记录历史（用于查找同 tick 位置并清掉已确认输入）
 pub fn reconcile_self(
     server_position: Vec3,
-    server_tick: u32,
+    acked_input_tick: u32,
     physics: &mut LocalPhysics,
     history: &mut InputHistory,
 ) -> ReconcileResult {
-    history.drop_until(server_tick);
+    let Some(predicted_position) = history.position_at(acked_input_tick) else {
+        history.drop_until(acked_input_tick);
+        return ReconcileResult::MissingHistory;
+    };
 
-    let error = (physics.feet_position - server_position).length();
+    let correction = server_position - predicted_position;
+    let error = correction.length();
 
-    if error >= HARD_THRESHOLD_M {
-        physics.feet_position = server_position;
-        ReconcileResult::Snap
-    } else if error < SOFT_THRESHOLD_M {
+    history.drop_until(acked_input_tick);
+
+    if error < SOFT_THRESHOLD_M {
         ReconcileResult::Ok
+    } else if error >= HARD_THRESHOLD_M {
+        physics.feet_position += correction;
+        history.translate_remaining(correction);
+        ReconcileResult::HardCorrection(correction)
     } else {
-        // 中等误差：Phase 5 不做软插值（Phase 7 加 blend）
-        ReconcileResult::Ok
+        history.translate_remaining(correction);
+        ReconcileResult::SoftCorrection(correction)
+    }
+}
+
+/// 每渲染帧应用一部分待修正位移，避免中等误差造成肉眼可见瞬移。
+pub fn apply_pending_position_correction(
+    physics: &mut LocalPhysics,
+    pending_correction: &mut Vec3,
+    dt: f32,
+) {
+    if pending_correction.length_squared() < 0.000001 {
+        *pending_correction = Vec3::ZERO;
+        return;
+    }
+
+    let blend = (dt * 5.0).clamp(0.0, 1.0);
+    let step = *pending_correction * blend;
+    physics.feet_position += step;
+    *pending_correction -= step;
+
+    if pending_correction.length_squared() < 0.000001 {
+        *pending_correction = Vec3::ZERO;
     }
 }
 
@@ -254,7 +302,7 @@ mod prediction_tests {
     fn reconcile_returns_ok_for_small_error() {
         let mut physics = LocalPhysics::new(Vec3::new(10.0, 64.0, 10.0));
         let mut history = InputHistory::new(10);
-        history.push(1, Vec3::new(10.0, 64.0, 10.0));
+        history.push(2, Vec3::new(10.0, 64.0, 10.0));
         // 误差 0.05 < SOFT
         let r = reconcile_self(Vec3::new(10.03, 64.0, 10.04), 2, &mut physics, &mut history);
         assert_eq!(r, ReconcileResult::Ok);
@@ -262,13 +310,39 @@ mod prediction_tests {
     }
 
     #[test]
-    fn reconcile_snaps_for_large_error() {
-        let mut physics = LocalPhysics::new(Vec3::new(10.0, 64.0, 10.0));
+    fn reconcile_shifts_current_by_same_tick_error_for_large_error() {
+        let mut physics = LocalPhysics::new(Vec3::new(30.0, 64.0, 10.0));
         let mut history = InputHistory::new(10);
-        history.push(1, Vec3::new(10.0, 64.0, 10.0));
-        // 误差 10m > HARD → Snap
+        history.push(2, Vec3::new(10.0, 64.0, 10.0));
+        history.push(3, Vec3::new(12.0, 64.0, 10.0));
+        // 误差 10m > HARD → 当前预测位置按差值平移，而不是退回旧快照位置。
         let r = reconcile_self(Vec3::new(20.0, 64.0, 10.0), 2, &mut physics, &mut history);
-        assert_eq!(r, ReconcileResult::Snap);
-        assert!((physics.feet_position - Vec3::new(20.0, 64.0, 10.0)).length() < 0.001);
+        assert_eq!(
+            r,
+            ReconcileResult::HardCorrection(Vec3::new(10.0, 0.0, 0.0))
+        );
+        assert!((physics.feet_position - Vec3::new(40.0, 64.0, 10.0)).length() < 0.001);
+        assert_eq!(history.position_at(3), Some(Vec3::new(22.0, 64.0, 10.0)));
+    }
+
+    #[test]
+    fn reconcile_returns_soft_correction_for_mid_error() {
+        let mut physics = LocalPhysics::new(Vec3::new(10.5, 64.0, 10.0));
+        let mut history = InputHistory::new(10);
+        history.push(7, Vec3::new(10.0, 64.0, 10.0));
+
+        let r = reconcile_self(Vec3::new(10.5, 64.0, 10.0), 7, &mut physics, &mut history);
+        assert_eq!(r, ReconcileResult::SoftCorrection(Vec3::new(0.5, 0.0, 0.0)));
+        assert!((physics.feet_position - Vec3::new(10.5, 64.0, 10.0)).length() < 0.001);
+    }
+
+    #[test]
+    fn reconcile_missing_history_does_not_snap_to_stale_echo() {
+        let mut physics = LocalPhysics::new(Vec3::new(30.0, 64.0, 10.0));
+        let mut history = InputHistory::new(10);
+
+        let r = reconcile_self(Vec3::new(10.0, 64.0, 10.0), 99, &mut physics, &mut history);
+        assert_eq!(r, ReconcileResult::MissingHistory);
+        assert!((physics.feet_position - Vec3::new(30.0, 64.0, 10.0)).length() < 0.001);
     }
 }

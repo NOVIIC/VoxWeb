@@ -53,36 +53,34 @@ fn upload_input(&mut self) {
 
 ### 2.2 协调（Reconciliation）
 
-当客户端收到 `PlayerTick`，找到自己 entity 的服务端权威位置：
+当客户端收到 `PlayerTick`，找到自己 entity 的服务端权威位置。关键点是用
+`PlayerSnapshot.last_input_tick` 对齐本地历史：它表示 Host 已经接受到该玩家的哪一条
+`PlayerInput`。这样 RTT 200ms+ 时也不会把“200ms 前自己的位置回声”和当前预测位置直接相减。
 
 ```rust
-fn reconcile_self(&mut self, snap: &PlayerSnapshot, server_tick: u32) {
-    // 服务端 tick 对应客户端的某个 input_history entry
+fn reconcile_self(&mut self, snap: &PlayerSnapshot) {
+    // Host 已处理的客户端输入 tick 对应本地 input_history 中的一条记录
     let our_record = self.prediction.input_history.iter()
-        .find(|r| r.tick == server_tick);
+        .find(|r| r.tick == snap.last_input_tick);
 
     if let Some(record) = our_record {
         let error = (snap.position - record.position).length();
+        let correction = snap.position - record.position;
 
         if error < SOFT_THRESHOLD {
             // 误差小：忽略，本地预测继续
         } else if error < HARD_THRESHOLD {
-            // 误差中等：软插补 → 把 camera.position 往服务端方向慢慢拉
-            let correction = snap.position - record.position;
+            // 误差中等：把同一输入时刻的差值软插补到当前预测位置
             self.prediction.pending_correction = Some(correction);
         } else {
-            // 误差大：硬瞬移
-            self.camera.position = snap.position;
+            // 误差大：立刻把差值加到当前预测位置，而不是回到旧快照位置
+            self.camera.position += correction;
             self.prediction.input_history.clear();
-            // 重新执行后续 input（本地保留的 inputs 应用到新位置）
-            for input in self.prediction.input_history.iter().filter(|r| r.tick > server_tick) {
-                self.physics.replay(input);
-            }
         }
     }
 
     // 清理过旧记录
-    self.prediction.input_history.retain(|r| r.tick > server_tick);
+    self.prediction.input_history.retain(|r| r.tick > snap.last_input_tick);
 }
 ```
 

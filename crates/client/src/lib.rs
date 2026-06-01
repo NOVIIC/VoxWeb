@@ -42,7 +42,9 @@ use crate::camera::CameraMode;
 use crate::chunk_loader::affected_chunks;
 use crate::input::InputState;
 use crate::mesh_jobs::{MeshPriority, MeshRunStats};
-use crate::prediction::{PendingAction, PendingKind, reconcile_self};
+use crate::prediction::{
+    PendingAction, PendingKind, ReconcileResult, apply_pending_position_correction, reconcile_self,
+};
 use crate::raycast::raycast;
 use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
@@ -1934,30 +1936,34 @@ fn render_game_frame(
                 game.physics.step(&getter, &game.camera, &neutral, dt);
             }
         }
+        apply_pending_position_correction(
+            &mut game.physics,
+            &mut game.pending_position_correction,
+            dt,
+        );
         game.camera.position = game.physics.eye_position();
 
         // 60Hz 逻辑帧
         game.frame_clock.accumulate(dt);
         let mut steps_consumed: u32 = 0;
         let server_tick_allowed = matches!(game.mode, GameMode::Local | GameMode::Host);
+        let mut last_input_tick_to_send = None;
         while game.frame_clock.consume_logic_step() {
             if server_tick_allowed {
                 game.server.borrow_mut().tick();
             }
-            // 每个逻辑步推一条 input history（Host reconcile 用；Remote 也可靠它追踪本地步数）
+            // 每个逻辑步分配本地输入序号。Remote 不能借 dummy server tick，
+            // 否则 Host 回播时无法把权威位置和同一条预测记录对齐。
+            game.local_input_tick = game.local_input_tick.wrapping_add(1).max(1);
             game.input_history
-                .push(game.server.borrow().tick, game.physics.feet_position);
+                .push(game.local_input_tick, game.physics.feet_position);
+            last_input_tick_to_send = Some(game.local_input_tick);
             steps_consumed += 1;
         }
 
-        // 每个 logic step 上报一条 PlayerInput
+        // 若本帧消费了一个或多个逻辑步，只上报最新位置；tick 仍对应最后一个本地输入序号。
         if steps_consumed > 0 && game.entity_id != 0 {
-            let tick = if server_tick_allowed {
-                game.server.borrow().tick
-            } else {
-                // Remote：用自己的 input history 计数（从 physics 最后一次 reconcile 后的步数推导）
-                0 // Phase 5 简化：Remote 的 PlayerInput.tick 用 0；Host Server 不依赖 Remote 的 tick 做排序
-            };
+            let tick = last_input_tick_to_send.unwrap_or(game.local_input_tick);
             game.net.send_client_message(ClientMessage::PlayerInput {
                 tick,
                 position: game.physics.feet_position,
@@ -2678,12 +2684,21 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             for snap in &players {
                 if snap.entity_id == game.entity_id {
                     // 自己的权威位置 → reconcile
-                    let _r = reconcile_self(
+                    let result = reconcile_self(
                         snap.position,
-                        server_tick,
+                        snap.last_input_tick,
                         &mut game.physics,
                         &mut game.input_history,
                     );
+                    match result {
+                        ReconcileResult::SoftCorrection(delta) => {
+                            game.pending_position_correction += delta;
+                        }
+                        ReconcileResult::HardCorrection(_) => {
+                            game.pending_position_correction = glam::Vec3::ZERO;
+                        }
+                        ReconcileResult::Ok | ReconcileResult::MissingHistory => {}
+                    }
                 } else {
                     // 远端玩家 → 喂入插值缓冲
                     game.interp.ingest_tick(
