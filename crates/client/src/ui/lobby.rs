@@ -251,9 +251,9 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.add_space(8.0);
             let save_count = state.saved_worlds.len();
             let header_text = if state.saves_loading {
-                "我的存档 (加载中...)".to_string()
+                "My Saves (Loading...)".to_string()
             } else {
-                format!("我的存档 ({})", save_count)
+                format!("My Saves ({})", save_count)
             };
             ui.label(
                 egui::RichText::new(&header_text)
@@ -264,7 +264,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
 
             // New World 选项（默认选中）
             let is_new_world = state.selected_save.is_none();
-            let radio = egui::RadioButton::new(is_new_world, "New World (创建新世界)");
+            let radio = egui::RadioButton::new(is_new_world, "New World");
             if ui.add(radio).clicked() {
                 action = Some(LobbyAction::SelectSave { key: None });
             }
@@ -283,8 +283,8 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     }
                     // 删除按钮
                     if ui
-                        .small_button("删除")
-                        .on_hover_text("删除此存档")
+                        .small_button("Delete")
+                        .on_hover_text("Delete this save")
                         .clicked()
                     {
                         state.delete_confirm_key = Some(world.key.clone());
@@ -295,7 +295,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             // 空列表提示
             if !state.saves_loading && save_count == 0 {
                 ui.label(
-                    egui::RichText::new("暂无存档")
+                    egui::RichText::new("No saves")
                         .size(12.0)
                         .color(egui::Color32::from_rgb(120, 130, 140)),
                 );
@@ -304,13 +304,13 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             // 删除确认对话框
             if let Some(key) = &state.delete_confirm_key.clone() {
                 ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 180, 100), "确认删除此存档？");
+                ui.colored_label(egui::Color32::from_rgb(220, 180, 100), "Delete this save?");
                 ui.horizontal(|ui| {
-                    if ui.button("确认删除").clicked() {
+                    if ui.button("Confirm").clicked() {
                         action = Some(LobbyAction::DeleteSave { key: key.clone() });
                         state.delete_confirm_key = None;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button("Cancel").clicked() {
                         state.delete_confirm_key = None;
                     }
                 });
@@ -433,7 +433,7 @@ fn parse_seed(input: &str) -> Result<Option<u64>, String> {
     trimmed
         .parse::<u64>()
         .map(Some)
-        .map_err(|_| format!("种子必须是 0~{} 的整数", u64::MAX))
+        .map_err(|_| format!("Seed must be an integer from 0 to {}", u64::MAX))
 }
 
 /// 校验房间号：4-12 字符，仅 [a-z0-9_-]。

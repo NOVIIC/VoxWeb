@@ -687,7 +687,7 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                     Err(e) => {
                         log::warn!("[lobby] 加载存档列表失败: {e:?}");
-                        a.lobby_state.error_message = Some(format!("加载存档失败: {e:?}"));
+                        a.lobby_state.error_message = Some(format!("Failed to load saves: {e:?}"));
                     }
                 }
             });
@@ -786,7 +786,7 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                 if let Err(e) = crate::storage::delete_world_by_key(&key).await {
                     log::warn!("[lobby] 删除存档失败: {e:?}");
                     let mut a = app_ref.borrow_mut();
-                    a.lobby_state.error_message = Some(format!("删除存档失败: {e:?}"));
+                    a.lobby_state.error_message = Some(format!("Failed to delete save: {e:?}"));
                     return;
                 }
                 // 刷新列表
@@ -799,7 +799,8 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                     Err(e) => {
                         log::warn!("[lobby] 刷新存档列表失败: {e:?}");
-                        a.lobby_state.error_message = Some(format!("刷新存档列表失败: {e:?}"));
+                        a.lobby_state.error_message =
+                            Some(format!("Failed to refresh saves: {e:?}"));
                     }
                 }
             });
@@ -815,7 +816,8 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                     Err(e) => {
                         log::warn!("[lobby] 刷新存档列表失败: {e:?}");
-                        a.lobby_state.error_message = Some(format!("刷新存档列表失败: {e:?}"));
+                        a.lobby_state.error_message =
+                            Some(format!("Failed to refresh saves: {e:?}"));
                     }
                 }
             });
