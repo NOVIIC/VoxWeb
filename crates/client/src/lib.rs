@@ -58,6 +58,11 @@ const MAX_REACH: f32 = 6.0;
 /// Ping 间隔（毫秒）。
 const PING_INTERVAL_MS: f64 = 5000.0;
 
+/// Pong 校时样本权重。Pong 带 RTT 信息，可信度高于裸 PlayerTick。
+const CLOCK_PONG_ALPHA: f64 = 0.2;
+/// PlayerTick 校时样本权重。它可能受单向排队延迟影响，只作为低权重补充。
+const CLOCK_TICK_ALPHA: f64 = 0.05;
+
 /// 信令服务 URL meta tag 名称。
 const SIGNALING_META_NAME: &str = "signaling-url";
 
@@ -1846,7 +1851,10 @@ fn render_game_frame(
             return Ok(());
         };
         let now = now_ms();
-        if game.entity_id != 0 && now - game.last_ping_sent_ms >= PING_INTERVAL_MS {
+        if game.mode != GameMode::Local
+            && game.entity_id != 0
+            && now - game.last_ping_sent_ms >= PING_INTERVAL_MS
+        {
             let client_time_ms = now as u64;
             game.pending_pings.insert(client_time_ms, now);
             // 上限 16 个待办，避免长期不通时无限增长
@@ -2114,7 +2122,7 @@ fn render_game_frame(
         let mut view_proj_for_np = glam::Mat4::IDENTITY;
         if let Some(g) = a.game.as_mut() {
             view_proj_for_np = g.camera.vp_matrix();
-            let render_target = now_local + g.server_clock_offset_ms as f64 - g.interp.delay_ms;
+            let render_target = now_local + g.server_clock_offset_ms - g.interp.delay_ms;
             let cam_pos = g.camera.position;
             let eids: Vec<EntityId> = g.interp.ids().collect();
             for eid in eids {
@@ -2322,8 +2330,7 @@ fn render_game_frame(
             let now = now_ms();
             let mut instances: Vec<voxweb_render::passes::player::PlayerInstance> = Vec::new();
             if let Some(ref mut game) = a.game {
-                let render_server_time =
-                    now + game.server_clock_offset_ms as f64 - game.interp.delay_ms;
+                let render_server_time = now + game.server_clock_offset_ms - game.interp.delay_ms;
                 let eids: Vec<voxweb_core::protocol::EntityId> = game.interp.ids().collect();
                 for eid in eids {
                     if let Some((pos, _yaw, _pitch)) = game.interp.advance(eid, render_server_time)
@@ -2509,9 +2516,16 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
             let server = game.server.borrow();
             server.world.get_block(pos)
         };
-        // Local 模式 client 和 server 共享同一份 world，乐观更新会干扰 server 校验
-        // （server 读回 AIR 误判 BlockNotEmpty 拒绝）。因此跳过乐观 set_block；
-        // BlockUpdate 返回后再重 mesh。Phase 5 Remote 端加独立 WorldView 时再加乐观路径。
+        let input_tick = game.local_input_tick;
+        let player_position = game.physics.feet_position;
+        // Remote 的 server.world 只是本地世界视图，可以安全乐观修改；
+        // Local/Host 与权威 server 共享同一份 world，仍等 BlockUpdate，避免提前改世界干扰校验。
+        if game.mode == GameMode::Remote {
+            game.server.borrow_mut().world.set_block(pos, BlockID::AIR);
+            for cp in affected_chunks(pos) {
+                game.mesh_jobs.enqueue(cp, MeshPriority::High);
+            }
+        }
         let request_id = game.pending.next_request_id();
         game.pending.insert(
             request_id,
@@ -2521,8 +2535,12 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
                 backup,
             },
         );
-        game.net
-            .send_client_message(ClientMessage::Break { pos, request_id });
+        game.net.send_client_message(ClientMessage::Break {
+            pos,
+            request_id,
+            input_tick,
+            player_position,
+        });
         game.last_break_at_ms = now;
     }
 
@@ -2551,6 +2569,8 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
             return;
         }
         let request_id = game.pending.next_request_id();
+        let input_tick = game.local_input_tick;
+        let player_position = game.physics.feet_position;
         game.pending.insert(
             request_id,
             PendingAction {
@@ -2559,10 +2579,18 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
                 backup,
             },
         );
+        if game.mode == GameMode::Remote {
+            game.server.borrow_mut().world.set_block(neighbor, block);
+            for cp in affected_chunks(neighbor) {
+                game.mesh_jobs.enqueue(cp, MeshPriority::High);
+            }
+        }
         game.net.send_client_message(ClientMessage::Place {
             pos: neighbor,
             block,
             request_id,
+            input_tick,
+            player_position,
         });
     }
 }
@@ -2579,6 +2607,21 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
 fn send_chat(game: &mut Game, content: String) {
     game.net
         .send_client_message(ClientMessage::Chat { content });
+}
+
+/// 摄入一条 Host 时钟偏移样本。
+///
+/// 高延迟网络下，直接用最新 `server_time_ms - now` 覆盖偏移会让远端玩家插值 target
+/// 来回抖动。这里第一条样本直接采用，后续做指数平滑；Pong 样本权重较高，
+/// PlayerTick 样本只做低权重微调。
+fn ingest_server_clock_sample(game: &mut Game, estimated_offset_ms: f64, alpha: f64) {
+    if !game.server_clock_synced {
+        game.server_clock_offset_ms = estimated_offset_ms;
+        game.server_clock_synced = true;
+        return;
+    }
+    let a = alpha.clamp(0.0, 1.0);
+    game.server_clock_offset_ms = game.server_clock_offset_ms * (1.0 - a) + estimated_offset_ms * a;
 }
 
 fn apply_server_message(game: &mut Game, msg: ServerMessage) {
@@ -2678,8 +2721,12 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             players,
             server_time_ms,
         } => {
-            let now = (now_ms()) as i64;
-            game.server_clock_offset_ms = server_time_ms as i64 - now;
+            let now = now_ms();
+            if game.mode != GameMode::Local {
+                let one_way_ms = game.rtt_ms.map(|rtt| rtt as f64 * 0.5).unwrap_or(0.0);
+                let estimated_offset = server_time_ms as f64 + one_way_ms - now;
+                ingest_server_clock_sample(game, estimated_offset, CLOCK_TICK_ALPHA);
+            }
 
             for snap in &players {
                 if snap.entity_id == game.entity_id {
@@ -2750,11 +2797,17 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
         }
         ServerMessage::Pong {
             client_time_ms,
-            server_time_ms: _,
+            server_time_ms,
         } => {
             if let Some(sent_ms) = game.pending_pings.remove(&client_time_ms) {
-                let rtt = (now_ms() - sent_ms) as f32;
-                game.rtt_ms = Some(rtt);
+                let now = now_ms();
+                let rtt = (now - sent_ms) as f32;
+                game.rtt_ms = Some(match game.rtt_ms {
+                    Some(prev) => prev * 0.8 + rtt * 0.2,
+                    None => rtt,
+                });
+                let estimated_offset = server_time_ms as f64 + (rtt as f64 * 0.5) - now;
+                ingest_server_clock_sample(game, estimated_offset, CLOCK_PONG_ALPHA);
             }
         }
     }

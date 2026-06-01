@@ -96,6 +96,8 @@ mod tests {
             channel_for_client_message(&ClientMessage::Break {
                 pos: Position::new(0, 0, 0),
                 request_id: 0,
+                input_tick: 0,
+                player_position: Vec3::ZERO,
             }),
             ChannelKind::Reliable
         );
@@ -150,6 +152,8 @@ mod tests {
             pos: Position::new(1, 2, 3),
             block: BlockID::STONE,
             request_id: 7,
+            input_tick: 8,
+            player_position: Vec3::new(1.0, 64.0, 1.0),
         };
         let bytes = encode_client_message(&msg).unwrap();
         let back = decode_client_message(&bytes).unwrap();

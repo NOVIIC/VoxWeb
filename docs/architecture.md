@@ -265,7 +265,7 @@ VoxWeb/
 1. 鼠标左键按下
 2. 本地 raycast 命中 (10, 64, 5)
 3. 本地半透明预览（待确认）
-4. 发 ClientMessage::Break {pos:(10,64,5)}
+4. 发 ClientMessage::Break {pos:(10,64,5), input_tick, player_position}
    通过 reliable DataChannel              ────→    5. 收到消息，server.physics 校验
                                                       （射程内？方块非空？）
                                                   6. 通过 → world.set_block(pos, AIR)

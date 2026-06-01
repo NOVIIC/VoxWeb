@@ -22,11 +22,14 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 3; // Phase 8 (2026-06-01): PlayerSnapshot 回执 last_input_tick
+pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带点击时玩家位置
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
 
+| 版本 | 变化 |
+|---|---|
+| v4 (Phase 8) | `Break` / `Place` 增加 `input_tick: u32` 与 `player_position: Vec3`；Host 用点击时玩家脚底位置校验挖放范围，避免高 RTT / unreliable 丢包时用旧位置误拒 |
 | v3 (Phase 8) | `PlayerSnapshot` 增加 `last_input_tick: u32`；客户端用它对齐预测历史，避免高延迟下把旧回声当成当前位置校正 |
 | v2 (Phase 6) | Welcome 增加 `host_entity_id: u32` + `players: Vec<PlayerEntry>`；新增 `PlayerEntry { entity_id, display_name }` |
 
@@ -40,8 +43,8 @@ pub const PROTOCOL_VERSION: u32 = 3; // Phase 8 (2026-06-01): PlayerSnapshot 回
 |---|---|---|---|---|
 | `Hello` | reliable | 一次（连接建立后） | `display_name: String, version: u32` | 加入握手 |
 | `PlayerInput` | unreliable | 60Hz | `tick: u32, position: Vec3, yaw: f32, pitch: f32` | 玩家移动同步；`tick` 是该客户端本地单调递增的输入序号 |
-| `Break` | reliable | 按需 | `pos: Position, request_id: u32` | 挖方块 |
-| `Place` | reliable | 按需 | `pos: Position, block: BlockID, request_id: u32` | 放方块 |
+| `Break` | reliable | 按需 | `pos: Position, request_id: u32, input_tick: u32, player_position: Vec3` | 挖方块；携带点击时脚底位置用于高延迟范围校验 |
+| `Place` | reliable | 按需 | `pos: Position, block: BlockID, request_id: u32, input_tick: u32, player_position: Vec3` | 放方块；携带点击时脚底位置用于高延迟范围/重叠校验 |
 | `Chat` | reliable | 按需 | `content: String` | 文字聊天（≤ 256 字符） |
 | `Ping` | unreliable | 5s | `client_time_ms: u64` | 时延探测，可选 |
 | `Goodbye` | reliable | 一次（断开前） | 无 | 优雅关闭（v2） |
@@ -72,6 +75,8 @@ pub const PROTOCOL_VERSION: u32 = 3; // Phase 8 (2026-06-01): PlayerSnapshot 回
 | `String` | UTF-8，bincode 默认带 varint 长度前缀 |
 | `u32 request_id` | 客户端单调递增，用于 ActionAck 配对 |
 | `PlayerInput.tick` | 客户端本地 60Hz 输入序号，用于服务端丢弃乱序输入，也用于客户端协调 |
+| `Break/Place.input_tick` | 玩家点击时已生成的最新本地输入序号；用于日志/调试，并允许 Host 判断该操作来自哪个预测时刻 |
+| `Break/Place.player_position` | 玩家点击时的脚底位置；Host 用它做挖放距离和放置重叠校验，避免可靠操作包先于最新 `PlayerInput` 到达时被旧位置误拒 |
 | `PlayerTick.tick` | 服务端 60Hz 累计 tick，用于远端插值、调试和 UI |
 | `PlayerSnapshot.last_input_tick` | 服务端已接受到该玩家的最新输入序号；本玩家收到自身快照时用它查找同一输入时刻的预测记录 |
 
@@ -204,7 +209,8 @@ Remote                          Host
 ──────                          ────
 鼠标左键命中 (10,64,5)：
    prediction.optimistic_break((10,64,5))     ← 本地立即半透明预览
-   Break{pos=(10,64,5), request_id=42}  ────▶
+   Break{pos=(10,64,5), request_id=42,
+         input_tick=810, player_position=feet_at_click}  ────▶
                                           physics::validate_break →
                                           OK：
                                             world.set_block AIR

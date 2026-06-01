@@ -311,9 +311,11 @@ pub struct Game {
     pub input_history: InputHistory,
     /// 中等位置误差的剩余软修正量。每个渲染帧应用一小段，避免高 RTT 下画面回弹。
     pub pending_position_correction: Vec3,
-    /// Host 时钟与本地时钟的瞬态偏移（ms）：server_time_ms - local_now_ms。
-    /// PlayerTick 每帧覆盖；远端的 rendering target 用。
-    pub server_clock_offset_ms: i64,
+    /// Host 时钟与本地时钟的平滑偏移（ms）：server_time_ms - local_now_ms。
+    /// Pong 按半 RTT 估算，PlayerTick 提供低权重补充样本；远端插值 target 使用它。
+    pub server_clock_offset_ms: f64,
+    /// 是否已经吃过至少一条 Host 时钟样本。第一条样本直接采用，后续再指数平滑。
+    pub server_clock_synced: bool,
     /// Phase 8：Local/Host 的 OPFS 存储句柄。Remote 不写存档。
     pub storage: Option<OpfsStorage>,
     pub known_persisted: HashSet<voxweb_core::ChunkPos>,
@@ -455,7 +457,8 @@ impl Game {
             local_input_tick: 0,
             input_history: InputHistory::new(120),
             pending_position_correction: Vec3::ZERO,
-            server_clock_offset_ms: 0,
+            server_clock_offset_ms: 0.0,
+            server_clock_synced: false,
             storage: None,
             known_persisted: HashSet::new(),
             last_persist_ms: 0.0,

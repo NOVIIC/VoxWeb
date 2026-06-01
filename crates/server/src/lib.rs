@@ -280,12 +280,14 @@ impl Server {
                 player.pitch = pitch;
                 player.last_input_tick = tick;
             }
-            ClientMessage::Break { pos, request_id } => {
-                let player_feet = self
-                    .players
-                    .get(&entity_id)
-                    .map(|p| p.position)
-                    .unwrap_or(DEFAULT_SPAWN);
+            ClientMessage::Break {
+                pos,
+                request_id,
+                input_tick,
+                player_position,
+            } => {
+                let player_feet =
+                    self.action_player_position(entity_id, input_tick, player_position);
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
@@ -319,12 +321,11 @@ impl Server {
                 pos,
                 block,
                 request_id,
+                input_tick,
+                player_position,
             } => {
-                let player_feet = self
-                    .players
-                    .get(&entity_id)
-                    .map(|p| p.position)
-                    .unwrap_or(DEFAULT_SPAWN);
+                let player_feet =
+                    self.action_player_position(entity_id, input_tick, player_position);
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
@@ -379,6 +380,28 @@ impl Server {
                 );
             }
         }
+    }
+
+    /// 取玩家点击某个可靠操作时的脚底位置。
+    ///
+    /// `Break` / `Place` 走 reliable 通道，常会先于最新的 unreliable `PlayerInput`
+    /// 到达 Host。此时如果继续使用服务端缓存的旧位置做范围校验，高 RTT 下玩家会被误判
+    /// `OutOfRange`。因此操作消息携带点击时的预测位置；若它对应的 input tick 更新，
+    /// 顺手推进服务端玩家位置与 last_input_tick，让下一帧 PlayerTick 的回执也对齐。
+    fn action_player_position(
+        &mut self,
+        entity_id: EntityId,
+        input_tick: u32,
+        player_position: Vec3,
+    ) -> Vec3 {
+        let Some(player) = self.players.get_mut(&entity_id) else {
+            return DEFAULT_SPAWN;
+        };
+        if input_tick > player.last_input_tick {
+            player.position = player_position;
+            player.last_input_tick = input_tick;
+        }
+        player_position
     }
 
     /// 每 tick 向所有玩家广播 PlayerTick（delta 模式）。
@@ -671,6 +694,8 @@ mod handle_message_tests {
             ClientMessage::Break {
                 pos: Position::new(3, 64, 3),
                 request_id: 42,
+                input_tick: 5,
+                player_position: Vec3::new(3.5, 65.0, 3.5),
             },
         );
 
@@ -709,6 +734,8 @@ mod handle_message_tests {
             ClientMessage::Break {
                 pos: Position::new(15, 64, 15),
                 request_id: 7,
+                input_tick: 5,
+                player_position: Vec3::new(3.5, 65.0, 3.5),
             },
         );
         let ack = find_outbox(&server, |m| {
@@ -748,6 +775,8 @@ mod handle_message_tests {
                 pos: Position::new(3, 65, 3),
                 block: voxweb_core::BlockID::STONE,
                 request_id: 9,
+                input_tick: 5,
+                player_position: Vec3::new(3.5, 65.0, 3.5),
             },
         );
         let ack = find_outbox(&server, |m| {
@@ -768,6 +797,30 @@ mod handle_message_tests {
             matches!(m.message, ServerMessage::BlockUpdate { .. })
         });
         assert!(bu.is_none());
+    }
+
+    #[test]
+    fn handle_message_break_uses_action_position_when_player_input_lags() {
+        let (mut server, eid) = prepare_world();
+        server.players.get_mut(&eid).unwrap().position = Vec3::new(30.0, 65.0, 30.0);
+
+        server.handle_message(
+            eid,
+            ClientMessage::Break {
+                pos: Position::new(3, 64, 3),
+                request_id: 77,
+                input_tick: 12,
+                player_position: Vec3::new(3.5, 65.0, 3.5),
+            },
+        );
+
+        assert_eq!(
+            server.world.get_block(Position::new(3, 64, 3)),
+            voxweb_core::BlockID::AIR
+        );
+        let player = server.players.get(&eid).unwrap();
+        assert_eq!(player.last_input_tick, 12);
+        assert!((player.position - Vec3::new(3.5, 65.0, 3.5)).length() < 0.001);
     }
 
     #[test]

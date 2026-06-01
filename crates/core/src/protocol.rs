@@ -12,9 +12,9 @@ use crate::chunk::{ChunkPos, Position};
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v3（Phase 8）：PlayerSnapshot 携带 last_input_tick，
-/// 让客户端按同一条本地输入记录做预测协调，避免高延迟时被旧位置回声拉回。
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4（Phase 8）：Break/Place 携带点击时 input_tick 与 player_position，
+/// 让 Host 在高延迟下按玩家实际点击时的位置做挖放范围校验。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// ChunkSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -65,12 +65,24 @@ pub enum ClientMessage {
         pitch: f32,
     },
     /// 挖掘方块请求
-    Break { pos: Position, request_id: u32 },
+    Break {
+        pos: Position,
+        request_id: u32,
+        /// 玩家点击时的本地输入序号，用于让服务端把操作与预测历史对齐。
+        input_tick: u32,
+        /// 玩家点击时的脚底位置。可靠操作包可能先于最新 PlayerInput 到达，
+        /// 服务端用它做范围校验，避免高 RTT 下误判 OutOfRange。
+        player_position: Vec3,
+    },
     /// 放置方块请求
     Place {
         pos: Position,
         block: BlockID,
         request_id: u32,
+        /// 玩家点击时的本地输入序号。
+        input_tick: u32,
+        /// 玩家点击时的脚底位置，用于范围与玩家 AABB 重叠校验。
+        player_position: Vec3,
     },
     /// 文本聊天
     Chat { content: String },
@@ -238,6 +250,8 @@ mod tests {
         roundtrip(&ClientMessage::Break {
             pos: Position::new(10, 64, -5),
             request_id: 42,
+            input_tick: 9,
+            player_position: Vec3::new(8.0, 65.0, 8.0),
         });
     }
 
@@ -247,6 +261,8 @@ mod tests {
             pos: Position::new(10, 65, -5),
             block: BlockID::STONE,
             request_id: 43,
+            input_tick: 10,
+            player_position: Vec3::new(8.0, 65.0, 8.0),
         });
     }
 
@@ -287,9 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_three() {
-        // Phase 8 起为 3；任何破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_four() {
+        // Phase 8 高延迟挖放优化为 v4；任何破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

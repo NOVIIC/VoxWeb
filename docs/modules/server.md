@@ -346,8 +346,9 @@ match msg {
     ClientMessage::PlayerInput { tick, position, yaw, pitch } => {
         self.handle_player_input(sender, tick, position, yaw, pitch);
     }
-    ClientMessage::Break { pos, request_id } => {
-        match physics::validate_break(&self.world, sender, pos) {
+    ClientMessage::Break { pos, request_id, input_tick, player_position } => {
+        let feet = self.action_player_position(sender, input_tick, player_position);
+        match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
                 self.world.dirty_chunks.insert(pos.to_chunk_pos());
@@ -359,7 +360,10 @@ match msg {
             }
         }
     }
-    ClientMessage::Place { pos, block, request_id } => { /* 同上 */ }
+    ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
+        let feet = self.action_player_position(sender, input_tick, player_position);
+        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠 */
+    }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));
     }
