@@ -674,13 +674,14 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     // —— 异步加载存档列表（仅首次进入 Lobby 时触发）——
     {
         let mut a = app.borrow_mut();
-        if a.lobby_state.saved_worlds.is_empty() && !a.lobby_state.saves_loading {
+        if !a.lobby_state.saves_loaded && !a.lobby_state.saves_loading {
             a.lobby_state.saves_loading = true;
             let app_ref = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let result = crate::storage::list_saved_worlds().await;
                 let mut a = app_ref.borrow_mut();
                 a.lobby_state.saves_loading = false;
+                a.lobby_state.saves_loaded = true;
                 match result {
                     Ok(worlds) => {
                         a.lobby_state.saved_worlds = worlds;

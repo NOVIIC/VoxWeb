@@ -62,10 +62,10 @@ pub struct LobbyState {
     pub saved_worlds: Vec<WorldSummary>,
     /// 是否正在加载存档列表
     pub saves_loading: bool,
+    /// 是否已完成首次加载（防止空存档时无限循环加载）
+    pub saves_loaded: bool,
     /// 选中的存档 key（None = New World）
     pub selected_save: Option<String>,
-    /// 正在确认删除的 key
-    pub delete_confirm_key: Option<String>,
 }
 
 impl Default for LobbyState {
@@ -78,8 +78,8 @@ impl Default for LobbyState {
             last_generated_room: None,
             saved_worlds: Vec::new(),
             saves_loading: false,
+            saves_loaded: false,
             selected_save: None,
-            delete_confirm_key: None,
         }
     }
 }
@@ -274,20 +274,40 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                 let is_selected = state.selected_save.as_deref() == Some(&world.key);
                 let time_str = format_creation_time(&world.key);
 
+                // horizontal 内容居中：先测量文字宽度，再算间距
+                let text_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        time_str.clone(),
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x;
+                let icon_w = ui.spacing().icon_width;
+                let gap = ui.spacing().item_spacing.x;
+                let del_w = ui.spacing().interact_size.x;
+                let content_w = icon_w + gap + text_w + gap + del_w;
+
                 ui.horizontal(|ui| {
+                    let avail = ui.available_width();
+                    if avail > content_w {
+                        ui.add_space((avail - content_w) / 2.0);
+                    }
                     let radio = egui::RadioButton::new(is_selected, &time_str);
                     if ui.add(radio).clicked() {
                         action = Some(LobbyAction::SelectSave {
                             key: Some(world.key.clone()),
                         });
                     }
-                    // 删除按钮
                     if ui
                         .small_button("Delete")
                         .on_hover_text("Delete this save")
                         .clicked()
                     {
-                        state.delete_confirm_key = Some(world.key.clone());
+                        action = Some(LobbyAction::DeleteSave {
+                            key: world.key.clone(),
+                        });
                     }
                 });
             }
@@ -299,21 +319,6 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                         .size(12.0)
                         .color(egui::Color32::from_rgb(120, 130, 140)),
                 );
-            }
-
-            // 删除确认对话框
-            if let Some(key) = &state.delete_confirm_key.clone() {
-                ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 180, 100), "Delete this save?");
-                ui.horizontal(|ui| {
-                    if ui.button("Confirm").clicked() {
-                        action = Some(LobbyAction::DeleteSave { key: key.clone() });
-                        state.delete_confirm_key = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.delete_confirm_key = None;
-                    }
-                });
             }
 
             ui.add_space(8.0);

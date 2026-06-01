@@ -541,10 +541,7 @@ fn js_error(value: JsValue) -> StorageError {
 }
 
 fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or(0.0)
+    js_sys::Date::now()
 }
 
 #[wasm_bindgen::prelude::wasm_bindgen]
