@@ -5,5 +5,5 @@ pub fn draw_hud(ui: &mut egui::Ui) {
     // Phase 1: FPS + 坐标
     // Phase 3: hotbar
     // Phase 6: 玩家列表
-    ui.label("HUD 占位");
+    ui.label("HUD placeholder");
 }

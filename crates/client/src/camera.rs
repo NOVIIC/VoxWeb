@@ -7,7 +7,7 @@ use glam::{Mat4, Vec3};
 /// 相机模式：决定物理子系统跑哪条分支。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CameraMode {
-    /// 飞行：WASD + 空格/Shift，无重力、无碰撞
+    /// 飞行：WASD + 空格/Shift，无重力、有碰撞（分轴扫动，与 Walk 一致）
     Fly,
     /// 步行：受重力、跳跃、AABB 分轴碰撞
     Walk,

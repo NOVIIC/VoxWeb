@@ -62,10 +62,10 @@ pub struct LobbyState {
     pub saved_worlds: Vec<WorldSummary>,
     /// 是否正在加载存档列表
     pub saves_loading: bool,
+    /// 是否已完成首次加载（防止空存档时无限循环加载）
+    pub saves_loaded: bool,
     /// 选中的存档 key（None = New World）
     pub selected_save: Option<String>,
-    /// 正在确认删除的 key
-    pub delete_confirm_key: Option<String>,
 }
 
 impl Default for LobbyState {
@@ -78,8 +78,8 @@ impl Default for LobbyState {
             last_generated_room: None,
             saved_worlds: Vec::new(),
             saves_loading: false,
+            saves_loaded: false,
             selected_save: None,
-            delete_confirm_key: None,
         }
     }
 }
@@ -145,10 +145,17 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     // 从存档 key 获取 seed
                     crate::storage::seed_from_key(key)
                 } else {
-                    // New World：从输入框获取或随机生成
-                    parse_seed(&state.seed_input)
+                    // New World：从输入框获取或随机生成；解析失败时提示用户
+                    match parse_seed(&state.seed_input) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            state.error_message = Some(e);
+                            return;
+                        }
+                    }
                 };
                 let display_name = resolve_display_name(state);
+                state.error_message = None;
                 action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
             }
 
@@ -185,8 +192,14 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                         // 从存档 key 获取 seed
                         crate::storage::seed_from_key(key)
                     } else {
-                        // New World：从输入框获取或随机生成
-                        parse_seed(&state.seed_input)
+                        // New World：从输入框获取或随机生成；解析失败时提示用户
+                        match parse_seed(&state.seed_input) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                state.error_message = Some(e);
+                                return;
+                            }
+                        }
                     };
                     let display_name = resolve_display_name(state);
                     state.error_message = None;
@@ -238,9 +251,9 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.add_space(8.0);
             let save_count = state.saved_worlds.len();
             let header_text = if state.saves_loading {
-                "我的存档 (加载中...)".to_string()
+                "My Saves (Loading...)".to_string()
             } else {
-                format!("我的存档 ({})", save_count)
+                format!("My Saves ({})", save_count)
             };
             ui.label(
                 egui::RichText::new(&header_text)
@@ -251,7 +264,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
 
             // New World 选项（默认选中）
             let is_new_world = state.selected_save.is_none();
-            let radio = egui::RadioButton::new(is_new_world, "New World (创建新世界)");
+            let radio = egui::RadioButton::new(is_new_world, "New World");
             if ui.add(radio).clicked() {
                 action = Some(LobbyAction::SelectSave { key: None });
             }
@@ -261,20 +274,40 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                 let is_selected = state.selected_save.as_deref() == Some(&world.key);
                 let time_str = format_creation_time(&world.key);
 
+                // horizontal 内容居中：先测量文字宽度，再算间距
+                let text_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        time_str.clone(),
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x;
+                let icon_w = ui.spacing().icon_width;
+                let gap = ui.spacing().item_spacing.x;
+                let del_w = ui.spacing().interact_size.x;
+                let content_w = icon_w + gap + text_w + gap + del_w;
+
                 ui.horizontal(|ui| {
+                    let avail = ui.available_width();
+                    if avail > content_w {
+                        ui.add_space((avail - content_w) / 2.0);
+                    }
                     let radio = egui::RadioButton::new(is_selected, &time_str);
                     if ui.add(radio).clicked() {
                         action = Some(LobbyAction::SelectSave {
                             key: Some(world.key.clone()),
                         });
                     }
-                    // 删除按钮
                     if ui
-                        .small_button("删除")
-                        .on_hover_text("删除此存档")
+                        .small_button("Delete")
+                        .on_hover_text("Delete this save")
                         .clicked()
                     {
-                        state.delete_confirm_key = Some(world.key.clone());
+                        action = Some(LobbyAction::DeleteSave {
+                            key: world.key.clone(),
+                        });
                     }
                 });
             }
@@ -282,25 +315,10 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             // 空列表提示
             if !state.saves_loading && save_count == 0 {
                 ui.label(
-                    egui::RichText::new("暂无存档")
+                    egui::RichText::new("No saves")
                         .size(12.0)
                         .color(egui::Color32::from_rgb(120, 130, 140)),
                 );
-            }
-
-            // 删除确认对话框
-            if let Some(key) = &state.delete_confirm_key.clone() {
-                ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 180, 100), "确认删除此存档？");
-                ui.horizontal(|ui| {
-                    if ui.button("确认删除").clicked() {
-                        action = Some(LobbyAction::DeleteSave { key: key.clone() });
-                        state.delete_confirm_key = None;
-                    }
-                    if ui.button("取消").clicked() {
-                        state.delete_confirm_key = None;
-                    }
-                });
             }
 
             ui.add_space(8.0);
@@ -408,13 +426,19 @@ pub fn draw_connecting(
     action
 }
 
-/// 把输入框文本解析为 Option<u64>。空字符串 → None（随机）。
-fn parse_seed(input: &str) -> Option<u64> {
+/// 把输入框文本解析为种子值。
+/// - 空字符串 → `Ok(None)`（随机种子）
+/// - 有效数字 → `Ok(Some(n))`
+/// - 非空但不是合法数字 → `Err(错误描述)`
+fn parse_seed(input: &str) -> Result<Option<u64>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    trimmed.parse::<u64>().ok()
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("Seed must be an integer from 0 to {}", u64::MAX))
 }
 
 /// 校验房间号：4-12 字符，仅 [a-z0-9_-]。
@@ -453,20 +477,20 @@ mod tests {
 
     #[test]
     fn parse_seed_empty_is_none() {
-        assert_eq!(parse_seed(""), None);
-        assert_eq!(parse_seed("   "), None);
+        assert_eq!(parse_seed(""), Ok(None));
+        assert_eq!(parse_seed("   "), Ok(None));
     }
 
     #[test]
     fn parse_seed_valid_u64() {
-        assert_eq!(parse_seed("42"), Some(42));
-        assert_eq!(parse_seed("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_seed("42"), Ok(Some(42)));
+        assert_eq!(parse_seed("18446744073709551615"), Ok(Some(u64::MAX)));
     }
 
     #[test]
-    fn parse_seed_invalid_is_none() {
-        assert_eq!(parse_seed("not_a_number"), None);
-        assert_eq!(parse_seed("-1"), None); // 负数不是合法 u64
+    fn parse_seed_invalid_is_err() {
+        assert!(parse_seed("not_a_number").is_err());
+        assert!(parse_seed("-1").is_err()); // 负数不是合法 u64
     }
 
     #[test]
