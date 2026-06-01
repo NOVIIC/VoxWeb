@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 
 [workspace.lints.rust]
@@ -46,6 +46,7 @@ web-sys = { version = "0.3", features = [
     "Storage",
     "Location",
     "Navigator",
+    "StorageManager",
     "ResizeObserver",
     "WebSocket",
     "MessageEvent",
@@ -78,6 +79,16 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "Gpu",
     "GpuAdapter",
+    "Blob",
+    "File",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemHandle",
+    "FileSystemRemoveOptions",
+    "FileSystemWritableFileStream",
+    "WritableStream",
 ] }
 js-sys = "0.3"
 

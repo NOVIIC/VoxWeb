@@ -10,7 +10,7 @@
 ```
 Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase 5 ─▶ Phase 6 ─▶ Phase 7 ─▶ Phase 8 ─▶ Phase 9 (stretch)
 脚手架      渲染骨架     体素单人     物理交互     P2P 通道     权威同步     多人 UI      渲染优化     多 Pass+存档   后处理/TURN/触屏
-  ✅          ✅          ✅          ✅          ✅          ✅          ✅          ✅
+  ✅          ✅          ✅          ✅          ✅          ✅          ✅          ✅          ✅
 ```
 
 每个 Phase **可独立验收**：完成时可以演示一个具体的、可观察的功能。后续 Phase 只增不破。
@@ -267,7 +267,9 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 
 ---
 
-## Phase 8 · 多 Pass + 存档完善
+## Phase 8 · 多 Pass + 存档完善 ✅
+
+> 完成日期：2026-06-01 · 详见 [`../PHASE_8_DONE.md`](../PHASE_8_DONE.md)
 
 ### 目标
 渲染管线优雅化（多 Pass）；存档体验完整。
@@ -277,13 +279,13 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [`features/persistence.md`](features/persistence.md)
 
 ### 任务清单
-- [ ] `render::graph::RenderGraph` + `RenderPass` trait
-- [ ] Depth Pre-Pass（可关）
-- [ ] Skybox Pass（程序化天空 + 太阳方向）
-- [ ] Transparent Pass（水/玻璃 alpha blend）
-- [ ] UI Pass 重构为 trait 实现
-- [ ] 透明方块网格独立 buffer + 距离排序
-- [ ] **存档完善**：
+- [x] `render::graph::RenderGraph` + `RenderPass` trait
+- [x] Depth Pre-Pass（可关）
+- [x] Skybox Pass（程序化天空 + 太阳方向）
+- [x] Transparent Pass（水/玻璃 alpha blend）
+- [x] UI Pass 重构为 trait 实现
+- [x] 透明方块网格独立 buffer + 距离排序
+- [x] **存档完善**：
   - `crates/server/src/world.rs` 引入 LRU + pinned 集合（capacity 4096，runtime 可调）
   - 暂停菜单"立即保存"按钮 + 配额 UI（使用量、> 80% 警告、> 95% 暂停 dirty）
   - `navigator.storage.persist()` 启动时申请

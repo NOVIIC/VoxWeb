@@ -245,7 +245,7 @@ impl Server {
 
     /// Phase 8 持久化层用的占位。Phase 5 不消费，留方法签名以免后续 API churn。
     pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: voxweb_core::chunk::Chunk) {
-        self.world.chunks.insert(pos, chunk);
+        self.world.load_chunk_from_storage(pos, chunk);
     }
 
     /// 处理一条来自 Client 的消息（本地或远程）。

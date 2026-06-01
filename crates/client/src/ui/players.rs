@@ -30,6 +30,8 @@ pub struct NameplateEntry {
     pub display_name: String,
     /// 玩家到相机的距离（米）；用来做距离衰减 + 远处隐藏。
     pub distance: f32,
+    /// Phase 8：若玩家与相机之间被实体方块挡住，则名牌半透明淡出。
+    pub occluded: bool,
 }
 
 /// 绘制右上角玩家列表。空列表也照画（显示 "在线玩家 (0)"）。
@@ -74,9 +76,12 @@ pub fn draw_nameplates(ctx: &egui::Context, entries: &[NameplateEntry], view_pro
     ));
 
     for entry in entries {
-        let Some(alpha) = nameplate_alpha(entry.distance) else {
+        let Some(mut alpha) = nameplate_alpha(entry.distance) else {
             continue;
         };
+        if entry.occluded {
+            alpha *= 0.25;
+        }
         let head_pos = entry.world_position + Vec3::new(0.0, PLAYER_HEIGHT + 0.3, 0.0);
         let Some(screen_pos) = project_world_to_screen(view_proj, head_pos, screen_size) else {
             continue;

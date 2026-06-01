@@ -3,10 +3,9 @@
 > **何时阅读**：改存档逻辑；增删存储字段；调写入频率；处理配额异常；评估迁移到 Worker 同步路径
 > **关联文档**：[`README.md`](../../README.md) · [`modules/server.md`](../modules/server.md) · [`modules/client.md`](../modules/client.md) · [`reference.md`](../reference.md) · [`roadmap.md`](../roadmap.md)
 >
-> **⚠️ Phase 5 延后**：本文档描述的是 OPFS 持久化的**完整设计**。Phase 5 仅实现了 Server 层的 `dirty_chunks` 标记与 `drain_dirty()` 接口；
-> `chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait 实装、PersistenceManager（snapshot/commit/failure 三段式）、
-> prime 预加载、按需 load、1s 周期 flush、`pagehide` 退出 flush、LRU 卸载、配额 UI、migration 框架
-> **全部延后到 Phase 8**。当前 `crates/client/src/storage.rs` 仅留 stub 签名。
+> **Phase 8 状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
+> `PersistenceManager` snapshot/commit/failure、启动 prime、1s 周期 flush、LRU/pinned、配额 UI、
+> `storage_version` 高版本拒绝与删档入口已实现。Worker sync handle 仍按本文 §十二保留为后续升级路径。
 
 ---
 

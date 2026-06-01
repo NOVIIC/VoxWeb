@@ -4,12 +4,16 @@
 //! 提供世界坐标查询接口供网格化跨区块剔除使用。
 //! Phase 5：set_block 实装 dirty 标记；持久化层（Phase 8）会从 drain_dirty 取出待写。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 
+use crate::persistence::PersistenceManager;
 use crate::terrain::TerrainGenerator;
+
+/// Phase 8 默认内存 chunk cache 容量。4096 chunk 约 512MB 原始方块数据。
+pub const DEFAULT_CHUNK_CACHE_CAPACITY: usize = 4096;
 
 /// 世界状态。Phase 2 仅含 chunk 表 + 地形生成器；Phase 5 起加 dirty_chunks。
 pub struct World {
@@ -21,6 +25,12 @@ pub struct World {
     /// Phase 5：被 set_block 修改过的 ChunkPos 集合。
     /// 持久化层（Phase 8）通过 drain_dirty 取出待写；Phase 5 暂不消费。
     pub dirty_chunks: HashSet<ChunkPos>,
+    /// Phase 8：dirty / in-flight / retry 状态机。保留 `dirty_chunks` 是为了兼容旧测试和旧入口。
+    pub persistence: PersistenceManager,
+    /// 简易 LRU 顺序表。front 旧、back 新；容量不引入外部 crate。
+    lru_order: VecDeque<ChunkPos>,
+    pinned_chunks: HashSet<ChunkPos>,
+    chunk_cache_capacity: usize,
 }
 
 impl World {
@@ -31,6 +41,10 @@ impl World {
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
             dirty_chunks: HashSet::new(),
+            persistence: PersistenceManager::new(),
+            lru_order: VecDeque::new(),
+            pinned_chunks: HashSet::new(),
+            chunk_cache_capacity: DEFAULT_CHUNK_CACHE_CAPACITY,
         }
     }
 
@@ -38,15 +52,21 @@ impl World {
     /// Phase 2 的 chunk 入口点（由 client::chunk_loader 调用）。
     pub fn ensure_chunk_generated(&mut self, pos: ChunkPos) {
         if self.chunks.contains_key(&pos) {
+            self.touch_chunk(pos);
             return;
         }
         let chunk = self.terrain.generate_chunk(pos);
         self.chunks.insert(pos, chunk);
+        self.touch_chunk(pos);
+        self.evict_if_needed();
     }
 
     /// 卸载（移除）一个 chunk。Phase 5 引入持久化后会先把 dirty 数据 flush 再移除。
     pub fn unload_chunk(&mut self, pos: ChunkPos) {
-        self.chunks.remove(&pos);
+        if !self.persistence.is_dirty_or_in_flight(pos) {
+            self.chunks.remove(&pos);
+            self.lru_order.retain(|p| *p != pos);
+        }
     }
 
     /// 世界坐标方块查询；chunk 未加载或 y 越界一律返回 AIR。
@@ -76,6 +96,8 @@ impl World {
         if let Some(idx) = pos.local_index() {
             chunk.blocks[idx] = block;
             self.dirty_chunks.insert(cp);
+            self.persistence.mark_dirty(cp);
+            self.touch_chunk(cp);
         }
     }
 
@@ -87,12 +109,70 @@ impl World {
     /// Phase 5：取出当前 dirty chunk 列表并清空集合。
     /// Phase 5 暂无调用方；Phase 8 持久化层每秒 flush 一次。
     pub fn drain_dirty(&mut self) -> Vec<ChunkPos> {
-        self.dirty_chunks.drain().collect()
+        let drained: Vec<_> = self.dirty_chunks.drain().collect();
+        if drained.is_empty() {
+            self.persistence.take_dirty()
+        } else {
+            drained
+        }
     }
 
     /// 推进 tick 计数（Phase 5 起会驱动玩家广播等）。
     pub fn tick(&mut self) {
         self.tick_count += 1;
+    }
+
+    /// 直接载入持久化层读出的 chunk，不标 dirty。
+    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: Chunk) {
+        self.chunks.insert(pos, chunk);
+        self.touch_chunk(pos);
+        self.evict_if_needed();
+    }
+
+    pub fn set_chunk_cache_capacity(&mut self, capacity: usize) {
+        self.chunk_cache_capacity = capacity.max(1);
+        self.evict_if_needed();
+    }
+
+    pub fn chunk_cache_capacity(&self) -> usize {
+        self.chunk_cache_capacity
+    }
+
+    pub fn pin_chunks<I>(&mut self, chunks: I)
+    where
+        I: IntoIterator<Item = ChunkPos>,
+    {
+        self.pinned_chunks.clear();
+        self.pinned_chunks.extend(chunks);
+    }
+
+    pub fn pinned_len(&self) -> usize {
+        self.pinned_chunks.len()
+    }
+
+    fn touch_chunk(&mut self, pos: ChunkPos) {
+        self.lru_order.retain(|p| *p != pos);
+        self.lru_order.push_back(pos);
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.chunks.len() > self.chunk_cache_capacity {
+            let Some(candidate) = self.lru_order.pop_front() else {
+                break;
+            };
+            if self.pinned_chunks.contains(&candidate)
+                || self.persistence.is_dirty_or_in_flight(candidate)
+            {
+                self.lru_order.push_back(candidate);
+                if self.lru_order.iter().all(|p| {
+                    self.pinned_chunks.contains(p) || self.persistence.is_dirty_or_in_flight(*p)
+                }) {
+                    break;
+                }
+                continue;
+            }
+            self.chunks.remove(&candidate);
+        }
     }
 }
 
@@ -170,6 +250,7 @@ mod tests {
 
         world.set_block(Position::new(5, 100, 7), BlockID::STONE);
         assert!(world.dirty_chunks.contains(&cp));
+        assert_eq!(world.persistence.dirty_len(), 1);
 
         // drain 后清空
         let drained = world.drain_dirty();
@@ -183,5 +264,26 @@ mod tests {
         let mut world = World::new(0);
         world.set_block(Position::new(0, 64, 0), BlockID::STONE);
         assert!(world.dirty_chunks.is_empty());
+    }
+
+    #[test]
+    fn lru_evicts_unpinned_clean_chunks() {
+        let mut world = World::new(0);
+        world.set_chunk_cache_capacity(2);
+        world.ensure_chunk_generated(ChunkPos::new(0, 0));
+        world.ensure_chunk_generated(ChunkPos::new(1, 0));
+        world.ensure_chunk_generated(ChunkPos::new(2, 0));
+        assert_eq!(world.chunks.len(), 2);
+        assert!(!world.chunks.contains_key(&ChunkPos::new(0, 0)));
+    }
+
+    #[test]
+    fn lru_keeps_pinned_chunks() {
+        let mut world = World::new(0);
+        world.set_chunk_cache_capacity(1);
+        world.ensure_chunk_generated(ChunkPos::new(0, 0));
+        world.pin_chunks([ChunkPos::new(0, 0)]);
+        world.ensure_chunk_generated(ChunkPos::new(1, 0));
+        assert!(world.chunks.contains_key(&ChunkPos::new(0, 0)));
     }
 }

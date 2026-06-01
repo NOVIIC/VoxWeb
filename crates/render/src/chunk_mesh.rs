@@ -15,6 +15,9 @@ pub struct ChunkMeshCpu {
     pub vertices: Vec<PackedVertex>,
     /// u32 index buffer。每个 quad 6 个索引。
     pub indices: Vec<u32>,
+    /// 半透明方块独立顶点。Phase 8 起由 TransparentPass 负责 alpha blend。
+    pub transparent_vertices: Vec<PackedVertex>,
+    pub transparent_indices: Vec<u32>,
     /// 网格的局部 AABB（相对 chunk 原点），用于上传时转换为世界 AABB。
     pub bounds: Aabb,
     /// 贪婪前的可见单位面数量，用于 HUD 展示 Phase 2 等价顶点数。
@@ -128,6 +131,8 @@ impl MeshBuilder {
         ChunkMeshCpu {
             vertices: self.vertices,
             indices: self.indices,
+            transparent_vertices: Vec::new(),
+            transparent_indices: Vec::new(),
             bounds,
             visible_faces: self.visible_faces,
         }
@@ -181,7 +186,53 @@ pub fn generate_with_neighbors(
     emit_pos_z(&ctx, &mut out);
     emit_neg_z(&ctx, &mut out);
 
-    out.finish()
+    let mut mesh = out.finish();
+    emit_transparent(&ctx, &mut mesh);
+    mesh
+}
+
+fn emit_transparent(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
+    for ly in 0..CHUNK_Y {
+        for lz in 0..CHUNK_Z {
+            for lx in 0..CHUNK_X {
+                let block = ctx.chunk.get(lx, ly, lz);
+                if block == BlockID::AIR || !properties(block).transparent {
+                    continue;
+                }
+                let wx = ctx.origin_x + lx as i32;
+                let wy = ly as i32;
+                let wz = ctx.origin_z + lz as i32;
+                let tex = properties(block).texture_index;
+                for face_idx in 0..6 {
+                    let (dx, dy, dz) = FACE_NEIGHBORS[face_idx];
+                    let neighbor = (ctx.get_block_world)(wx + dx, wy + dy, wz + dz);
+                    // 同类透明方块内部面不画；透明贴着空气或不透明方块时仍画一层可见面。
+                    if neighbor == block {
+                        continue;
+                    }
+                    let base = mesh.transparent_vertices.len() as u32;
+                    for &(cx, cy, cz) in &FACE_CORNERS[face_idx] {
+                        mesh.transparent_vertices.push(PackedVertex::new(
+                            (lx + cx as usize) as u8,
+                            (ly + cy as usize) as u16,
+                            (lz + cz as usize) as u8,
+                            Face::from_index(face_idx as u8),
+                            tex,
+                            3,
+                        ));
+                    }
+                    mesh.transparent_indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+            }
+        }
+    }
 }
 
 fn emit_pos_x(ctx: &MeshContext<'_>, out: &mut MeshBuilder) {
