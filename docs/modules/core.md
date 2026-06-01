@@ -172,10 +172,11 @@ pub enum ClientMessage {
     Hello { display_name: String, version: u32 },
     /// 玩家移动同步（高频，走 unreliable 通道）
     PlayerInput { tick: u32, position: glam::Vec3, yaw: f32, pitch: f32 },
-    /// 方块挖掘
-    Break { pos: Position, request_id: u32 },
-    /// 方块放置
-    Place { pos: Position, block: BlockID, request_id: u32 },
+    /// 方块挖掘。input_tick / player_position 表示玩家点击时的本地预测状态，
+    /// Host 用它避免高延迟下最新 PlayerInput 还没到达造成范围误判。
+    Break { pos: Position, request_id: u32, input_tick: u32, player_position: glam::Vec3 },
+    /// 方块放置。player_position 是点击时脚底位置，用于范围与重叠校验。
+    Place { pos: Position, block: BlockID, request_id: u32, input_tick: u32, player_position: glam::Vec3 },
     /// 文本聊天
     Chat { content: String },
     /// 心跳（防止 NAT 老化；可选）
@@ -222,6 +223,9 @@ pub enum RoomEvent {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub entity_id: u32,
+    /// 服务端已接受到该玩家的最新 PlayerInput.tick。
+    /// 本玩家收到自己的快照时用它与本地预测历史对齐，避免高延迟下用旧回声拉扯当前位置。
+    pub last_input_tick: u32,
     pub position: glam::Vec3,
     pub yaw: f32,
     pub pitch: f32,

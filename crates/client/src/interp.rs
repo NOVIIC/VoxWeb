@@ -4,14 +4,19 @@
 //! 每渲染帧以 `server_time_ms - interp_delay` 作为渲染 target，
 //! 找出 bracket `[a.time, b.time]` 后 lerp position / yaw / pitch。
 //!
-//! Phase 5 不做外推（若 render_time 超出最新快照直接返回最新）；
-//! Phase 7 可加 50ms 外推窗口。
+//! Phase 8 起在缺少未来快照时允许最多 50ms 短外推，降低丢一两帧时的冻结感。
 
 use std::collections::HashMap;
 
 use glam::Vec3;
 
 use voxweb_core::protocol::EntityId;
+
+/// 没有未来快照时允许的短外推窗口。超过该窗口仍停在外推 50ms 的位置，
+/// 避免丢包时远端玩家立刻冻结，同时避免长时间猜测导致穿墙。
+const MAX_EXTRAPOLATE_MS: f64 = 50.0;
+/// 相邻快照距离超过该阈值视为传送或大纠偏，不做插值/外推。
+const TELEPORT_SNAP_DISTANCE_M: f32 = 10.0;
 
 /// 单条远端玩家快照。由 `apply_server_message::PlayerTick` 推入。
 #[derive(Copy, Clone, Debug)]
@@ -54,7 +59,7 @@ impl RemoteBuffer {
 
     /// 给定渲染 target（server 时间 ms），返回插值后的 (position, yaw, pitch)。
     /// - target 早于最早样本 → 返回最早
-    /// - target 晚于最新样本 → 返回最新（不外推）
+    /// - target 晚于最新样本 → 按最近速度短外推（最多 50ms）
     /// - 在 [a, b] 之间 → lerp
     fn get(&self, render_server_time_ms: f64) -> Option<(Vec3, f32, f32)> {
         if self.buf.is_empty() {
@@ -74,11 +79,13 @@ impl RemoteBuffer {
             let s = &self.buf[0];
             Some((s.position, s.yaw, s.pitch))
         } else if idx >= self.buf.len() {
-            let s = &self.buf[self.buf.len() - 1];
-            Some((s.position, s.yaw, s.pitch))
+            Some(self.latest_or_extrapolated(render_server_time_ms))
         } else {
             let a = &self.buf[idx - 1];
             let b = &self.buf[idx];
+            if a.position.distance(b.position) > TELEPORT_SNAP_DISTANCE_M {
+                return Some((b.position, b.yaw, b.pitch));
+            }
             let denom = (b.server_time_ms - a.server_time_ms) as f64;
             if denom <= 0.0 {
                 return Some((a.position, a.yaw, a.pitch));
@@ -91,6 +98,29 @@ impl RemoteBuffer {
             let yaw = lerp_yaw_shortest(a.yaw, b.yaw, t);
             Some((position, yaw, pitch))
         }
+    }
+
+    fn latest_or_extrapolated(&self, render_server_time_ms: f64) -> (Vec3, f32, f32) {
+        let latest = &self.buf[self.buf.len() - 1];
+        if self.buf.len() < 2 {
+            return (latest.position, latest.yaw, latest.pitch);
+        }
+        let prev = &self.buf[self.buf.len() - 2];
+        if prev.server_time_ms >= latest.server_time_ms
+            || prev.position.distance(latest.position) > TELEPORT_SNAP_DISTANCE_M
+        {
+            return (latest.position, latest.yaw, latest.pitch);
+        }
+
+        let sample_dt_s = (latest.server_time_ms - prev.server_time_ms) as f32 * 0.001;
+        if sample_dt_s <= f32::EPSILON {
+            return (latest.position, latest.yaw, latest.pitch);
+        }
+        let extrapolate_ms =
+            (render_server_time_ms - latest.server_time_ms as f64).clamp(0.0, MAX_EXTRAPOLATE_MS);
+        let velocity = (latest.position - prev.position) / sample_dt_s;
+        let position = latest.position + velocity * (extrapolate_ms as f32 * 0.001);
+        (position, latest.yaw, latest.pitch)
     }
 }
 
@@ -238,14 +268,25 @@ mod tests {
     }
 
     #[test]
-    fn interp_clamps_to_latest_when_render_time_after_all() {
+    fn interp_short_extrapolates_when_render_time_after_latest() {
         let mut interp = PlayerInterp::new();
         interp.delay_ms = 0.0;
         interp.ingest_tick(1, 1000, Vec3::new(0.0, 64.0, 0.0), 0.5, 0.0);
         interp.ingest_tick(1, 2000, Vec3::new(10.0, 64.0, 10.0), 1.0, 0.0);
-        // render 3000 > 最新 2000 → 返回最新
+        // render 3000 > 最新 2000 → 只短外推 50ms，速度为 10m/s
         let (pos, yaw, _) = interp.advance(1, 3000.0).expect("should return latest");
-        assert!((pos - Vec3::new(10.0, 64.0, 10.0)).length() < 0.01);
+        assert!((pos - Vec3::new(10.5, 64.0, 10.5)).length() < 0.01);
         assert!((yaw - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn interp_does_not_extrapolate_teleports() {
+        let mut interp = PlayerInterp::new();
+        interp.delay_ms = 0.0;
+        interp.ingest_tick(1, 1000, Vec3::ZERO, 0.0, 0.0);
+        interp.ingest_tick(1, 2000, Vec3::new(20.0, 64.0, 0.0), 0.0, 0.0);
+
+        let (pos, _, _) = interp.advance(1, 2050.0).expect("should return latest");
+        assert!((pos - Vec3::new(20.0, 64.0, 0.0)).length() < 0.01);
     }
 }

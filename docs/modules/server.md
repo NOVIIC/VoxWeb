@@ -94,7 +94,7 @@ pub struct PlayerEntity {
     pub position: glam::Vec3,
     pub yaw: f32,
     pub pitch: f32,
-    pub last_input_tick: u32,                // 用于丢弃过期输入
+    pub last_input_tick: u32,                // 用于丢弃过期输入，并随 PlayerSnapshot 回执给客户端协调
     pub joined_at_tick: u32,
 }
 ```
@@ -212,6 +212,8 @@ fn broadcast_tick(&mut self) {
         .filter(|(_, p)| force_full || p.has_changed_since_last_broadcast())
         .map(|(eid, p)| {
             p.record_broadcast();
+            // PlayerSnapshot 携带 last_input_tick，让客户端用同一输入时刻做协调；
+            // 高 RTT 下不能用 server tick 去对齐客户端预测历史。
             p.to_snapshot(*eid)
         })
         .collect();
@@ -344,8 +346,9 @@ match msg {
     ClientMessage::PlayerInput { tick, position, yaw, pitch } => {
         self.handle_player_input(sender, tick, position, yaw, pitch);
     }
-    ClientMessage::Break { pos, request_id } => {
-        match physics::validate_break(&self.world, sender, pos) {
+    ClientMessage::Break { pos, request_id, input_tick, player_position } => {
+        let feet = self.action_player_position(sender, input_tick, player_position);
+        match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
                 self.world.dirty_chunks.insert(pos.to_chunk_pos());
@@ -357,7 +360,10 @@ match msg {
             }
         }
     }
-    ClientMessage::Place { pos, block, request_id } => { /* 同上 */ }
+    ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
+        let feet = self.action_player_position(sender, input_tick, player_position);
+        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠 */
+    }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));
     }

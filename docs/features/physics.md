@@ -379,7 +379,10 @@ fn on_left_click(&mut self) {
     }
 
     self.net.send_to_server(ClientMessage::Break {
-        pos: hit.block_pos, request_id,
+        pos: hit.block_pos,
+        request_id,
+        input_tick: self.local_input_tick,
+        player_position: self.physics.feet_position,
     });
 }
 ```
@@ -415,7 +418,11 @@ fn on_right_click(&mut self) {
     }
 
     self.net.send_to_server(ClientMessage::Place {
-        pos: neighbor_pos, block: block_to_place, request_id,
+        pos: neighbor_pos,
+        block: block_to_place,
+        request_id,
+        input_tick: self.local_input_tick,
+        player_position: self.physics.feet_position,
     });
 }
 ```

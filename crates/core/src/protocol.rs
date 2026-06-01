@@ -12,9 +12,9 @@ use crate::chunk::{ChunkPos, Position};
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v2（Phase 6）：Welcome 携带完整 roster + host_entity_id，
-/// 让新加入的 Remote 一次性建好玩家表（包括早于自己加入的 Host）。
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v4（Phase 8）：Break/Place 携带点击时 input_tick 与 player_position，
+/// 让 Host 在高延迟下按玩家实际点击时的位置做挖放范围校验。
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// ChunkSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -65,12 +65,24 @@ pub enum ClientMessage {
         pitch: f32,
     },
     /// 挖掘方块请求
-    Break { pos: Position, request_id: u32 },
+    Break {
+        pos: Position,
+        request_id: u32,
+        /// 玩家点击时的本地输入序号，用于让服务端把操作与预测历史对齐。
+        input_tick: u32,
+        /// 玩家点击时的脚底位置。可靠操作包可能先于最新 PlayerInput 到达，
+        /// 服务端用它做范围校验，避免高 RTT 下误判 OutOfRange。
+        player_position: Vec3,
+    },
     /// 放置方块请求
     Place {
         pos: Position,
         block: BlockID,
         request_id: u32,
+        /// 玩家点击时的本地输入序号。
+        input_tick: u32,
+        /// 玩家点击时的脚底位置，用于范围与玩家 AABB 重叠校验。
+        player_position: Vec3,
     },
     /// 文本聊天
     Chat { content: String },
@@ -156,6 +168,9 @@ pub enum RoomEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlayerSnapshot {
     pub entity_id: u32,
+    /// 服务端已接受到该玩家的最新 PlayerInput.tick。
+    /// 客户端收到自己的快照时用它查本地 InputHistory，而不是用 server tick 对齐。
+    pub last_input_tick: u32,
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
@@ -235,6 +250,8 @@ mod tests {
         roundtrip(&ClientMessage::Break {
             pos: Position::new(10, 64, -5),
             request_id: 42,
+            input_tick: 9,
+            player_position: Vec3::new(8.0, 65.0, 8.0),
         });
     }
 
@@ -244,6 +261,8 @@ mod tests {
             pos: Position::new(10, 65, -5),
             block: BlockID::STONE,
             request_id: 43,
+            input_tick: 10,
+            player_position: Vec3::new(8.0, 65.0, 8.0),
         });
     }
 
@@ -284,9 +303,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_two() {
-        // Phase 6 起为 2；任何破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_four() {
+        // Phase 8 高延迟挖放优化为 v4；任何破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -295,6 +314,7 @@ mod tests {
             tick: 60,
             players: vec![PlayerSnapshot {
                 entity_id: 1,
+                last_input_tick: 9,
                 position: Vec3::new(1.0, 64.0, 2.0),
                 yaw: 0.5,
                 pitch: -0.2,

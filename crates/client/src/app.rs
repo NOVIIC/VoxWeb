@@ -305,11 +305,17 @@ pub struct Game {
     pub interp: PlayerInterp,
     /// Chunk 快照接收组装器（Remote 端用，Host/Local 闲置）。
     pub chunk_assembler: ChunkAssembler,
+    /// 本地生成的 PlayerInput 序号。Remote 模式也独立递增，不能借用本地 dummy server tick。
+    pub local_input_tick: u32,
     /// 本地位置预测的输入历史（60Hz 推入，PlayerTick reconcile 时修剪）。
     pub input_history: InputHistory,
-    /// Host 时钟与本地时钟的瞬态偏移（ms）：server_time_ms - local_now_ms。
-    /// PlayerTick 每帧覆盖；远端的 rendering target 用。
-    pub server_clock_offset_ms: i64,
+    /// 中等位置误差的剩余软修正量。每个渲染帧应用一小段，避免高 RTT 下画面回弹。
+    pub pending_position_correction: Vec3,
+    /// Host 时钟与本地时钟的平滑偏移（ms）：server_time_ms - local_now_ms。
+    /// Pong 按半 RTT 估算，PlayerTick 提供低权重补充样本；远端插值 target 使用它。
+    pub server_clock_offset_ms: f64,
+    /// 是否已经吃过至少一条 Host 时钟样本。第一条样本直接采用，后续再指数平滑。
+    pub server_clock_synced: bool,
     /// Phase 8：Local/Host 的 OPFS 存储句柄。Remote 不写存档。
     pub storage: Option<OpfsStorage>,
     pub known_persisted: HashSet<voxweb_core::ChunkPos>,
@@ -448,8 +454,11 @@ impl Game {
             remote_players: HashMap::new(),
             interp,
             chunk_assembler: ChunkAssembler::new(),
+            local_input_tick: 0,
             input_history: InputHistory::new(120),
-            server_clock_offset_ms: 0,
+            pending_position_correction: Vec3::ZERO,
+            server_clock_offset_ms: 0.0,
+            server_clock_synced: false,
             storage: None,
             known_persisted: HashSet::new(),
             last_persist_ms: 0.0,

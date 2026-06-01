@@ -53,36 +53,34 @@ fn upload_input(&mut self) {
 
 ### 2.2 协调（Reconciliation）
 
-当客户端收到 `PlayerTick`，找到自己 entity 的服务端权威位置：
+当客户端收到 `PlayerTick`，找到自己 entity 的服务端权威位置。关键点是用
+`PlayerSnapshot.last_input_tick` 对齐本地历史：它表示 Host 已经接受到该玩家的哪一条
+`PlayerInput`。这样 RTT 200ms+ 时也不会把“200ms 前自己的位置回声”和当前预测位置直接相减。
 
 ```rust
-fn reconcile_self(&mut self, snap: &PlayerSnapshot, server_tick: u32) {
-    // 服务端 tick 对应客户端的某个 input_history entry
+fn reconcile_self(&mut self, snap: &PlayerSnapshot) {
+    // Host 已处理的客户端输入 tick 对应本地 input_history 中的一条记录
     let our_record = self.prediction.input_history.iter()
-        .find(|r| r.tick == server_tick);
+        .find(|r| r.tick == snap.last_input_tick);
 
     if let Some(record) = our_record {
         let error = (snap.position - record.position).length();
+        let correction = snap.position - record.position;
 
         if error < SOFT_THRESHOLD {
             // 误差小：忽略，本地预测继续
         } else if error < HARD_THRESHOLD {
-            // 误差中等：软插补 → 把 camera.position 往服务端方向慢慢拉
-            let correction = snap.position - record.position;
+            // 误差中等：把同一输入时刻的差值软插补到当前预测位置
             self.prediction.pending_correction = Some(correction);
         } else {
-            // 误差大：硬瞬移
-            self.camera.position = snap.position;
+            // 误差大：立刻把差值加到当前预测位置，而不是回到旧快照位置
+            self.camera.position += correction;
             self.prediction.input_history.clear();
-            // 重新执行后续 input（本地保留的 inputs 应用到新位置）
-            for input in self.prediction.input_history.iter().filter(|r| r.tick > server_tick) {
-                self.physics.replay(input);
-            }
         }
     }
 
     // 清理过旧记录
-    self.prediction.input_history.retain(|r| r.tick > server_tick);
+    self.prediction.input_history.retain(|r| r.tick > snap.last_input_tick);
 }
 ```
 
@@ -124,6 +122,7 @@ pub struct PendingAction {
     pub kind: PendingActionKind,
     pub backup: BlockID,           // 修改前的方块（rollback 用）
     pub pos: Position,
+    pub input_tick: u32,           // 点击时本地输入序号
     pub since_tick: u32,
 }
 
@@ -139,8 +138,10 @@ pub enum PendingActionKind {
 fn handle_break_input(&mut self, hit: RaycastHit) {
     let request_id = self.prediction.next_request_id();
     let backup = self.world_view.get_block(hit.pos);
+    let input_tick = self.local_input_tick;
+    let player_position = self.physics.feet_position;
 
-    // 本地立即修改（Remote 视角；Local-Only 实际由 server 来改不需预测）
+    // 本地立即修改（仅 Remote 视角；Local/Host 与 server 共享世界，仍等权威 BlockUpdate）
     if matches!(self.role, Role::Remote) {
         self.world_view.set_block(hit.pos, BlockID::AIR);
         self.mesh_jobs.enqueue(hit.pos.to_chunk_pos(), Priority::High);
@@ -148,12 +149,20 @@ fn handle_break_input(&mut self, hit: RaycastHit) {
 
     self.prediction.pending_actions.insert(request_id, PendingAction {
         request_id, kind: PendingActionKind::Break,
-        backup, pos: hit.pos, since_tick: self.current_tick,
+        backup, pos: hit.pos, input_tick, since_tick: self.current_tick,
     });
 
-    self.net.send_to_server(ClientMessage::Break { pos: hit.pos, request_id });
+    self.net.send_to_server(ClientMessage::Break {
+        pos: hit.pos,
+        request_id,
+        input_tick,
+        player_position,
+    });
 }
 ```
+
+`Place` 同样携带 `input_tick` 与点击时 `player_position`，并在 Remote 本地世界视图中先写入目标方块。
+Host 仍以权威世界状态决定最终是否接受；拒绝时客户端用 `backup` 回滚。
 
 ### 3.3 ActionAck 处理
 
@@ -199,6 +208,7 @@ fn handle_block_update(&mut self, update: BlockUpdate) {
 ```rust
 pub struct ClockSync {
     offset_ms: f32,    // server_time = client_time + offset
+    initialized: bool,
 }
 
 impl ClockSync {
@@ -209,8 +219,13 @@ impl ClockSync {
         let estimated_server_at_now = server_ms as f32 + one_way;
         let new_offset = estimated_server_at_now - now as f32;
 
-        // 指数平滑
-        self.offset_ms = self.offset_ms * 0.9 + new_offset * 0.1;
+        // 指数平滑；第一条样本直接采用，避免从 0 慢慢漂移
+        self.offset_ms = if self.initialized {
+            self.offset_ms * 0.8 + new_offset * 0.2
+        } else {
+            self.initialized = true;
+            new_offset
+        };
     }
 
     pub fn server_time_ms_now(&self) -> f32 {
@@ -220,6 +235,10 @@ impl ClockSync {
 ```
 
 可选：每 5 秒发 Ping 估算偏移。
+
+`PlayerTick.server_time_ms` 也会提供低频校正样本：若当前已有 RTT，就按
+`server_time_ms + rtt / 2 - client_now` 估算；否则暂按 `server_time_ms - client_now` 估算。
+这类样本使用更小的平滑权重，避免网络抖动直接改变远端玩家渲染 target。
 
 主要用于：
 - 远端玩家插值缓冲区按 `server_time_ms` 排序
@@ -291,10 +310,16 @@ pub fn advance(&mut self, _dt: f32) {
             buf.current_pos = a.position.lerp(b.position, t);
             buf.current_yaw = lerp_angle(a.yaw, b.yaw, t);
             buf.current_pitch = lerp_angle(a.pitch, b.pitch, t);
-        } else if let Some(latest) = buf.snapshots.back() {
-            // 没有未来快照可插值：外推一次（最多 50ms）防止冻结
+        } else if let Some((prev, latest)) = latest_pair(&buf.snapshots) {
+            // 没有未来快照可插值：按最近两帧速度短外推（最多 50ms）防止丢包冻结
             let dt = (render_server_time - latest.server_time_ms).clamp(0.0, 50.0) * 0.001;
-            buf.current_pos = latest.position; // 简化：不外推位置；只保持
+            let sample_dt = ((latest.server_time_ms - prev.server_time_ms) * 0.001).max(0.001);
+            let velocity = (latest.position - prev.position) / sample_dt;
+            buf.current_pos = latest.position + velocity * dt;
+            buf.current_yaw = latest.yaw;
+            buf.current_pitch = latest.pitch;
+        } else if let Some(latest) = buf.snapshots.back() {
+            buf.current_pos = latest.position;
             buf.current_yaw = latest.yaw;
             buf.current_pitch = latest.pitch;
         }
