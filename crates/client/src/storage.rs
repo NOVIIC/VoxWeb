@@ -90,7 +90,8 @@ impl OpfsStorage {
         &self.world_key
     }
 
-    async fn open_impl(room_id: &str, seed: u64) -> Result<Self, StorageError> {
+    /// 内部方法：通过 key 打开世界目录
+    async fn open_impl_by_key(key: &str) -> Result<Self, StorageError> {
         let storage = web_sys::window()
             .ok_or(StorageError::NotSupported)?
             .navigator()
@@ -106,8 +107,7 @@ impl OpfsStorage {
             opts
         };
         let worlds_root = get_dir(&opfs_root, "voxweb", &create_dir).await?;
-        let world_key = make_world_key(room_id, seed);
-        let root = get_dir(&worlds_root, &world_key, &create_dir).await?;
+        let root = get_dir(&worlds_root, key, &create_dir).await?;
         let chunks_dir = get_dir(&root, "chunks", &create_dir).await?;
 
         let now = now_ms() as u64;
@@ -122,16 +122,20 @@ impl OpfsStorage {
                 record.updated_at_ms = now;
                 record
             }
-            None => WorldRecord {
-                key: world_key.clone(),
-                room_id: room_id.to_string(),
-                seed: seed.to_string(),
-                display_name: room_id.to_string(),
-                created_at_ms: now,
-                updated_at_ms: now,
-                storage_version: STORAGE_VERSION,
-                protocol_version: PROTOCOL_VERSION,
-            },
+            None => {
+                // 解析 key 获取 seed
+                let seed = seed_from_key(key).unwrap_or(0);
+                WorldRecord {
+                    key: key.to_string(),
+                    room_id: "local".to_string(),
+                    seed: seed.to_string(),
+                    display_name: "Unknown".to_string(),
+                    created_at_ms: parse_world_key(key).map(|(ts, _)| ts * 1000).unwrap_or(now),
+                    updated_at_ms: now,
+                    storage_version: STORAGE_VERSION,
+                    protocol_version: PROTOCOL_VERSION,
+                }
+            }
         };
         write_text_file(
             &root,
@@ -144,7 +148,7 @@ impl OpfsStorage {
         Ok(Self {
             worlds_root,
             chunks_dir,
-            world_key,
+            world_key: key.to_string(),
         })
     }
 
@@ -153,11 +157,36 @@ impl OpfsStorage {
         let promise = storage.persist().ok()?;
         JsFuture::from(promise).await.ok()?.as_bool()
     }
+
+    /// 通过 key 直接打开已有存档（加载存档时用）
+    pub async fn open_by_key(key: &str) -> Result<Self, StorageError> {
+        Self::open_impl_by_key(key).await
+    }
+
+    /// 创建新存档（用当前时间戳 + seed 生成 key）
+    pub async fn create_new(seed: u64) -> Result<Self, StorageError> {
+        let created_at_s = (now_ms() / 1000.0) as u64;
+        let key = make_world_key(created_at_s, seed);
+        Self::open_impl_by_key(&key).await
+    }
+
+    /// 获取当前世界的 WorldRecord
+    pub async fn world_record(&self) -> Option<WorldRecord> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await
+        .ok()?;
+        load_world_record(&root).await.ok().flatten()
+    }
 }
 
 impl WorldStorage for OpfsStorage {
-    async fn open(room_id: &str, seed: u64) -> Result<Self, StorageError> {
-        Self::open_impl(room_id, seed).await
+    async fn open(_room_id: &str, seed: u64) -> Result<Self, StorageError> {
+        // 创建新存档（使用当前时间戳 + seed 生成 key）
+        Self::create_new(seed).await
     }
 
     async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError> {
@@ -242,7 +271,105 @@ pub async fn quota() -> Option<QuotaInfo> {
     Some(QuotaInfo { quota, usage })
 }
 
-pub fn make_world_key(room_id: &str, seed: u64) -> String {
+/// 列出所有已保存的世界（大厅用）
+pub async fn list_saved_worlds() -> Result<Vec<WorldSummary>, StorageError> {
+    let storage = web_sys::window()
+        .ok_or(StorageError::NotSupported)?
+        .navigator()
+        .storage();
+    let root_value = JsFuture::from(storage.get_directory())
+        .await
+        .map_err(js_error)?;
+    let opfs_root: FileSystemDirectoryHandle = root_value.dyn_into().map_err(js_error)?;
+
+    let create_dir = {
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(true);
+        opts
+    };
+    let worlds_root = get_dir(&opfs_root, "voxweb", &create_dir).await?;
+
+    let meta = load_meta(&worlds_root).await.unwrap_or_default();
+    Ok(meta.worlds)
+}
+
+/// 删除指定世界（通过 key）
+pub async fn delete_world_by_key(key: &str) -> Result<(), StorageError> {
+    let storage = web_sys::window()
+        .ok_or(StorageError::NotSupported)?
+        .navigator()
+        .storage();
+    let root_value = JsFuture::from(storage.get_directory())
+        .await
+        .map_err(js_error)?;
+    let opfs_root: FileSystemDirectoryHandle = root_value.dyn_into().map_err(js_error)?;
+
+    let worlds_root = get_dir(&opfs_root, "voxweb", &{
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(true);
+        opts
+    })
+    .await?;
+
+    // 删除世界目录
+    let opts = FileSystemRemoveOptions::new();
+    opts.set_recursive(true);
+    JsFuture::from(worlds_root.remove_entry_with_options(key, &opts))
+        .await
+        .map_err(js_error)?;
+
+    // 更新 _meta.json
+    let mut meta = load_meta(&worlds_root).await.unwrap_or_default();
+    meta.worlds.retain(|w| w.key != key);
+    write_text_file(
+        &worlds_root,
+        "_meta.json",
+        &serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// 生成世界目录 key：`<created_at_s>__<seed>`（秒级时间戳 + seed）
+pub fn make_world_key(created_at_s: u64, seed: u64) -> String {
+    format!("{created_at_s}__{seed}")
+}
+
+/// 解析 world_key 为 (created_at_s, seed)
+/// 格式: `<created_at_s>__<seed>`，如 `1746000000__1234567890`
+pub fn parse_world_key(key: &str) -> Option<(u64, u64)> {
+    let (ts_str, seed_str) = key.split_once("__")?;
+    let ts = ts_str.parse::<u64>().ok()?;
+    let seed = seed_str.parse::<u64>().ok()?;
+    Some((ts, seed))
+}
+
+/// 从 key 提取 seed（加载存档时用）
+pub fn seed_from_key(key: &str) -> Option<u64> {
+    parse_world_key(key).map(|(_, seed)| seed)
+}
+
+/// 从 key 提取创建时间并格式化为本地时间字符串
+/// 输入: "1746000000__1234567890"
+/// 输出: "2026-06-01 12:00:00"
+pub fn format_creation_time(key: &str) -> String {
+    let (ts_s, _) = parse_world_key(key).unwrap_or((0, 0));
+    // 使用 js_sys::Date 将秒级时间戳转换为日期字符串
+    let date = js_sys::Date::new(&JsValue::from_f64((ts_s as f64) * 1000.0));
+    format!(
+        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds()
+    )
+}
+
+/// 旧版兼容：从 room_id + seed 生成 key（用于迁移或兼容）
+pub fn make_world_key_legacy(room_id: &str, seed: u64) -> String {
     format!("{}__{seed}", sanitize_key(room_id))
 }
 

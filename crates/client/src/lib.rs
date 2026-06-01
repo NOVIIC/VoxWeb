@@ -667,6 +667,29 @@ fn update_clock(app: &Rc<RefCell<App>>) -> f32 {
 // ============================================================
 
 fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), String> {
+    // —— 异步加载存档列表（仅首次进入 Lobby 时触发）——
+    {
+        let mut a = app.borrow_mut();
+        if a.lobby_state.saved_worlds.is_empty() && !a.lobby_state.saves_loading {
+            a.lobby_state.saves_loading = true;
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                a.lobby_state.saves_loading = false;
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 加载存档列表失败: {e:?}");
+                        a.lobby_state.error_message = Some(format!("加载存档失败: {e:?}"));
+                    }
+                }
+            });
+        }
+    }
+
     // —— 跑 egui Lobby UI ——
     let (action, paint_jobs, pixels_per_point, textures_delta) = {
         let mut a = app.borrow_mut();
@@ -695,9 +718,12 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     };
 
     // —— 处理动作 ——
+    // 获取当前选中的存档 key
+    let selected_save_key = app.borrow().lobby_state.selected_save.clone();
+
     match action {
         Some(LobbyAction::StartSinglePlayer { seed, display_name }) => {
-            start_single_player(app, seed, &display_name);
+            start_single_player(app, seed, &display_name, selected_save_key.as_deref());
         }
         Some(LobbyAction::CreateRoom {
             room_id,
@@ -728,7 +754,13 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                 }
             };
-            start_host(app, &final_room, seed, &display_name);
+            start_host(
+                app,
+                &final_room,
+                seed,
+                &display_name,
+                selected_save_key.as_deref(),
+            );
         }
         Some(LobbyAction::JoinRoom {
             room_id,
@@ -740,6 +772,44 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                 return Ok(());
             }
             start_remote(app, &room_id, &display_name);
+        }
+        Some(LobbyAction::SelectSave { key }) => {
+            app.borrow_mut().lobby_state.selected_save = key;
+        }
+        Some(LobbyAction::DeleteSave { key }) => {
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(e) = crate::storage::delete_world_by_key(&key).await {
+                    log::warn!("[lobby] 删除存档失败: {e:?}");
+                }
+                // 刷新列表
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                        a.lobby_state.selected_save = None; // 重置选择
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                    }
+                }
+            });
+        }
+        Some(LobbyAction::RefreshSaves) => {
+            let app_ref = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = crate::storage::list_saved_worlds().await;
+                let mut a = app_ref.borrow_mut();
+                match result {
+                    Ok(worlds) => {
+                        a.lobby_state.saved_worlds = worlds;
+                    }
+                    Err(e) => {
+                        log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                    }
+                }
+            });
         }
         None => {}
     }
@@ -836,9 +906,16 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
     Ok(())
 }
 
-fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>, display_name: &str) {
+fn start_single_player(
+    app: &Rc<RefCell<App>>,
+    seed: Option<u64>,
+    display_name: &str,
+    save_key: Option<&str>,
+) {
     let seed = seed.unwrap_or_else(random_seed);
-    log::info!("启动单机游戏，seed = {seed}, display_name = {display_name}");
+    log::info!(
+        "启动单机游戏，seed = {seed}, display_name = {display_name}, save_key = {save_key:?}"
+    );
 
     let settings = settings_storage::load().unwrap_or_default();
     let mut game = Game::new_local(seed, settings, display_name);
@@ -864,7 +941,13 @@ fn start_single_player(app: &Rc<RefCell<App>>, seed: Option<u64>, display_name: 
     a.state = AppState::Connecting;
     log::info!("[local] 进入加载界面，开始区块预载 (total={total})");
     drop(a);
-    attach_storage_async(app.clone(), "local".to_string(), seed);
+
+    // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
+    if let Some(key) = save_key {
+        attach_storage_for_load(app.clone(), key.to_string());
+    } else {
+        attach_storage_for_new(app.clone(), seed);
+    }
 }
 
 fn install_debug_hooks(app: Rc<RefCell<App>>) {
@@ -967,7 +1050,13 @@ fn set_room_in_url(room_id: &str) {
     let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
 }
 
-fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_name: &str) {
+fn start_host(
+    app: &Rc<RefCell<App>>,
+    room_id: &str,
+    seed: Option<u64>,
+    display_name: &str,
+    save_key: Option<&str>,
+) {
     let seed = seed.unwrap_or_else(random_seed);
     let Some(url) = signaling_url() else {
         app.borrow_mut().lobby_state.error_message = Some(
@@ -975,7 +1064,9 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
         );
         return;
     };
-    log::info!("启动 Host：room={room_id}, signaling={url}, seed={seed}, name={display_name}");
+    log::info!(
+        "启动 Host：room={room_id}, signaling={url}, seed={seed}, name={display_name}, save_key={save_key:?}"
+    );
 
     let settings = settings_storage::load().unwrap_or_default();
     let game_result = Game::new_host(seed, settings, &url, room_id, display_name);
@@ -994,7 +1085,14 @@ fn start_host(app: &Rc<RefCell<App>>, room_id: &str, seed: Option<u64>, display_
             // 把房间号写回 URL（history.replaceState），方便用户直接复制 URL 分享
             set_room_in_url(room_id);
             drop(a);
-            attach_storage_async(app.clone(), room_id.to_string(), seed);
+
+            // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
+            if let Some(key) = save_key {
+                attach_storage_for_load(app.clone(), key.to_string());
+            } else {
+                // Host 模式：使用 room_id + seed 创建存档
+                attach_storage_async(app.clone(), room_id.to_string(), seed);
+            }
         }
         Err(e) => {
             log::warn!("[host] new_host failed: {e:?}");
@@ -1046,6 +1144,104 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::open(&room_id, seed).await {
+            Ok(storage) => {
+                let known = storage.list_chunks().await.unwrap_or_default();
+                let known_set: HashSet<_> = known.iter().copied().collect();
+                let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                let mut loaded = Vec::new();
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let pos = voxweb_core::ChunkPos::new(spawn.x + dx, spawn.z + dz);
+                        if !known_set.contains(&pos) {
+                            continue;
+                        }
+                        match storage.load_chunk(pos).await {
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
+                                Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
+                            },
+                            Ok(None) => {}
+                            Err(e) => log::warn!("[storage] load {pos:?} failed: {e:?}"),
+                        }
+                    }
+                }
+                let quota = storage.quota().await;
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                        g.mesh_jobs.enqueue(pos, MeshPriority::High);
+                    }
+                    g.known_persisted = known_set;
+                    g.quota = quota;
+                    g.storage = Some(storage);
+                    g.storage_error = None;
+                }
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    g.storage_error = Some(format!("{e:?}"));
+                }
+            }
+        }
+    });
+}
+
+/// 创建新存档（用当前时间戳 + seed 生成 key）
+fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = OpfsStorage::request_persistence().await;
+        match OpfsStorage::create_new(seed).await {
+            Ok(storage) => {
+                let known = storage.list_chunks().await.unwrap_or_default();
+                let known_set: HashSet<_> = known.iter().copied().collect();
+                let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+                let mut loaded = Vec::new();
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let pos = voxweb_core::ChunkPos::new(spawn.x + dx, spawn.z + dz);
+                        if !known_set.contains(&pos) {
+                            continue;
+                        }
+                        match storage.load_chunk(pos).await {
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
+                                Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
+                            },
+                            Ok(None) => {}
+                            Err(e) => log::warn!("[storage] load {pos:?} failed: {e:?}"),
+                        }
+                    }
+                }
+                let quota = storage.quota().await;
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                        g.mesh_jobs.enqueue(pos, MeshPriority::High);
+                    }
+                    g.known_persisted = known_set;
+                    g.quota = quota;
+                    g.storage = Some(storage);
+                    g.storage_error = None;
+                }
+            }
+            Err(e) => {
+                let mut a = app.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    g.storage_error = Some(format!("{e:?}"));
+                }
+            }
+        }
+    });
+}
+
+/// 通过 key 加载已有存档
+fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = OpfsStorage::request_persistence().await;
+        match OpfsStorage::open_by_key(&key).await {
             Ok(storage) => {
                 let known = storage.list_chunks().await.unwrap_or_default();
                 let known_set: HashSet<_> = known.iter().copied().collect();
