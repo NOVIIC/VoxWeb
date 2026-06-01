@@ -145,10 +145,17 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     // 从存档 key 获取 seed
                     crate::storage::seed_from_key(key)
                 } else {
-                    // New World：从输入框获取或随机生成
-                    parse_seed(&state.seed_input)
+                    // New World：从输入框获取或随机生成；解析失败时提示用户
+                    match parse_seed(&state.seed_input) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            state.error_message = Some(e);
+                            return;
+                        }
+                    }
                 };
                 let display_name = resolve_display_name(state);
+                state.error_message = None;
                 action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
             }
 
@@ -185,8 +192,14 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                         // 从存档 key 获取 seed
                         crate::storage::seed_from_key(key)
                     } else {
-                        // New World：从输入框获取或随机生成
-                        parse_seed(&state.seed_input)
+                        // New World：从输入框获取或随机生成；解析失败时提示用户
+                        match parse_seed(&state.seed_input) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                state.error_message = Some(e);
+                                return;
+                            }
+                        }
                     };
                     let display_name = resolve_display_name(state);
                     state.error_message = None;
@@ -408,13 +421,19 @@ pub fn draw_connecting(
     action
 }
 
-/// 把输入框文本解析为 Option<u64>。空字符串 → None（随机）。
-fn parse_seed(input: &str) -> Option<u64> {
+/// 把输入框文本解析为种子值。
+/// - 空字符串 → `Ok(None)`（随机种子）
+/// - 有效数字 → `Ok(Some(n))`
+/// - 非空但不是合法数字 → `Err(错误描述)`
+fn parse_seed(input: &str) -> Result<Option<u64>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
-    trimmed.parse::<u64>().ok()
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("种子必须是 0~{} 的整数", u64::MAX))
 }
 
 /// 校验房间号：4-12 字符，仅 [a-z0-9_-]。
@@ -453,20 +472,20 @@ mod tests {
 
     #[test]
     fn parse_seed_empty_is_none() {
-        assert_eq!(parse_seed(""), None);
-        assert_eq!(parse_seed("   "), None);
+        assert_eq!(parse_seed(""), Ok(None));
+        assert_eq!(parse_seed("   "), Ok(None));
     }
 
     #[test]
     fn parse_seed_valid_u64() {
-        assert_eq!(parse_seed("42"), Some(42));
-        assert_eq!(parse_seed("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(parse_seed("42"), Ok(Some(42)));
+        assert_eq!(parse_seed("18446744073709551615"), Ok(Some(u64::MAX)));
     }
 
     #[test]
-    fn parse_seed_invalid_is_none() {
-        assert_eq!(parse_seed("not_a_number"), None);
-        assert_eq!(parse_seed("-1"), None); // 负数不是合法 u64
+    fn parse_seed_invalid_is_err() {
+        assert!(parse_seed("not_a_number").is_err());
+        assert!(parse_seed("-1").is_err()); // 负数不是合法 u64
     }
 
     #[test]

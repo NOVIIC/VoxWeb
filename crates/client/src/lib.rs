@@ -138,6 +138,9 @@ struct App {
 
     /// Phase 7：上一帧的 CPU pass / 网格化统计，用于 HUD。
     perf: FramePerfStats,
+
+    /// 游戏内通知队列（timestamp_ms, 消息）。用于在 InGame 状态下显示信令错误等浮窗提示。
+    notifications: Vec<(f64, String)>,
 }
 
 #[wasm_bindgen(start)]
@@ -204,6 +207,7 @@ pub async fn start() -> Result<(), JsValue> {
         preload_state: None,
         relayed_peers: HashSet::new(),
         perf: FramePerfStats::default(),
+        notifications: Vec::new(),
     }));
 
     install_event_listeners(&canvas, &document, input.clone(), egui_events, app.clone())?;
@@ -781,6 +785,9 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) = crate::storage::delete_world_by_key(&key).await {
                     log::warn!("[lobby] 删除存档失败: {e:?}");
+                    let mut a = app_ref.borrow_mut();
+                    a.lobby_state.error_message = Some(format!("删除存档失败: {e:?}"));
+                    return;
                 }
                 // 刷新列表
                 let result = crate::storage::list_saved_worlds().await;
@@ -792,6 +799,7 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                     Err(e) => {
                         log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                        a.lobby_state.error_message = Some(format!("刷新存档列表失败: {e:?}"));
                     }
                 }
             });
@@ -807,6 +815,7 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     }
                     Err(e) => {
                         log::warn!("[lobby] 刷新存档列表失败: {e:?}");
+                        a.lobby_state.error_message = Some(format!("刷新存档列表失败: {e:?}"));
                     }
                 }
             });
@@ -1763,6 +1772,15 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
         }
         RoomEvent::SignalingError(msg) => {
             log::warn!("[net] signaling error: {msg}");
+            // InGame 状态下将错误推入通知队列，让玩家在游戏内看到浮窗提示
+            if matches!(a.state, AppState::InGame { .. }) {
+                let now = now_ms();
+                a.notifications.push((now, msg.clone()));
+                // 最多保留 8 条通知，超出时移除最旧的
+                if a.notifications.len() > 8 {
+                    a.notifications.remove(0);
+                }
+            }
             a.connecting_error = Some(msg);
         }
         RoomEvent::PeerCount(n) => {
@@ -2141,6 +2159,16 @@ fn render_game_frame(
             }
         }
 
+        // 提取游戏内通知（5 秒内有效），供 egui 闭包渲染浮窗
+        let active_notifications: Vec<String> = a
+            .notifications
+            .iter()
+            .filter(|(ts, _)| now_local - ts < 5000.0)
+            .map(|(_, msg)| msg.clone())
+            .collect();
+        // 清理过期通知
+        a.notifications.retain(|(ts, _)| now_local - ts < 5000.0);
+
         // —— 跑 egui：在同一 ctx.run 内绘制 HUD + 玩家列表 + 名牌 + 聊天浮窗 + 聊天框 + 暂停菜单 ——
         let App {
             ref egui_ctx,
@@ -2155,6 +2183,10 @@ fn render_game_frame(
             // 1) HUD（左上角统计面板受 hud.show_stats 开关控制；准星 / hotbar / 提示栏照常）
             if let Some(hud) = hud_data.as_ref() {
                 draw_hud(ctx, hud.clone());
+            }
+            // 1b) 游戏内通知浮窗（信令错误等，5 秒自动消失）
+            if !active_notifications.is_empty() {
+                draw_toast_notifications(ctx, &active_notifications);
             }
             // 2) 玩家列表
             ui::players::draw_player_list(ctx, &player_list_entries);
@@ -2997,6 +3029,33 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                         }
                     });
                 });
+        });
+}
+
+/// 在屏幕顶部居中绘制通知浮窗（信令错误等），5 秒自动消失。
+/// 多条通知从上到下堆叠，半透明深色背景 + 橙红色文字。
+fn draw_toast_notifications(ctx: &egui::Context, messages: &[String]) {
+    egui::Area::new(egui::Id::new("toast_notifications"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                for msg in messages {
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgba_unmultiplied(40, 20, 20, 200))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .show(ui, |ui| {
+                            ui.set_max_width(420.0);
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .color(egui::Color32::from_rgb(240, 140, 120))
+                                    .size(14.0),
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+            });
         });
 }
 
