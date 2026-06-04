@@ -6,7 +6,7 @@
 //! 还提供"Connecting…"视图：[`draw_connecting`]。
 
 use crate::app::GameMode;
-use crate::storage::{WorldSummary, format_creation_time};
+use crate::storage::{QuotaInfo, WorldSummary, format_creation_time, format_storage_bytes};
 use voxweb_net::{LoadingStep, StepStatus};
 
 /// Cargo 在构建 `voxweb-client` 时从 Cargo.toml 注入的包版本。
@@ -63,6 +63,8 @@ pub struct LobbyState {
     // —— 存档选择 ——
     /// 已保存的世界列表（按创建时间倒序）
     pub saved_worlds: Vec<WorldSummary>,
+    /// 浏览器存储配额概览，用于大厅显示"已用 / 总空间"。
+    pub storage_quota: Option<QuotaInfo>,
     /// 是否正在加载存档列表
     pub saves_loading: bool,
     /// 是否已完成首次加载（防止空存档时无限循环加载）
@@ -80,6 +82,7 @@ impl Default for LobbyState {
             error_message: None,
             last_generated_room: None,
             saved_worlds: Vec::new(),
+            storage_quota: None,
             saves_loading: false,
             saves_loaded: false,
             selected_save: None,
@@ -252,6 +255,34 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             // —— 我的存档区块 ——
             ui.separator();
             ui.add_space(8.0);
+            if let Some(quota) = state.storage_quota {
+                let color = if quota.usage_ratio() > 0.95 {
+                    egui::Color32::from_rgb(240, 100, 100)
+                } else if quota.usage_ratio() > 0.80 {
+                    egui::Color32::from_rgb(230, 190, 90)
+                } else {
+                    egui::Color32::from_rgb(150, 195, 165)
+                };
+                ui.colored_label(
+                    color,
+                    format!(
+                        "Storage: {} / {}",
+                        format_storage_bytes(quota.usage),
+                        format_storage_bytes(quota.quota)
+                    ),
+                );
+            } else if state.saves_loading {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 130, 140),
+                    "Storage: Loading...",
+                );
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 130, 140),
+                    "Storage: Unavailable",
+                );
+            }
+            ui.add_space(8.0);
             let save_count = state.saved_worlds.len();
             let header_text = if state.saves_loading {
                 "My Saves (Loading...)".to_string()
@@ -276,12 +307,14 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             for world in &state.saved_worlds {
                 let is_selected = state.selected_save.as_deref() == Some(&world.key);
                 let time_str = format_creation_time(&world.key);
+                let world_label =
+                    format!("{} · {}", time_str, format_storage_bytes(world.used_bytes));
 
                 // horizontal 内容居中：先测量文字宽度，再算间距
                 let text_w = ui
                     .painter()
                     .layout_no_wrap(
-                        time_str.clone(),
+                        world_label.clone(),
                         egui::FontId::proportional(14.0),
                         egui::Color32::WHITE,
                     )
@@ -297,7 +330,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
                     if avail > content_w {
                         ui.add_space((avail - content_w) / 2.0);
                     }
-                    let radio = egui::RadioButton::new(is_selected, &time_str);
+                    let radio = egui::RadioButton::new(is_selected, &world_label);
                     if ui.add(radio).clicked() {
                         action = Some(LobbyAction::SelectSave {
                             key: Some(world.key.clone()),

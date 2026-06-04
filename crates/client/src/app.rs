@@ -322,6 +322,12 @@ pub struct Game {
     /// Phase 8：Local/Host 的 OPFS 存储句柄。Remote 不写存档。
     pub storage: Option<OpfsStorage>,
     pub known_persisted: HashSet<voxweb_core::ChunkPos>,
+    /// 当前世界在 OPFS 中已落盘的字节数（world.json + chunk 文件）。
+    pub current_world_bytes: u64,
+    /// 除当前世界以外，世界列表中其它存档的总字节数。
+    pub other_worlds_bytes: u64,
+    /// 当前世界每个已落盘 chunk 文件的大小，保存成功后用于增量修正 HUD 数据。
+    pub persisted_chunk_sizes: HashMap<voxweb_core::ChunkPos, u64>,
     pub last_persist_ms: f64,
     pub quota: Option<QuotaInfo>,
     pub storage_error: Option<String>,
@@ -477,6 +483,9 @@ impl Game {
             server_clock_synced: false,
             storage: None,
             known_persisted: HashSet::new(),
+            current_world_bytes: 0,
+            other_worlds_bytes: 0,
+            persisted_chunk_sizes: HashMap::new(),
             last_persist_ms: 0.0,
             quota: None,
             storage_error: None,

@@ -100,6 +100,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 ```
 
 底部版本号由 `env!("CARGO_PKG_VERSION")` 读取当前客户端包版本；由于 `crates/client/Cargo.toml` 继承 workspace 版本，实际来源是根 [`Cargo.toml`](../../Cargo.toml) 的 `[workspace.package].version`。
+大厅"我的存档"区域还会显示浏览器存储 `已用 / 总空间`，并在每个世界条目后显示该世界自己的 OPFS 占用空间（`world.json + chunks/*.bin`）。
 
 ### 交互
 
@@ -232,9 +233,11 @@ FPS: 60.2
 VISIBLE / CULLED / DRAW_V/I
 MESH ms / jobs / Phase2→Greedy 顶点
 PASS world / player / selection / ui ms
+SAVE 当前世界占用 / (总空间 - 其它世界占用)
 ```
 
 仅在 `app.settings.show_stats == true` 显示（暂停菜单可切换）。Phase 7 起左上角统计面板也显示视锥剔除数量、draw 顶点/索引数、网格化批次耗时和各 pass 的 CPU 编码耗时。
+空间数值由 `format_storage_bytes` 统一格式化，保留一位小数并在 B/KB/MB/GB/TB 间自适应切换。
 
 ### 右上角：玩家列表
 
@@ -358,7 +361,7 @@ egui::Area::new(egui::Id::new("hud_hotbar"))
 │   ☑ 显示统计信息                              │
 │   ☐ 启用 Depth Pre-Pass                       │
 │                                              │
-│   [继续游戏]    [退出到大厅]                    │
+│   [立即保存]    [继续游戏]    [退出到大厅]       │
 └──────────────────────────────────────────────┘
 ```
 
@@ -392,6 +395,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
             ui.add_space(20.0);
             ui.horizontal(|ui| {
+                if ui.button("立即保存").clicked() {
+                    app.save_now();
+                }
                 if ui.button("继续游戏").clicked() {
                     app.resume_game();
                 }
@@ -407,7 +413,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 > **Phase 6 实装差异**：
 > - 上图与示例代码里的「☐ 启用 Depth Pre-Pass」复选框**Phase 6 内未暴露**，留到 Phase 8 的多 Pass 重构一起加（届时整个渲染管线会切到 Render Graph）。当前 [`crates/client/src/ui/pause.rs`](../../crates/client/src/ui/pause.rs) 只渲染 FOV / 灵敏度 / 渲染距离 / 插值延迟 / 显示统计 5 项。
-> - 实际函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 切回大厅 / 重新请求指针锁。
+> - 实际函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, SaveNow, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 立即保存 / 切回大厅 / 重新请求指针锁。
 > - 设置在 `Resume` / `ExitToLobby` 时通过 [`settings_storage::save`](../../crates/client/src/settings_storage.rs) 写入 localStorage（键 `voxweb.settings.v1`，JSON 编码 + schema 版本头）。下次进入大厅时由 `settings_storage::load()` 读回，失败回退 `AppSettings::default()`。
 
 ---
