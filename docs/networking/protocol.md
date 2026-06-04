@@ -180,6 +180,7 @@ if let Some(full) = assembler.ingest(pos, frag_index, frag_total, payload) {
 - `PeerConnection::send()` 发送后检查 `bufferedAmount`，超过 **1 MB 高水位**时设置暂停标志
 - 暂停后该 peer 的 reliable 消息被推迟到下帧发送，等待 `onbufferedamountlow` 事件清除暂停标志
 - `host_route_outbox()` 返回流控阻塞的未发送消息，由 `flush_server_outbox()` 重新入队 server.outbox
+- 中继模式额外使用 Worker 下发的 `max_rate` 做客户端本地令牌桶节流（默认按 80% 留余量）；高视距产生的大量 `ChunkSnapshot` 会分帧发送，避免触发 `relay_closed{reason:"rate_limit"}`
 
 ---
 

@@ -405,7 +405,7 @@ DO 收到客户端帧后：
 | 单 payload 大小 | ≤ 64 KB（不含 4B 头） | `relay_closed{reason:"msg_too_large"}` |
 | 发送速率 | 200 msg/s 令牌桶 | `relay_closed{reason:"rate_limit"}` |
 
-参数在 `relay_active` 中下发（`max_msg_size` / `max_rate`），客户端可读取但当前仅作展示用，限速由 DO 强制执行。
+参数在 `relay_active` 中下发（`max_msg_size` / `max_rate`）。DO 仍做最终强制限制；客户端 Host 端也会按 `max_rate` 建本地令牌桶并留约 20% 余量，把高视距产生的大量 `ChunkSnapshot` 分帧送出，避免正常预载触发 `rate_limit`。
 
 ### 关闭与清理
 

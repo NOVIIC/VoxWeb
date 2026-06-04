@@ -174,6 +174,8 @@ impl SignalingClient {
 }
 ```
 
+`RelayActive.max_rate` 会被 Host 端记录为本地中继发送令牌桶的上限；`host_route_outbox()` 在真正调用 `send_relay_binary()` 前预扣 token，预算不足时把当前及后续 outbox 消息推迟到下一帧，避免高视距 ChunkSnapshot 突发触发 Worker 的 `rate_limit`。
+
 **注意**：`web_sys::WebSocket` 的事件回调通过 `Closure<dyn FnMut(...)>` 注册，回调内只能 `inbox.borrow_mut().push_back(event)`，不能直接做长时间工作（保持回调短）。
 
 ---
