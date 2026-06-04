@@ -328,6 +328,8 @@ pub struct Game {
     pub other_worlds_bytes: u64,
     /// 当前世界每个已落盘 chunk 文件的大小，保存成功后用于增量修正 HUD 数据。
     pub persisted_chunk_sizes: HashMap<voxweb_core::ChunkPos, u64>,
+    /// 暂停菜单 "Save Now" 请求下一帧持久化泵立即 flush，并在完成后显示提示。
+    pub save_now_requested: bool,
     pub last_persist_ms: f64,
     pub quota: Option<QuotaInfo>,
     pub storage_error: Option<String>,
@@ -486,6 +488,7 @@ impl Game {
             current_world_bytes: 0,
             other_worlds_bytes: 0,
             persisted_chunk_sizes: HashMap::new(),
+            save_now_requested: false,
             last_persist_ms: 0.0,
             quota: None,
             storage_error: None,

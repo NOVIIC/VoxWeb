@@ -320,7 +320,7 @@ window.add_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())
 ```rust
 if ui.button("立即保存").clicked() {
     let all = persistence.snapshot_dirty(usize::MAX);
-    // ... encode + save_chunks（同步反馈进度条）
+    // ... encode + save_chunks，完成后显示 "Save complete" 顶部提示
 }
 ```
 

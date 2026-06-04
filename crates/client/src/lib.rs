@@ -278,6 +278,13 @@ fn return_to_lobby(a: &mut App) {
     mark_lobby_saves_stale(a);
 }
 
+fn push_notification(a: &mut App, message: impl Into<String>) {
+    a.notifications.push((now_ms(), message.into()));
+    if a.notifications.len() > 8 {
+        a.notifications.remove(0);
+    }
+}
+
 // ============================================================
 // 主循环 & 事件
 // ============================================================
@@ -1913,12 +1920,7 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             log::warn!("[net] signaling error: {msg}");
             // InGame 状态下将错误推入通知队列，让玩家在游戏内看到浮窗提示
             if matches!(a.state, AppState::InGame { .. }) {
-                let now = now_ms();
-                a.notifications.push((now, msg.clone()));
-                // 最多保留 8 条通知，超出时移除最旧的
-                if a.notifications.len() > 8 {
-                    a.notifications.remove(0);
-                }
+                push_notification(&mut a, msg.clone());
             }
             a.connecting_error = Some(msg);
         }
@@ -2413,6 +2415,7 @@ fn render_game_frame(
             }
             ui::pause::PauseAction::SaveNow => {
                 if let Some(g) = a.game.as_mut() {
+                    g.save_now_requested = true;
                     g.last_persist_ms = 0.0;
                 }
             }
@@ -2605,7 +2608,15 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         let Some(g) = a.game.as_mut() else {
             return;
         };
-        if matches!(g.mode, GameMode::Remote) || now - g.last_persist_ms < 1000.0 {
+        let save_now = g.save_now_requested;
+        if matches!(g.mode, GameMode::Remote) {
+            if save_now {
+                g.save_now_requested = false;
+                push_notification(&mut a, "Remote worlds are saved by the host");
+            }
+            return;
+        }
+        if !save_now && now - g.last_persist_ms < 1000.0 {
             return;
         }
         if let Some(q) = g.quota {
@@ -2616,10 +2627,14 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 .set_quota_pause_dirty(q.usage_ratio() > 0.95);
         }
         let Some(storage) = g.storage.clone() else {
+            if save_now {
+                g.save_now_requested = false;
+                push_notification(&mut a, "Save unavailable");
+            }
             return;
         };
         let tick = g.server.borrow().world.tick_count;
-        if !g.server.borrow().world.persistence.should_flush(tick) {
+        if !save_now && !g.server.borrow().world.persistence.should_flush(tick) {
             return;
         }
         let positions = g
@@ -2627,8 +2642,20 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             .borrow_mut()
             .world
             .persistence
-            .snapshot_dirty(4, tick);
+            .snapshot_dirty(if save_now { usize::MAX } else { 4 }, tick);
         if positions.is_empty() {
+            if save_now {
+                let dirty = g.server.borrow().world.persistence.dirty_len();
+                let in_flight = g.server.borrow().world.persistence.in_flight_len();
+                g.save_now_requested = false;
+                if dirty == 0 && in_flight == 0 {
+                    push_notification(&mut a, "Save complete");
+                } else if in_flight > 0 {
+                    push_notification(&mut a, "Save already in progress");
+                } else {
+                    push_notification(&mut a, "Save will retry soon");
+                }
+            }
             return;
         }
         let server = g.server.clone();
@@ -2644,11 +2671,21 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 }
             }
         }
+        g.save_now_requested = false;
         g.last_persist_ms = now;
-        Some((storage, server, positions, encoded, encoded_sizes, tick))
+        Some((
+            storage,
+            server,
+            positions,
+            encoded,
+            encoded_sizes,
+            tick,
+            save_now,
+        ))
     };
 
-    let Some((storage, server, positions, encoded, encoded_sizes, tick)) = maybe_job else {
+    let Some((storage, server, positions, encoded, encoded_sizes, tick, save_now)) = maybe_job
+    else {
         return;
     };
     let app_ref = app.clone();
@@ -2680,10 +2717,20 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                         g.quota = Some(quota);
                     }
                 }
+                if save_now && matches!(a.state, AppState::InGame { .. }) {
+                    push_notification(&mut a, "Save complete");
+                }
             }
             Err(e) => {
                 log::warn!("[storage] save failed: {e:?}");
                 s.world.persistence.record_flush_failure(&positions, tick);
+                drop(s);
+                if save_now {
+                    let mut a = app_ref.borrow_mut();
+                    if matches!(a.state, AppState::InGame { .. }) {
+                        push_notification(&mut a, format!("Save failed: {e:?}"));
+                    }
+                }
             }
         }
     });
