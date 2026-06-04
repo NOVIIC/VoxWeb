@@ -22,13 +22,15 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带点击时玩家位置
+pub const PROTOCOL_VERSION: u32 = 6; // Phase 8: Host 视距上限同步
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
 
 | 版本 | 变化 |
 |---|---|
+| v6 (Phase 8) | `Welcome` 增加 `host_render_distance: u32`；`ChunkRequest` 增加 `center` / `render_distance`；新增 `HostSettings` 用于 Host 视距变化通知 |
+| v5 (Phase 8) | 新增 `ClientMessage::ChunkRequest { chunks: Vec<ChunkPos> }`；Remote 移动或渲染距离变化时向 Host 请求视距内缺失区块 |
 | v4 (Phase 8) | `Break` / `Place` 增加 `input_tick: u32` 与 `player_position: Vec3`；Host 用点击时玩家脚底位置校验挖放范围，避免高 RTT / unreliable 丢包时用旧位置误拒 |
 | v3 (Phase 8) | `PlayerSnapshot` 增加 `last_input_tick: u32`；客户端用它对齐预测历史，避免高延迟下把旧回声当成当前位置校正 |
 | v2 (Phase 6) | Welcome 增加 `host_entity_id: u32` + `players: Vec<PlayerEntry>`；新增 `PlayerEntry { entity_id, display_name }` |
@@ -43,6 +45,7 @@ pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带
 |---|---|---|---|---|
 | `Hello` | reliable | 一次（连接建立后） | `display_name: String, version: u32` | 加入握手 |
 | `PlayerInput` | unreliable | 60Hz | `tick: u32, position: Vec3, yaw: f32, pitch: f32` | 玩家移动同步；`tick` 是该客户端本地单调递增的输入序号 |
+| `ChunkRequest` | reliable | 按需 | `center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>` | Remote 请求 Host 发送自己有效视距内缺失的 chunk |
 | `Break` | reliable | 按需 | `pos: Position, request_id: u32, input_tick: u32, player_position: Vec3` | 挖方块；携带点击时脚底位置用于高延迟范围校验 |
 | `Place` | reliable | 按需 | `pos: Position, block: BlockID, request_id: u32, input_tick: u32, player_position: Vec3` | 放方块；携带点击时脚底位置用于高延迟范围/重叠校验 |
 | `Chat` | reliable | 按需 | `content: String` | 文字聊天（≤ 256 字符） |
@@ -53,7 +56,7 @@ pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带
 
 | 消息 | 通道 | 频率 | 字段 | 接收对象 | 说明 |
 |---|---|---|---|---|---|
-| `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单） |
+| `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单；v6 起含 Host 视距上限） |
 | `ChunkSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 chunk 数据，分片 |
 | `BlockUpdate` | reliable | 按需 | `pos: Position, block: BlockID` | 广播 | 单方块变更 |
 | `ActionAck` | reliable | 应答 | `request_id: u32, accepted: bool, reason: AckReason` | 单一 | 挖放应答 |
@@ -62,6 +65,7 @@ pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带
 | `PeerLeft` | reliable | 按需 | `entity_id: u32` | 广播 | 玩家离开通告 |
 | `Chat` | reliable | 按需 | `from: u32, content: String` | 广播 | 聊天广播 |
 | `Pong` | unreliable | 应答 | `client_time_ms: u64, server_time_ms: u64` | 单一 | Ping 应答 |
+| `HostSettings` | reliable | 按需 | `render_distance: u32` | 广播 | Host 视距变化；Remote 更新有效视距上限 |
 | `Kick` | reliable | 按需 | `reason: String` | 单一 | 主机踢人（v2） |
 
 ### 字段类型说明
@@ -75,6 +79,7 @@ pub const PROTOCOL_VERSION: u32 = 4; // Phase 8 (2026-06-01): Break/Place 携带
 | `String` | UTF-8，bincode 默认带 varint 长度前缀 |
 | `u32 request_id` | 客户端单调递增，用于 ActionAck 配对 |
 | `PlayerInput.tick` | 客户端本地 60Hz 输入序号，用于服务端丢弃乱序输入，也用于客户端协调 |
+| `ChunkRequest.render_distance` | Remote 已按 Host 上限裁剪后的有效视距；Host 再取 `min(request, host_render_distance)` 做最终校验 |
 | `Break/Place.input_tick` | 玩家点击时已生成的最新本地输入序号；用于日志/调试，并允许 Host 判断该操作来自哪个预测时刻 |
 | `Break/Place.player_position` | 玩家点击时的脚底位置；Host 用它做挖放距离和放置重叠校验，避免可靠操作包先于最新 `PlayerInput` 到达时被旧位置误拒 |
 | `PlayerTick.tick` | 服务端 60Hz 累计 tick，用于远端插值、调试和 UI |
@@ -96,12 +101,11 @@ DataChannel 双通道 OPEN
    │── (reliable) Hello{name, version} ─▶
    │                                       验证 version
    │                                       server.add_player → entity_id
-   │◀── (reliable) Welcome{entity_id, server_tick, world_seed}
+   │◀── (reliable) Welcome{entity_id, server_tick, world_seed, host_render_distance}
    │
-   │   ┌── (reliable) ChunkSnapshot pos=(0,0) frag 0/3 ─▶ │
-   │◀──┤── (reliable) ChunkSnapshot pos=(0,0) frag 1/3 ─▶ │
-   │   └── (reliable) ChunkSnapshot pos=(0,0) frag 2/3 ─▶ │
-   │   ... 渲染距离内全部 chunk ...
+   │◀── (reliable) bootstrap ChunkSnapshot（出生点默认半径）
+   │── (reliable) ChunkRequest{chunks=[视距内缺失区块]} ─▶
+   │◀── (reliable) ChunkSnapshot 分片（补齐 Remote 视距）
    │
    │◀── (reliable) PeerJoined{entity_id=X, name="Alice"}（其它老玩家收到）
    │
@@ -114,7 +118,13 @@ DataChannel 双通道 OPEN
 
 ## 五、Chunk 快照同步
 
-加入新成员时 Host 把渲染距离内所有 chunks 发给该成员。
+Remote 客户端应始终维护自己视距范围内的 chunk 集合。
+
+- 加入房间时 Host 先推送出生点附近的 bootstrap 快照（当前半径 6），让默认设置能尽快预载。
+- Remote 收到 `Welcome` 后计算有效视距 `effective_render_distance = min(local_render_distance, host_render_distance)`，按该半径请求缺失区块；渲染距离大于 bootstrap 半径时会立刻请求外圈。
+- InGame 后 Remote 每次跨 chunk 边界或渲染距离变化，都会重新计算 desired 集合，只请求尚未加载且不在 in-flight 的缺失区块。
+- Host 收到请求后先确认请求中心离服务端记录的玩家位置足够近，再按 `min(request.render_distance, host_render_distance)` 校验每个 chunk，合法才 `ensure_chunk_generated` 并用 `ChunkSnapshot` 分片回传。
+- Host 修改自身视距时广播 `HostSettings`；Remote 收到后立即更新有效视距并在下一帧卸载超出范围的本地缓存。
 
 ### palette+RLE 压缩编码
 
@@ -273,6 +283,7 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 | `PlayerInput` | 24 字节 | varint 后 |
 | `PlayerTick`（4 玩家，delta） | ~30-120 字节 | delta 模式下多数 tick 只含 0-2 个玩家 |
 | `PlayerTick`（8 玩家，全量） | ~220 字节 | 每 0.5s 强制全量 |
+| `ChunkRequest`（一次移动外圈） | 100-400 字节 | 请求中心 + 有效视距 + 缺失 `ChunkPos` 列表；完整视距首包最多约 441 个 chunk |
 | `Break/Place` | 16-20 字节 | |
 | `BlockUpdate` | 16 字节 | |
 | `ChunkSnapshot`（典型地形 chunk） | 2-5 KB | palette+RLE 压缩后；通常不需分片 |
@@ -280,7 +291,7 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 | `Chat`（短消息） | 30-100 字节 | |
 | `ActionAck` | 12 字节 | |
 
-初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB）。
+bootstrap 初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB）。渲染距离更大时，Remote 会通过 `ChunkRequest` 只补请求外圈。
 
 ---
 
@@ -302,7 +313,7 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 ## 十一、Future Work（v2/v3）
 
 - 操作日志同步（让 Remote 重放 BlockUpdate 历史，避免重复全量同步）
-- 区块按需请求（Remote 走远后请求新 chunk，而非加入时一次性发全部）
+- ~~区块按需请求~~ ✅ 已实现（Remote 按视距发送 `ChunkRequest`）
 - 端到端加密（双重保险）
 - 更复杂的 Welcome 流程（双向能力协商，如纹理包版本）
 - ~~Delta 玩家广播~~ ✅ 已实现（见 §六.1）

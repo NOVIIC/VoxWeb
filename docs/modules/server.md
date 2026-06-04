@@ -31,7 +31,7 @@
 | **Phase 3 ✅** | `physics::validate_break/place`（6m 射程 + AABB overlap）；`Server::players` 最小 tracker（feat Hello 插入 + PlayerInput 更新）；Break/Place 调 validate → ActionAck + BlockUpdate 闭环 |
 | **Phase 4 ✅** | Server 不变；`net` 层新增 Host/Remote 角色以 P2P 转发 ClientMessage/ServerMessage；Server 通过 `handle_message` 闭包被 `NetEndpoint::poll` 驱动处理 peer 消息 |
 | Phase 5 ✅ | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`outbox` + `Recipient` 路由；OPFS 持久化整体延后至 Phase 8 |
-| Phase 8 | 补 Phase 5 延后的持久化全套（chunk encode/decode、OpfsStorage、PersistenceManager、LRU、迁移框架、配额 UI） |
+| Phase 8 | 补 Phase 5 延后的持久化全套（chunk encode/decode、OpfsStorage、PersistenceManager、LRU、迁移框架、配额 UI）；新增 `ChunkRequest` 处理与 Host 视距上限同步 |
 
 下面 §3 起描述的是**完整设计**；每节遇到 Phase 3+ 才引入的字段会用 `> Phase N` 注明。
 
@@ -332,6 +332,8 @@ pub fn tick(&mut self) {
 > **Phase 3 ✅**：`validate_break/place` 接入；`players` 表由 Hello/PlayerInput 维护。实际实现见 [`crates/server/src/lib.rs`](../../crates/server/src/lib.rs)。
 >
 > **Phase 5**：补 `broadcast_tick`（PlayerTick）+ `send_initial_snapshot` + `Recipient` + outbox。
+>
+> **Phase 8**：补 `ChunkRequest`，让 Remote 移动后继续请求 Host 的新区块。
 
 `Server::handle_client_message` 的核心 dispatch（Phase 5 完整版）：
 
@@ -345,6 +347,11 @@ match msg {
     }
     ClientMessage::PlayerInput { tick, position, yaw, pitch } => {
         self.handle_player_input(sender, tick, position, yaw, pitch);
+    }
+    ClientMessage::ChunkRequest { center, render_distance, chunks } => {
+        // 去重、限制单包数量，并确认请求中心没有明显远离该玩家服务端位置；
+        // 每个 chunk 还要在 min(render_distance, host_render_distance) 内才会回传。
+        self.handle_chunk_request(sender, center, render_distance, chunks);
     }
     ClientMessage::Break { pos, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
@@ -375,11 +382,11 @@ match msg {
 
 ---
 
-## 九、初始快照同步
+## 九、初始与按需快照同步
 
 > **Phase 5** 引入（与 ChunkSnapshot 分片协议一起）。Phase 2 单人模式不走该路径：客户端通过 `Rc<RefCell<Server>>` 共享读 `server.world`，由 `ChunkLoader` 自身触发 `ensure_chunk_generated`。
 
-新玩家 `Hello` → `Welcome` 之后，Server 把当前所有已加载 chunk 通过 `ChunkSnapshot` 分片发给该玩家（仅该玩家，`Recipient::One`）。
+新玩家 `Hello` → `Welcome` 之后，Server 先把出生点附近 bootstrap 半径内的 chunk 通过 `ChunkSnapshot` 分片发给该玩家（仅该玩家，`Recipient::One`）。bootstrap 半径不会超过 Host 的视距。Remote 端随后按 `min(local_render_distance, host_render_distance)` 计算缺失区块，发送 `ChunkRequest` 补齐外圈；进入游戏后每次跨 chunk 边界继续按这个机制请求新区块。
 
 伪代码：
 ```rust
@@ -399,6 +406,24 @@ fn send_initial_snapshot(&mut self, recipient: EntityId) {
                 }));
             }
         }
+    }
+}
+```
+
+按需请求伪代码：
+
+```rust
+fn handle_chunk_request(&mut self, recipient: EntityId, center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>) {
+    let player_center = chunk_pos_of_world(self.players[&recipient].position);
+    if chebyshev_distance(center, player_center) > CHUNK_REQUEST_CENTER_GRACE {
+        return;
+    }
+    let allowed_radius = min(render_distance, self.host_render_distance);
+    for pos in unique(chunks).take(CHUNK_REQUEST_MAX_BATCH) {
+        if chebyshev_distance(pos, center) > allowed_radius {
+            continue;
+        }
+        self.send_chunk_snapshot(recipient, pos);
     }
 }
 ```

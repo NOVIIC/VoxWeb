@@ -172,6 +172,8 @@ pub enum ClientMessage {
     Hello { display_name: String, version: u32 },
     /// 玩家移动同步（高频，走 unreliable 通道）
     PlayerInput { tick: u32, position: glam::Vec3, yaw: f32, pitch: f32 },
+    /// Remote 请求 Host 发送有效视距内缺失的 chunk。
+    ChunkRequest { center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos> },
     /// 方块挖掘。input_tick / player_position 表示玩家点击时的本地预测状态，
     /// Host 用它避免高延迟下最新 PlayerInput 还没到达造成范围误判。
     Break { pos: Position, request_id: u32, input_tick: u32, player_position: glam::Vec3 },
@@ -187,7 +189,7 @@ pub enum ClientMessage {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// 加入握手响应（含玩家 entity_id 与 server tick）
-    Welcome { entity_id: u32, server_tick: u32, world_seed: u64 },
+    Welcome { entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry> },
     /// 全量 Chunk 数据（分片）
     ChunkSnapshot { pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8> },
     /// 单方块更新
@@ -203,6 +205,8 @@ pub enum ServerMessage {
     Chat { from: u32, content: String },
     /// 心跳响应
     Pong { client_time_ms: u64, server_time_ms: u64 },
+    /// Host 视距变化，Remote 据此更新自己的有效视距上限。
+    HostSettings { render_distance: u32 },
 }
 
 /// 房间会话事件（信令层产生，给 client 用）

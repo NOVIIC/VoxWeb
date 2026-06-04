@@ -12,9 +12,8 @@ use crate::chunk::{ChunkPos, Position};
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v4（Phase 8）：Break/Place 携带点击时 input_tick 与 player_position，
-/// 让 Host 在高延迟下按玩家实际点击时的位置做挖放范围校验。
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v6（Phase 8）：Welcome 携带 Host 视距，ChunkRequest 带请求中心与有效视距。
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// ChunkSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -64,6 +63,19 @@ pub enum ClientMessage {
         yaw: f32,
         pitch: f32,
     },
+    /// 请求 Host 发送指定区块快照。
+    ///
+    /// Remote 端只保存自己视距范围内的区块；当玩家进入新 chunk 或渲染距离变化时，
+    /// 客户端计算缺失区块列表并通过 reliable 通道请求。Host 收到后按需生成，
+    /// 再用 [`ServerMessage::ChunkSnapshot`] 分片回传。
+    ChunkRequest {
+        /// Remote 当前用于计算 desired 集合的中心 chunk。
+        center: ChunkPos,
+        /// Remote 已经按 Host 上限裁剪后的有效视距。
+        render_distance: u32,
+        /// 本次请求的缺失 chunk 列表。
+        chunks: Vec<ChunkPos>,
+    },
     /// 挖掘方块请求
     Break {
         pos: Position,
@@ -103,6 +115,8 @@ pub enum ServerMessage {
         server_tick: u32,
         world_seed: u64,
         host_entity_id: u32,
+        /// Host 当前允许 Remote 使用的最大视距（单位：chunk）。
+        host_render_distance: u32,
         players: Vec<PlayerEntry>,
     },
     /// 全量 Chunk 快照（分片传输，接收端按 frag_index 组装）
@@ -140,6 +154,8 @@ pub enum ServerMessage {
         client_time_ms: u64,
         server_time_ms: u64,
     },
+    /// Host 视距变化。Remote 收到后更新自身有效视距上限。
+    HostSettings { render_distance: u32 },
 }
 
 /// 信令层产生的事件（给 client 状态机消费）。
@@ -273,6 +289,7 @@ mod tests {
             server_tick: 0,
             world_seed: 123456789,
             host_entity_id: 1,
+            host_render_distance: 6,
             players: Vec::new(),
         });
     }
@@ -285,6 +302,7 @@ mod tests {
             server_tick: 600,
             world_seed: 0xDEADBEEF,
             host_entity_id: 1,
+            host_render_distance: 6,
             players: vec![
                 PlayerEntry {
                     entity_id: 1,
@@ -303,9 +321,18 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_four() {
-        // Phase 8 高延迟挖放优化为 v4；任何破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn roundtrip_chunk_request() {
+        roundtrip(&ClientMessage::ChunkRequest {
+            center: ChunkPos::new(0, 0),
+            render_distance: 6,
+            chunks: vec![ChunkPos::new(0, 0), ChunkPos::new(-3, 5)],
+        });
+    }
+
+    #[test]
+    fn protocol_version_is_six() {
+        // Phase 8 Host 视距上限同步为 v6；任何破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -335,6 +362,11 @@ mod tests {
             accepted: false,
             reason: AckReason::OutOfRange,
         });
+    }
+
+    #[test]
+    fn roundtrip_host_settings() {
+        roundtrip(&ServerMessage::HostSettings { render_distance: 4 });
     }
 
     #[test]

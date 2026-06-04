@@ -181,7 +181,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 两个 Tab 看到同一个世界。Host 是权威，Remote 通过快照 + tick 同步。
 
 ### 涉及文档
-- [`modules/server.md`](modules/server.md)（add_player, send_initial_snapshot）
+- [`modules/server.md`](modules/server.md)（add_player, send_initial_snapshot, handle_chunk_request）
 - [`networking/protocol.md`](networking/protocol.md)
 - [`networking/prediction.md`](networking/prediction.md)
 - [`features/persistence.md`](features/persistence.md)
@@ -190,6 +190,7 @@ Phase 0 ─▶ Phase 1 ─▶ Phase 2 ─▶ Phase 3 ─▶ Phase 4 ─▶ Phase
 - [x] `core::protocol` 完整消息定义 + bincode 配置（消息枚举 + PROTOCOL_VERSION + Recipient/OutboundMessage）
 - [x] Hello/Welcome 握手（add_player 分配 eid，Welcome 含 seed + eid）
 - [x] ChunkSnapshot 分片传输 + 接收端组装（ChunkAssembler）
+- [x] ChunkRequest 按需区块请求（Remote 移动后请求 Host 补齐有效视距；有效视距不超过 Host 视距）
 - [x] PlayerInput / PlayerTick 60Hz 收发
 - [x] `client::prediction` 自身位置预测协调（InputHistory + reconcile_self）
 - [x] `client::interp` 远端玩家位置插值（PlayerInterp, delay=100ms）
