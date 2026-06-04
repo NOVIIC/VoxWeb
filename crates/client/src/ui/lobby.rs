@@ -9,6 +9,9 @@ use crate::app::GameMode;
 use crate::storage::{WorldSummary, format_creation_time};
 use voxweb_net::{LoadingStep, StepStatus};
 
+/// Cargo 在构建 `voxweb-client` 时从 Cargo.toml 注入的包版本。
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// 大厅按钮触发的动作。lib.rs 主循环消费。
 ///
 /// Phase 6：所有进入游戏的动作都额外携带 `display_name`，从大厅顶部的昵称输入框抓取，
@@ -111,7 +114,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
             ui.add_space(8.0);
             ui.colored_label(
                 egui::Color32::from_rgb(160, 170, 180),
-                "Browser Voxel Sandbox (Phase 4)",
+                "Browser Voxel Sandbox",
             );
 
             ui.add_space(40.0);
@@ -349,7 +352,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
         .show(ctx, |ui| {
             ui.colored_label(
                 egui::Color32::from_rgb(100, 110, 120),
-                "VoxWeb 0.1.0 · Phase 4",
+                format!("VoxWeb {APP_VERSION}"),
             );
         });
 
