@@ -220,7 +220,7 @@ pub enum ChannelKind { Reliable, Unreliable }
 
 | 通道 | 配置 | 用途 |
 |---|---|---|
-| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | ChunkSnapshot, BlockUpdate, Chat, Hello/Welcome, ActionAck, Join/Leave |
+| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | ChunkRequest, ChunkSnapshot, HostSettings, BlockUpdate, Chat, Hello/Welcome, ActionAck, Join/Leave |
 | `unreliable` | `ordered: false, maxRetransmits: 0, maxPacketLifeTime: null` | PlayerInput, PlayerTick, Ping/Pong |
 
 `maxRetransmits: 0` 实现"发出去就完事"，丢失不重传，适合频繁的位置广播。
@@ -379,10 +379,12 @@ impl RoomSession {
 |---|---|---|
 | `ClientMessage::Hello` | reliable | 不能丢，需 ack |
 | `ClientMessage::PlayerInput` | unreliable | 60Hz 高频，丢一两帧不影响 |
+| `ClientMessage::ChunkRequest` | reliable | Remote 缺失区块必须送达 |
 | `ClientMessage::Break/Place` | reliable | 一次性操作必须送达 |
 | `ClientMessage::Chat` | reliable | 同上 |
 | `ClientMessage::Ping` | unreliable | 时延探测，丢失忽略 |
 | `ServerMessage::Welcome` | reliable | 必须送达 |
+| `ServerMessage::HostSettings` | reliable | Host 视距上限变化，必须送达 |
 | `ServerMessage::ChunkSnapshot` | reliable | 不能丢、按序 |
 | `ServerMessage::BlockUpdate` | reliable | 状态不可丢 |
 | `ServerMessage::ActionAck` | reliable | 必须送达 |

@@ -15,7 +15,7 @@ pub mod physics;
 pub mod terrain;
 pub mod world;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::Vec3;
 
@@ -93,6 +93,8 @@ pub struct Server {
     /// 房间主机的 entity_id（首次 `add_player` 时设；用于 Welcome 标识 Host）。
     /// Local-Only 模式下也会被设为 FIRST_ENTITY_ID，行为一致。
     host_entity_id: Option<EntityId>,
+    /// Host 当前允许 Remote 使用的最大视距（单位：chunk）。
+    host_render_distance: u32,
     /// 出站消息队列（带 Recipient 标签）。
     /// `handle_message` / `add_player` / `broadcast_tick` 都向此队列追加，
     /// 由调用方（Local 直接消费 / Host 通过 net 层路由）每帧 `drain_outbox()` 取走。
@@ -110,7 +112,19 @@ pub const FIRST_ENTITY_ID: EntityId = 1;
 pub const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
 
 /// 初始 ChunkSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
-const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
+pub const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
+/// Host 默认视距（与 AppSettings 默认值保持一致）。
+pub const DEFAULT_HOST_RENDER_DISTANCE: u32 = INITIAL_SNAPSHOT_RADIUS as u32;
+/// Remote 单次区块请求最多处理多少个 chunk。
+/// 当前设置 UI 最大渲染距离为 10，一次完整视距请求为 21×21=441 个 chunk；
+/// 512 能覆盖完整首包，同时避免恶意客户端单包塞入无限列表。
+const CHUNK_REQUEST_MAX_BATCH: usize = 512;
+/// Remote 请求中心最多允许领先服务端记录位置多少个 chunk。
+/// `ChunkRequest` 与 `PlayerInput` 分属 reliable/unreliable 通道，可能先后倒置；
+/// 留 2 个 chunk 的余量避免刚跨边界时误拒合法请求。
+const CHUNK_REQUEST_CENTER_GRACE: i32 = 2;
+/// 绝对上限兜底，避免异常设置或恶意包请求过大半径。
+const CHUNK_REQUEST_MAX_DISTANCE: i32 = 16;
 
 /// Delta 广播：位置变化距离平方阈值（0.01m² ≈ 0.1m 位移）。
 const DELTA_POS_THRESHOLD_SQ: f32 = 0.0001;
@@ -138,6 +152,7 @@ impl Server {
             current_time_ms: 0,
             next_entity_id: FIRST_ENTITY_ID,
             host_entity_id: None,
+            host_render_distance: DEFAULT_HOST_RENDER_DISTANCE,
             outbox: VecDeque::new(),
             chat_window: HashMap::new(),
         }
@@ -146,6 +161,24 @@ impl Server {
     /// 由 Host 主循环每帧更新（performance.now() 毫秒）；Pong/PlayerTick 中带回。
     pub fn set_clock(&mut self, ms: u64) {
         self.current_time_ms = ms;
+    }
+
+    /// 设置 Host 允许 Remote 使用的最大视距。
+    ///
+    /// Host 暂停菜单修改渲染距离后会调用这里。若房间已经有玩家，
+    /// 变化会广播 `HostSettings`，让 Remote 立即收紧自己的有效视距。
+    pub fn set_host_render_distance(&mut self, render_distance: u32) {
+        let render_distance = render_distance.max(1);
+        if self.host_render_distance == render_distance {
+            return;
+        }
+        self.host_render_distance = render_distance;
+        if self.host_entity_id.is_some() {
+            self.enqueue(
+                Recipient::All,
+                ServerMessage::HostSettings { render_distance },
+            );
+        }
     }
 
     /// 每帧 tick（60Hz）：推进 world tick + 把当前所有玩家位置打包成 PlayerTick 广播。
@@ -197,6 +230,7 @@ impl Server {
                 server_tick: self.tick,
                 world_seed: self.seed,
                 host_entity_id: host_eid,
+                host_render_distance: self.host_render_distance,
                 players: roster,
             },
         );
@@ -214,7 +248,10 @@ impl Server {
             (DEFAULT_SPAWN.x as i32).div_euclid(CHUNK_X as i32),
             (DEFAULT_SPAWN.z as i32).div_euclid(CHUNK_Z as i32),
         );
-        self.send_initial_snapshot(eid, spawn_chunk, INITIAL_SNAPSHOT_RADIUS);
+        let snapshot_radius = self
+            .host_render_distance
+            .min(INITIAL_SNAPSHOT_RADIUS as u32) as i32;
+        self.send_initial_snapshot(eid, spawn_chunk, snapshot_radius);
 
         eid
     }
@@ -279,6 +316,13 @@ impl Server {
                 player.yaw = yaw;
                 player.pitch = pitch;
                 player.last_input_tick = tick;
+            }
+            ClientMessage::ChunkRequest {
+                center,
+                render_distance,
+                chunks,
+            } => {
+                self.handle_chunk_request(entity_id, center, render_distance, chunks);
             }
             ClientMessage::Break {
                 pos,
@@ -462,32 +506,88 @@ impl Server {
         for dx in -radius..=radius {
             for dz in -radius..=radius {
                 let pos = ChunkPos::new(center.x + dx, center.z + dz);
-                self.world.ensure_chunk_generated(pos);
-                let Some(chunk) = self.world.chunks.get(&pos) else {
-                    continue;
-                };
-                let bytes = match voxweb_core::chunk::encode_chunk(&chunk.blocks) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::warn!("[server] encode chunk {pos:?} failed: {e}");
-                        continue;
-                    }
-                };
-                let total_len = bytes.len();
-                let frag_count = total_len.div_ceil(CHUNK_SNAPSHOT_PAYLOAD_MAX).max(1);
-                debug_assert!(frag_count <= u16::MAX as usize, "chunk too big");
-                for (i, chunk_bytes) in bytes.chunks(CHUNK_SNAPSHOT_PAYLOAD_MAX).enumerate() {
-                    self.enqueue(
-                        Recipient::One(recipient),
-                        ServerMessage::ChunkSnapshot {
-                            pos,
-                            frag_index: i as u16,
-                            frag_total: frag_count as u16,
-                            payload: chunk_bytes.to_vec(),
-                        },
-                    );
-                }
+                self.send_chunk_snapshot(recipient, pos);
             }
+        }
+    }
+
+    /// 处理 Remote 的按需区块请求。
+    ///
+    /// 这里做两个轻量防护：单包处理数量上限，以及只能请求服务端记录位置附近的 chunk。
+    /// 真正的可靠性仍由 DataChannel reliable 保证；客户端侧会记录 in-flight，避免每帧重复请求。
+    fn handle_chunk_request(
+        &mut self,
+        entity_id: EntityId,
+        center: ChunkPos,
+        render_distance: u32,
+        chunks: Vec<ChunkPos>,
+    ) {
+        let Some(player_center) = self
+            .players
+            .get(&entity_id)
+            .map(|p| chunk_pos_of_world(p.position))
+        else {
+            return;
+        };
+        if chunk_distance(center, player_center) > CHUNK_REQUEST_CENTER_GRACE {
+            log::debug!(
+                "[server] ignore chunk request with far center: eid={entity_id} center={center:?} player_center={player_center:?}"
+            );
+            return;
+        }
+
+        let allowed_radius = render_distance
+            .min(self.host_render_distance)
+            .min(CHUNK_REQUEST_MAX_DISTANCE as u32) as i32;
+        let mut seen = HashSet::new();
+        let mut processed = 0usize;
+        let mut sent = 0usize;
+        for pos in chunks {
+            if processed >= CHUNK_REQUEST_MAX_BATCH {
+                break;
+            }
+            if !seen.insert(pos) {
+                continue;
+            }
+            processed += 1;
+            if chunk_distance(pos, center) > allowed_radius {
+                log::debug!(
+                    "[server] ignore far chunk request: eid={entity_id} pos={pos:?} center={center:?} allowed_radius={allowed_radius}"
+                );
+                continue;
+            }
+            self.send_chunk_snapshot(entity_id, pos);
+            sent += 1;
+        }
+        log::debug!("[server] chunk request: eid={entity_id} processed={processed} sent={sent}");
+    }
+
+    /// 把单个 chunk 编码并分片发给指定玩家。未生成时会先按世界种子生成。
+    fn send_chunk_snapshot(&mut self, recipient: EntityId, pos: ChunkPos) {
+        self.world.ensure_chunk_generated(pos);
+        let Some(chunk) = self.world.chunks.get(&pos) else {
+            return;
+        };
+        let bytes = match voxweb_core::chunk::encode_chunk(&chunk.blocks) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("[server] encode chunk {pos:?} failed: {e}");
+                return;
+            }
+        };
+        let total_len = bytes.len();
+        let frag_count = total_len.div_ceil(CHUNK_SNAPSHOT_PAYLOAD_MAX).max(1);
+        debug_assert!(frag_count <= u16::MAX as usize, "chunk too big");
+        for (i, chunk_bytes) in bytes.chunks(CHUNK_SNAPSHOT_PAYLOAD_MAX).enumerate() {
+            self.enqueue(
+                Recipient::One(recipient),
+                ServerMessage::ChunkSnapshot {
+                    pos,
+                    frag_index: i as u16,
+                    frag_total: frag_count as u16,
+                    payload: chunk_bytes.to_vec(),
+                },
+            );
         }
     }
 
@@ -522,6 +622,17 @@ impl Server {
         window.push_back(now);
         true
     }
+}
+
+fn chunk_pos_of_world(world_pos: Vec3) -> ChunkPos {
+    ChunkPos::new(
+        (world_pos.x as i32).div_euclid(CHUNK_X as i32),
+        (world_pos.z as i32).div_euclid(CHUNK_Z as i32),
+    )
+}
+
+fn chunk_distance(a: ChunkPos, b: ChunkPos) -> i32 {
+    (a.x - b.x).abs().max((a.z - b.z).abs())
 }
 
 #[cfg(test)]
@@ -660,6 +771,80 @@ mod handle_message_tests {
             "expired tick must not override"
         );
         assert_eq!(p.last_input_tick, 5);
+    }
+
+    #[test]
+    fn handle_message_chunk_request_generates_and_sends_snapshot() {
+        let mut server = Server::new(0);
+        server.set_host_render_distance(8);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        let requested = ChunkPos::new(7, 0);
+        assert!(!server.world.chunks.contains_key(&requested));
+        server.handle_message(
+            eid,
+            ClientMessage::ChunkRequest {
+                center: ChunkPos::new(0, 0),
+                render_distance: 8,
+                chunks: vec![requested],
+            },
+        );
+
+        assert!(server.world.chunks.contains_key(&requested));
+        let snapshot = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::One(e), ServerMessage::ChunkSnapshot { pos, .. })
+                    if *e == eid && *pos == requested
+            )
+        });
+        assert!(snapshot.is_some(), "missing requested ChunkSnapshot");
+    }
+
+    #[test]
+    fn handle_message_chunk_request_ignores_far_chunks() {
+        let mut server = Server::new(0);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        let far = ChunkPos::new(40, 0);
+        server.handle_message(
+            eid,
+            ClientMessage::ChunkRequest {
+                center: ChunkPos::new(0, 0),
+                render_distance: 10,
+                chunks: vec![far],
+            },
+        );
+
+        let snapshot = find_outbox(
+            &server,
+            |m| matches!(m.message, ServerMessage::ChunkSnapshot { pos, .. } if pos == far),
+        );
+        assert!(snapshot.is_none(), "far chunk request should be ignored");
+    }
+
+    #[test]
+    fn handle_message_chunk_request_is_capped_by_host_render_distance() {
+        let mut server = Server::new(0);
+        server.set_host_render_distance(4);
+        let eid = server.add_player("A".into());
+        server.drain_outbox();
+
+        let allowed = ChunkPos::new(4, 0);
+        let denied = ChunkPos::new(5, 0);
+        server.handle_message(
+            eid,
+            ClientMessage::ChunkRequest {
+                center: ChunkPos::new(0, 0),
+                render_distance: 10,
+                chunks: vec![allowed, denied],
+            },
+        );
+
+        assert!(server.world.chunks.contains_key(&allowed));
+        assert!(!server.world.chunks.contains_key(&denied));
     }
 
     /// 把 chunk(0,0) 的一柱方块设置好，便于挖放测试。
@@ -879,6 +1064,23 @@ mod handle_message_tests {
     }
 
     #[test]
+    fn set_host_render_distance_broadcasts_after_host_exists() {
+        let mut server = Server::new(0);
+        let _ = server.add_player("Alice".into());
+        server.drain_outbox();
+
+        server.set_host_render_distance(4);
+
+        let settings = find_outbox(&server, |m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (Recipient::All, ServerMessage::HostSettings { render_distance }) if *render_distance == 4
+            )
+        });
+        assert!(settings.is_some(), "missing HostSettings broadcast");
+    }
+
+    #[test]
     fn welcome_carries_full_roster_and_host_eid() {
         let mut server = Server::new(0);
         let alice = server.add_player("Alice".into());
@@ -897,10 +1099,12 @@ mod handle_message_tests {
         match msg {
             ServerMessage::Welcome {
                 host_entity_id,
+                host_render_distance,
                 players,
                 ..
             } => {
                 assert_eq!(host_entity_id, alice, "host_eid should be Alice");
+                assert_eq!(host_render_distance, DEFAULT_HOST_RENDER_DISTANCE);
                 let mut names: Vec<_> = players.iter().map(|p| p.display_name.as_str()).collect();
                 names.sort_unstable();
                 assert_eq!(names, vec!["Alice", "Bob"]);

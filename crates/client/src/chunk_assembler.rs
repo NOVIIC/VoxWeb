@@ -1,6 +1,6 @@
 //! ChunkSnapshot 分片组装器。
 //!
-//! Host 用 `send_initial_snapshot` 把每个 chunk 的 bincode 编码结果切片发送；
+//! Host 用 bootstrap 快照或 `ChunkRequest` 响应把每个 chunk 的 bincode 编码结果切片发送；
 //! Remote 端接收时通过本模块按 ChunkPos 汇集，齐了返回 concatenated bytes。
 //!
 //! Phase 5：不关心具体编码格式；解码（Vec<BlockID> → Chunk）在上层 `apply_server_message` 做。

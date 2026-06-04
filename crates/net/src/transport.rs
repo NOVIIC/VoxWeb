@@ -1,7 +1,7 @@
 //! 通道分配与消息序列化辅助。
 //!
 //! 两条 DataChannel：
-//! - `reliable`   (ordered + reliable):   Hello/Welcome、ChunkSnapshot、BlockUpdate、ActionAck、Chat、PeerJoined/Left
+//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、ChunkRequest/ChunkSnapshot、BlockUpdate、ActionAck、Chat、PeerJoined/Left
 //! - `unreliable` (unordered + 0 retransmits): PlayerInput、PlayerTick、Ping/Pong
 //!
 //! 选择依据见 docs/networking/protocol.md §三 通道列。
@@ -22,6 +22,7 @@ pub fn channel_for_client_message(msg: &ClientMessage) -> ChannelKind {
     match msg {
         ClientMessage::PlayerInput { .. } | ClientMessage::Ping { .. } => ChannelKind::Unreliable,
         ClientMessage::Hello { .. }
+        | ClientMessage::ChunkRequest { .. }
         | ClientMessage::Break { .. }
         | ClientMessage::Place { .. }
         | ClientMessage::Chat { .. } => ChannelKind::Reliable,
@@ -33,6 +34,7 @@ pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
     match msg {
         ServerMessage::PlayerTick { .. } | ServerMessage::Pong { .. } => ChannelKind::Unreliable,
         ServerMessage::Welcome { .. }
+        | ServerMessage::HostSettings { .. }
         | ServerMessage::ChunkSnapshot { .. }
         | ServerMessage::BlockUpdate { .. }
         | ServerMessage::ActionAck { .. }
@@ -101,6 +103,14 @@ mod tests {
             }),
             ChannelKind::Reliable
         );
+        assert_eq!(
+            channel_for_client_message(&ClientMessage::ChunkRequest {
+                center: voxweb_core::ChunkPos::new(0, 0),
+                render_distance: 2,
+                chunks: vec![voxweb_core::ChunkPos::new(1, -2)],
+            }),
+            ChannelKind::Reliable
+        );
     }
 
     #[test]
@@ -111,8 +121,13 @@ mod tests {
                 server_tick: 0,
                 world_seed: 0,
                 host_entity_id: 1,
+                host_render_distance: 6,
                 players: Vec::new(),
             }),
+            ChannelKind::Reliable
+        );
+        assert_eq!(
+            channel_for_server_message(&ServerMessage::HostSettings { render_distance: 6 }),
             ChannelKind::Reliable
         );
         assert_eq!(

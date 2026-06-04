@@ -288,6 +288,9 @@ pub struct Game {
     /// Phase 6：房间主机的 entity_id（Local-Only / Host 模式 = 自己；Remote 模式由 Welcome 填）。
     /// 0 表示尚未知晓（Remote 端 Welcome 到达前的瞬态）。
     pub host_entity_id: EntityId,
+    /// Host 允许 Remote 使用的最大视距。Remote 在 Welcome/HostSettings 后填入；
+    /// Local/Host 模式等于自己的设置。
+    pub host_render_distance: u32,
     /// Phase 6：聊天历史（含本地合成的系统消息）。
     pub chat: ChatHistory,
     /// Phase 4：RTT（毫秒）。`None` 表示未测过 / 上次 Ping 还没回。Local 模式永远 None。
@@ -332,6 +335,7 @@ impl Game {
         let server = Rc::new(RefCell::new(Server::new(seed)));
         let eid = {
             let mut s = server.borrow_mut();
+            s.set_host_render_distance(settings.render_distance);
             let id = s.add_player(display_name.to_string());
             let _ = s.drain_outbox();
             id
@@ -349,6 +353,7 @@ impl Game {
         game.entity_id = eid;
         // Local-Only：自己即 Host，立即填 host_entity_id 让 UI 不显示"未知主机"瞬态。
         game.host_entity_id = eid;
+        game.host_render_distance = game.settings.render_distance;
         game
     }
 
@@ -364,6 +369,7 @@ impl Game {
         let server = Rc::new(RefCell::new(Server::new(seed)));
         let eid = {
             let mut s = server.borrow_mut();
+            s.set_host_render_distance(settings.render_distance);
             let id = s.add_player(display_name.to_string());
             let _ = s.drain_outbox();
             id
@@ -382,6 +388,7 @@ impl Game {
         game.entity_id = eid;
         // Host：自己即 Host，host_entity_id 直接填。
         game.host_entity_id = eid;
+        game.host_render_distance = game.settings.render_distance;
         Ok(game)
     }
 
@@ -398,7 +405,7 @@ impl Game {
         // server_inbox 在 Remote 模式不参与驱动；为保持 Game 字段不可空，造一对空 mpsc
         let (_net_local, dummy_inbox) = NetEndpoint::new_local_pair();
         let net = NetEndpoint::new_remote(signaling_url, room_id, display_name)?;
-        Ok(Self::assemble(
+        let mut game = Self::assemble(
             GameMode::Remote,
             server,
             dummy_inbox,
@@ -406,7 +413,15 @@ impl Game {
             settings,
             display_name.to_string(),
             room_id.to_string(),
-        ))
+        );
+        let spawn_center = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
+        let bootstrap_radius = game
+            .chunk_loader
+            .render_distance
+            .min(voxweb_server::INITIAL_SNAPSHOT_RADIUS);
+        game.chunk_loader
+            .mark_requested_square(spawn_center, bootstrap_radius);
+        Ok(game)
     }
 
     fn assemble(
@@ -445,6 +460,7 @@ impl Game {
             entity_id: 0, // 由 add_player（Local/Host）或 Welcome（Remote）填
             display_name,
             host_entity_id: 0, // Local/Host 模式在 new_* 里立即填；Remote 等 Welcome 回填
+            host_render_distance: 0,
             chat: ChatHistory::default(),
             rtt_ms: None,
             last_ping_sent_ms: 0.0,
@@ -474,11 +490,28 @@ impl Game {
         self.interp
             .set_delay_ms(self.settings.interp_delay_ms as f64);
         self.chunk_loader
-            .set_render_distance(self.settings.render_distance);
-        self.server
-            .borrow_mut()
-            .world
-            .set_chunk_cache_capacity(self.settings.chunk_cache_capacity);
+            .set_render_distance(self.effective_render_distance());
+        {
+            let mut server = self.server.borrow_mut();
+            server
+                .world
+                .set_chunk_cache_capacity(self.settings.chunk_cache_capacity);
+            if matches!(self.mode, GameMode::Local | GameMode::Host) {
+                server.set_host_render_distance(self.settings.render_distance);
+                self.host_render_distance = self.settings.render_distance;
+            }
+        }
+    }
+
+    /// 当前实际使用的区块视距。
+    ///
+    /// Remote 端不能超过 Host 视距；Local/Host 端直接使用自己的设置。
+    pub fn effective_render_distance(&self) -> u32 {
+        if self.mode == GameMode::Remote && self.host_render_distance > 0 {
+            self.settings.render_distance.min(self.host_render_distance)
+        } else {
+            self.settings.render_distance
+        }
     }
 }
 

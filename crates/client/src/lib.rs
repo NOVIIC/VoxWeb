@@ -39,7 +39,7 @@ use crate::app::{
     AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
 };
 use crate::camera::CameraMode;
-use crate::chunk_loader::affected_chunks;
+use crate::chunk_loader::{affected_chunks, chunk_pos_of};
 use crate::input::InputState;
 use crate::mesh_jobs::{MeshPriority, MeshRunStats};
 use crate::prediction::{
@@ -1355,6 +1355,23 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
                     renderer,
                 );
                 drop(server_mut);
+            } else if game.entity_id != 0 {
+                let mut server_mut = game.server.borrow_mut();
+                let requests = game.chunk_loader.update_remote(
+                    voxweb_server::DEFAULT_SPAWN,
+                    &mut server_mut,
+                    &mut game.mesh_jobs,
+                    renderer,
+                );
+                drop(server_mut);
+                if !requests.is_empty() {
+                    log::debug!("[remote] request {} spawn preload chunks", requests.len());
+                    game.net.send_client_message(ClientMessage::ChunkRequest {
+                        center: chunk_pos_of(voxweb_server::DEFAULT_SPAWN),
+                        render_distance: game.chunk_loader.render_distance.max(0) as u32,
+                        chunks: requests,
+                    });
+                }
             }
 
             // 运行网格化（预载期间用 16ms 预算，比正常 4ms 更大）
@@ -1365,6 +1382,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
             // 统计已接收和已网格化的区块数
             let spawn_center = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
             let r = game.chunk_loader.render_distance;
+            preload.total = ((2 * r + 1) * (2 * r + 1)) as usize;
             let mut received = 0usize;
             let mut meshed = 0usize;
             for dx in -r..=r {
@@ -1744,7 +1762,7 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             // 网络连接完成，启动区块预载（不再直接进 InGame）
             if a.state == AppState::Connecting {
                 if let Some(ref game) = a.game {
-                    let rd = game.settings.render_distance as i32;
+                    let rd = game.chunk_loader.render_distance;
                     let total = ((2 * rd + 1) * (2 * rd + 1)) as usize;
                     a.preload_state = Some(PreloadState {
                         total,
@@ -2032,8 +2050,9 @@ fn render_game_frame(
         )
     };
 
-    // —— 5. ChunkLoader 滚动（仅 Local / Host；Remote 由 ChunkSnapshot / BlockUpdate 驱动） ——
-    if mode != GameMode::Remote {
+    // —— 5. ChunkLoader 滚动 ——
+    // Local/Host 直接生成；Remote 只请求缺失 chunk，由 Host 回 ChunkSnapshot。
+    {
         let mut a = app.borrow_mut();
         let App {
             ref mut renderer,
@@ -2044,8 +2063,28 @@ fn render_game_frame(
             return Ok(());
         };
         let mut server_mut = game.server.borrow_mut();
-        game.chunk_loader
-            .update(camera_pos, &mut server_mut, &mut game.mesh_jobs, renderer);
+        if mode == GameMode::Remote {
+            if game.entity_id != 0 {
+                let requests = game.chunk_loader.update_remote(
+                    camera_pos,
+                    &mut server_mut,
+                    &mut game.mesh_jobs,
+                    renderer,
+                );
+                drop(server_mut);
+                if !requests.is_empty() {
+                    log::debug!("[remote] request {} chunks near camera", requests.len());
+                    game.net.send_client_message(ClientMessage::ChunkRequest {
+                        center: chunk_pos_of(camera_pos),
+                        render_distance: game.chunk_loader.render_distance.max(0) as u32,
+                        chunks: requests,
+                    });
+                }
+            }
+        } else {
+            game.chunk_loader
+                .update(camera_pos, &mut server_mut, &mut game.mesh_jobs, renderer);
+        }
     }
 
     // —— 6. mesh_jobs run_until_budget ——
@@ -2659,19 +2698,37 @@ fn ingest_server_clock_sample(game: &mut Game, estimated_offset_ms: f64, alpha: 
     game.server_clock_offset_ms = game.server_clock_offset_ms * (1.0 - a) + estimated_offset_ms * a;
 }
 
+fn apply_host_render_distance(game: &mut Game, host_render_distance: u32) {
+    let capped = host_render_distance.max(1);
+    let before = game.chunk_loader.render_distance;
+    game.host_render_distance = capped;
+    game.apply_settings();
+    let after = game.chunk_loader.render_distance;
+    if game.mode == GameMode::Remote && before != after {
+        log::info!(
+            "[remote] effective render distance capped by host: requested={} host={} effective={}",
+            game.settings.render_distance,
+            capped,
+            after
+        );
+    }
+}
+
 fn apply_server_message(game: &mut Game, msg: ServerMessage) {
     match msg {
         ServerMessage::Welcome {
             entity_id,
             world_seed,
             host_entity_id,
+            host_render_distance,
             players,
             ..
         } => {
             game.entity_id = entity_id;
             game.host_entity_id = host_entity_id;
+            apply_host_render_distance(game, host_render_distance);
             log::info!(
-                "Welcome v2: entity_id={entity_id}, seed={world_seed}, host={host_entity_id}, roster_size={}",
+                "Welcome v3: entity_id={entity_id}, seed={world_seed}, host={host_entity_id}, host_rd={host_render_distance}, roster_size={}",
                 players.len()
             );
             // 写入 roster：除自己以外的玩家进入 remote_players
@@ -2693,6 +2750,9 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 game.server.borrow_mut().world.chunks.clear();
             }
         }
+        ServerMessage::HostSettings { render_distance } => {
+            apply_host_render_distance(game, render_distance);
+        }
         ServerMessage::ChunkSnapshot {
             pos,
             frag_index,
@@ -2707,6 +2767,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     Ok(blocks) => {
                         let chunk = voxweb_core::chunk::Chunk { blocks };
                         game.server.borrow_mut().world.chunks.insert(pos, chunk);
+                        game.chunk_loader.mark_loaded(pos);
                         // 自己 + 相邻 8 个 chunk 都重 mesh
                         for dz in -1..=1i32 {
                             for dx in -1..=1i32 {

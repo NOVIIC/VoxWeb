@@ -18,6 +18,7 @@ pub struct ChunkLoader {
     pub render_distance: i32,
     pub unload_buffer: i32,
     pub loaded: HashSet<ChunkPos>,
+    requested: HashSet<ChunkPos>,
     last_center: Option<ChunkPos>,
 }
 
@@ -27,6 +28,7 @@ impl ChunkLoader {
             render_distance: render_distance as i32,
             unload_buffer: 3,
             loaded: HashSet::new(),
+            requested: HashSet::new(),
             last_center: None,
         }
     }
@@ -101,6 +103,91 @@ impl ChunkLoader {
         }
 
         true
+    }
+
+    /// Remote 模式的区块滚动加载。
+    ///
+    /// Remote 没有权威地形生成权，只维护本地缓存集合：缺失 chunk 通过
+    /// `ClientMessage::ChunkRequest` 向 Host 请求；Host 回传 `ChunkSnapshot` 后，
+    /// 调用 [`ChunkLoader::mark_loaded`] 把它从 in-flight 集合移到 loaded 集合。
+    pub fn update_remote(
+        &mut self,
+        camera_pos: Vec3,
+        server: &mut Server,
+        mesh_jobs: &mut MeshJobQueue,
+        renderer: &mut Renderer,
+    ) -> Vec<ChunkPos> {
+        let center = chunk_pos_of(camera_pos);
+        let center_changed = Some(center) != self.last_center;
+        if center_changed {
+            self.last_center = Some(center);
+        }
+
+        let mut requests = Vec::new();
+        if center_changed {
+            let r = self.render_distance;
+            let desired: HashSet<ChunkPos> = (-r..=r)
+                .flat_map(|dx| (-r..=r).map(move |dz| ChunkPos::new(center.x + dx, center.z + dz)))
+                .collect();
+
+            for pos in desired.difference(&self.loaded).copied() {
+                if self.requested.insert(pos) {
+                    requests.push(pos);
+                }
+            }
+        }
+
+        // Remote 也要卸载远离视距的本地 world/mesh，否则长途移动会无限增长。
+        let unload_r = self.render_distance + self.unload_buffer;
+        let to_unload: Vec<ChunkPos> = self
+            .loaded
+            .iter()
+            .copied()
+            .filter(|p| chebyshev_distance(*p, center) > unload_r)
+            .collect();
+        for pos in to_unload {
+            server.world.unload_chunk(pos);
+            mesh_jobs.cancel(pos);
+            renderer.drop_chunk_mesh(pos);
+            self.loaded.remove(&pos);
+        }
+
+        // 已经飞出缓冲范围但尚未返回的请求直接忘掉；若快照稍后到达，
+        // 下一次 update_remote 会按当前位置把它清理出缓存。
+        let stale_requests: Vec<ChunkPos> = self
+            .requested
+            .iter()
+            .copied()
+            .filter(|p| chebyshev_distance(*p, center) > unload_r)
+            .collect();
+        for pos in stale_requests {
+            self.requested.remove(&pos);
+        }
+
+        requests
+    }
+
+    /// 标记一个 Remote chunk 已收到完整快照。
+    pub fn mark_loaded(&mut self, pos: ChunkPos) {
+        self.loaded.insert(pos);
+        self.requested.remove(&pos);
+    }
+
+    /// 标记一个正方形范围的 chunk 已经有快照在路上。
+    ///
+    /// Host 当前仍会在玩家加入时主动推送出生点附近的 bootstrap 快照。
+    /// Remote 端把这批 chunk 记为 in-flight，后续按视距请求时只补缺口，
+    /// 避免初始阶段重复传同一批地图数据。
+    pub fn mark_requested_square(&mut self, center: ChunkPos, radius: i32) {
+        let r = radius.max(0);
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let pos = ChunkPos::new(center.x + dx, center.z + dz);
+                if !self.loaded.contains(&pos) {
+                    self.requested.insert(pos);
+                }
+            }
+        }
     }
 }
 

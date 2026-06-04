@@ -87,4 +87,4 @@ docs/
 3. **文档冲突**：以本 README 决策表为准；其余冲突时 `docs/architecture.md` > `docs/modules/*` > `docs/features/*` > 其它
 4. **代码注释**：必须加上详细的中文注释以供没有图形学基础的人学习，但架构说明只放文档不写进注释
 5. **API 变化**：WGPU 等库新版 API 可能有变化，注意查阅最新文档
-6. **代码检查**：完成代码编辑后必须要通过 fmt 和 clippy 检查
+6. **代码检查**：完成代码编辑后必须要通过 fmt 和 clippy --all-targets 检查
