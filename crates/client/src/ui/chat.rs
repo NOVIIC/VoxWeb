@@ -6,7 +6,22 @@
 //!
 //! 数据模型见 [`crate::chat::ChatHistory`]；UI 层仅做渲染与输入捕获，不负责发送 / 持久化。
 
+use std::borrow::Cow;
+
 use crate::chat::{ChatHistory, ChatKind};
+
+/// 聊天 UI 只按单行展示消息：自动换行由 Label 配置禁止，显式 CR/LF 也在显示层折成空格。
+fn single_line_text(text: &str) -> Cow<'_, str> {
+    if text.contains('\n') || text.contains('\r') {
+        Cow::Owned(
+            text.chars()
+                .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(text)
+    }
+}
 
 /// 聊天 UI 单帧返回的动作。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,22 +60,36 @@ pub fn draw_chat_window(ctx: &egui::Context, history: &mut ChatHistory) -> ChatU
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for msg in history.recent(50) {
-                                ui.horizontal_wrapped(|ui| match &msg.kind {
+                                // 一条聊天消息固定占一行；正文用 Extend 禁止自动换行，
+                                // 避免玩家名和消息内容在宽度边界附近被拆到两行。
+                                ui.horizontal(|ui| match &msg.kind {
                                     ChatKind::System => {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(160, 170, 180),
-                                            format!("[System] {}", msg.content),
+                                        let content = single_line_text(&msg.content);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("[System] {content}"))
+                                                    .color(egui::Color32::from_rgb(160, 170, 180)),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
                                         );
                                     }
                                     ChatKind::User { from_name, .. } => {
-                                        ui.label(
-                                            egui::RichText::new(format!("{from_name}: "))
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(220, 230, 240)),
+                                        let from_name = single_line_text(from_name);
+                                        let content = single_line_text(&msg.content);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{from_name}: "))
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(220, 230, 240)),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
                                         );
-                                        ui.label(
-                                            egui::RichText::new(&msg.content)
-                                                .color(egui::Color32::from_rgb(230, 235, 240)),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(content.as_ref())
+                                                    .color(egui::Color32::from_rgb(230, 235, 240)),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
                                         );
                                     }
                                 });
@@ -125,23 +154,37 @@ pub fn draw_recent_overlay(ctx: &egui::Context, history: &ChatHistory, now_ms: f
                     ChatKind::System => {
                         // 系统消息：淡灰色。
                         let color = egui::Color32::from_rgba_unmultiplied(170, 180, 195, alpha);
-                        ui.label(
-                            egui::RichText::new(format!("[System] {}", msg.content)).color(color),
+                        let content = single_line_text(&msg.content);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("[System] {content}")).color(color),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
                         );
                     }
                     ChatKind::User { from_name, .. } => {
                         // 用户消息：发送者加粗稍亮 + 内容白底。
+                        let from_name = single_line_text(from_name);
+                        let content = single_line_text(&msg.content);
                         let name_color =
                             egui::Color32::from_rgba_unmultiplied(235, 215, 130, alpha);
                         let body_color =
                             egui::Color32::from_rgba_unmultiplied(240, 240, 240, alpha);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{from_name}: "))
-                                    .strong()
-                                    .color(name_color),
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{from_name}: "))
+                                        .strong()
+                                        .color(name_color),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
                             );
-                            ui.label(egui::RichText::new(&msg.content).color(body_color));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(content.as_ref()).color(body_color),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                            );
                         });
                     }
                 }

@@ -545,6 +545,13 @@ fn forward_keydown_to_egui(
         ) {
             e.prevent_default();
         }
+        // egui 的 TextEdit 依赖 Text 事件插入字符；Space 同时也是功能键，
+        // 因此需要在没有组合键修饰时额外补一个文本空格，聊天输入框才能输入空格。
+        if egui_key == egui::Key::Space && !modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd {
+            egui_events
+                .borrow_mut()
+                .push(egui::Event::Text(" ".to_string()));
+        }
     } else if key_str.chars().count() == 1
         && !modifiers.ctrl
         && !modifiers.alt
