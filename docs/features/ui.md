@@ -418,6 +418,10 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 - T 键打开（`chat_open = true`）
 - Enter 提交并关闭
 - ESC 取消并关闭
+- 聊天输入接收普通文本事件；Space 既要转成 `egui::Event::Key(Key::Space)`，也要转成
+  `egui::Event::Text(" ")`，否则 `TextEdit` 只能感知按键状态，无法真正插入空格。
+- 聊天历史和最近消息浮窗按单行显示：Label 使用 `TextWrapMode::Extend`，显式 CR/LF
+  只在显示层折成空格，不改变协议里的原始消息内容。
 
 ### 布局
 
@@ -443,12 +447,13 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         .title_bar(false)
         .min_width(400.0)
         .show(ctx, |ui| {
-            // 历史
+            // 历史：一条消息固定渲染为单行，避免发送者名和正文在窄宽度下被拆行。
             egui::ScrollArea::vertical().max_height(200.0).stick_to_bottom(true).show(ui, |ui| {
                 for msg in app.chat.recent(50) {
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("{}: ", msg.from)).strong());
-                        ui.label(&msg.content);
+                        ui.add(egui::Label::new(&msg.content)
+                            .wrap_mode(egui::TextWrapMode::Extend));
                     });
                 }
             });
