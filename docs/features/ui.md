@@ -95,8 +95,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 │   └─────────────┘                            │
 │                                              │
 │  浏览器要求：Chrome/Edge/Safari 17+ 支持 WebGPU │
+│                         VoxWeb {Cargo version}│
 └──────────────────────────────────────────────┘
 ```
+
+底部版本号由 `env!("CARGO_PKG_VERSION")` 读取当前客户端包版本；由于 `crates/client/Cargo.toml` 继承 workspace 版本，实际来源是根 [`Cargo.toml`](../../Cargo.toml) 的 `[workspace.package].version`。
 
 ### 交互
 
