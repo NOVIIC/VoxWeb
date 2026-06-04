@@ -295,6 +295,9 @@ impl Renderer {
     /// 卸载远处 chunk 网格
     pub fn drop_chunk_mesh(&mut self, pos: ChunkPos);
 
+    /// 退出当前世界 / 进入新世界前清空所有世界渲染缓存
+    pub fn clear_world_cache(&mut self);
+
     /// 查询某个 chunk 是否已有 GPU mesh
     pub fn has_chunk_mesh(&self, pos: ChunkPos) -> bool;
 
@@ -327,7 +330,7 @@ impl Renderer {
 |---|---|---|
 | `Surface` / `Device` / `Queue` | `Renderer::new` 一次 | Tab 关闭 |
 | `depth_texture` | 启动 + 每次 resize | 重建时 |
-| `chunk_mesh_gpu` | `upload_chunk_mesh` | `drop_chunk_mesh`（玩家走远）/ chunk 修改时（重建） |
+| `chunk_mesh_gpu` | `upload_chunk_mesh` | `drop_chunk_mesh`（玩家走远）/ `clear_world_cache`（退出或切换世界）/ chunk 修改时（重建） |
 | Pass pipelines | 各 Pass `new` 一次 | 程序退出 |
 
 **Chunk 网格更新规则**：
