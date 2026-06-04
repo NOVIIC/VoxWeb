@@ -168,6 +168,16 @@ impl Renderer {
         self.transparent_meshes.remove(&pos);
     }
 
+    /// 清空当前世界上传过的渲染缓存。
+    ///
+    /// Renderer 跨 AppState 常驻；退出世界只销毁 client::Game 不会自动释放这里的
+    /// GPU 缓存，所以切换世界前必须显式清空，避免上一局内容继续参与绘制。
+    pub fn clear_world_cache(&mut self) {
+        self.chunk_meshes.clear();
+        self.transparent_meshes.clear();
+        self.player_pass.upload_instances(&self.queue, &[]);
+    }
+
     /// 查询某个 chunk 是否已有 GPU mesh。
     /// Phase 2 ChunkLoader 用其决定邻居是否需重网格化（跨区块剔除生效条件）。
     pub fn has_chunk_mesh(&self, pos: ChunkPos) -> bool {

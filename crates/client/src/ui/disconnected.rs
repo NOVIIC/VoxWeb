@@ -8,7 +8,7 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisconnectedAction {
     None,
-    /// 用户点了"返回大厅"。调用方设 `app.state = AppState::Lobby` 并清 `disconnect_reason`。
+    /// 用户点了"返回大厅"。调用方走统一的大厅重置流程。
     BackToLobby,
 }
 

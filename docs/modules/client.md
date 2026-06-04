@@ -172,6 +172,7 @@ struct App {
     disconnect_reason: Option<String>,
 
     game: Option<Game>,
+    world_session_id: u64,           // 每次进入/离开世界递增，用于丢弃旧异步回调
 
     last_time_ms: f64,
     fps_frames: u32, fps_accum: f32, fps_display: f32,
@@ -240,6 +241,12 @@ pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 ```
 
 > Phase 2 不引入 `world_view`：Local 模式下 mesh 回调直接借 `server.world.get_block_world`。Phase 5 加入 Remote 模式时才有 `WorldView` 副本（由 ChunkSnapshot 喂数据）。
+
+### 世界会话清理
+
+进入新世界或离开当前世界时，client 会递增 `world_session_id`，并清理 `Game`、区块预载状态、输入事件、性能统计与 `Renderer` 内的世界 GPU 缓存。OPFS 存档加载等异步任务在回写前必须比对启动时捕获的 `world_session_id`；若会话已变化，直接丢弃结果，避免“退出再进入”后旧世界的 chunk 或 mesh 混入新世界。
+
+返回大厅统一清空当前存档列表缓存并标记为未加载，让下一帧 Lobby 自动重新读取 OPFS 世界列表。
 
 ---
 
