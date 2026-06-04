@@ -126,6 +126,8 @@ struct App {
     disconnect_reason: Option<String>,
 
     game: Option<Game>,
+    /// 当前世界会话编号。进入 / 离开世界时递增，异步存档回写前用它识别过期结果。
+    world_session_id: u64,
 
     /// 上一帧 performance.now()（毫秒）
     last_time_ms: f64,
@@ -206,6 +208,7 @@ pub async fn start() -> Result<(), JsValue> {
         connecting_error: None,
         disconnect_reason: None,
         game: None,
+        world_session_id: 0,
         last_time_ms: now_ms(),
         fps_frames: 0,
         fps_accum: 0.0,
@@ -222,6 +225,57 @@ pub async fn start() -> Result<(), JsValue> {
     spawn_raf_loop(app);
 
     Ok(())
+}
+
+/// 递增世界会话编号。所有跨 await 的世界相关异步任务都应捕获编号，回写前再次比对。
+fn bump_world_session(a: &mut App) -> u64 {
+    a.world_session_id = a.world_session_id.wrapping_add(1);
+    a.world_session_id
+}
+
+/// 清掉当前世界运行时资源。Renderer 是跨状态常驻对象，必须显式清空世界 GPU 缓存。
+fn clear_world_runtime(a: &mut App) -> u64 {
+    let session_id = bump_world_session(a);
+    a.game = None;
+    a.preload_state = None;
+    a.request_pointer_lock_next = false;
+    a.relayed_peers.clear();
+    a.notifications.clear();
+    a.perf = FramePerfStats::default();
+    a.egui_events.borrow_mut().clear();
+    a.renderer.clear_world_cache();
+    a.input.borrow_mut().clear_held();
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        doc.exit_pointer_lock();
+    }
+    session_id
+}
+
+/// 开始新世界前的统一入口：先结束旧会话，再返回新会话编号给异步存档任务使用。
+fn prepare_world_start(a: &mut App) -> u64 {
+    let session_id = clear_world_runtime(a);
+    a.disconnect_reason = None;
+    a.connecting_error = None;
+    session_id
+}
+
+/// 回大厅时让下一帧 Lobby 重新读取 OPFS 世界列表，避免显示退出前的旧缓存。
+fn mark_lobby_saves_stale(a: &mut App) {
+    a.lobby_state.saves_loaded = false;
+    a.lobby_state.saves_loading = false;
+    a.lobby_state.saved_worlds.clear();
+    a.lobby_state.selected_save = None;
+}
+
+/// 所有“返回大厅”路径的统一收口。
+fn return_to_lobby(a: &mut App) {
+    clear_world_runtime(a);
+    a.state = AppState::Lobby;
+    a.disconnect_reason = None;
+    a.connecting_error = None;
+    a.connecting_room_id.clear();
+    a.connecting_mode = GameMode::Local;
+    mark_lobby_saves_stale(a);
 }
 
 // ============================================================
@@ -946,26 +1000,29 @@ fn start_single_player(
     let rd = game.settings.render_distance as i32;
     let total = ((2 * rd + 1) * (2 * rd + 1)) as usize;
 
-    let mut a = app.borrow_mut();
-    a.game = Some(game);
-    a.connecting_mode = GameMode::Local;
-    a.connecting_room_id = String::new();
-    a.connecting_error = None;
-    a.preload_state = Some(PreloadState {
-        total,
-        received: 0,
-        meshed: 0,
-        active: true,
-    });
-    a.state = AppState::Connecting;
-    log::info!("[local] 进入加载界面，开始区块预载 (total={total})");
-    drop(a);
+    let session_id = {
+        let mut a = app.borrow_mut();
+        let session_id = prepare_world_start(&mut a);
+        a.game = Some(game);
+        a.connecting_mode = GameMode::Local;
+        a.connecting_room_id = String::new();
+        a.connecting_error = None;
+        a.preload_state = Some(PreloadState {
+            total,
+            received: 0,
+            meshed: 0,
+            active: true,
+        });
+        a.state = AppState::Connecting;
+        log::info!("[local] 进入加载界面，开始区块预载 (total={total})");
+        session_id
+    };
 
     // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
     if let Some(key) = save_key {
-        attach_storage_for_load(app.clone(), key.to_string());
+        attach_storage_for_load(app.clone(), key.to_string(), session_id);
     } else {
-        attach_storage_for_new(app.clone(), seed);
+        attach_storage_for_new(app.clone(), seed, session_id);
     }
 }
 
@@ -1096,6 +1153,7 @@ fn start_host(
             game.camera.position = game.physics.eye_position();
             game.camera.pitch = -0.4;
 
+            let session_id = prepare_world_start(&mut a);
             a.game = Some(game);
             a.state = AppState::Connecting;
             a.connecting_mode = GameMode::Host;
@@ -1107,10 +1165,10 @@ fn start_host(
 
             // 如果有 save_key，使用 open_by_key 加载；否则创建新存档
             if let Some(key) = save_key {
-                attach_storage_for_load(app.clone(), key.to_string());
+                attach_storage_for_load(app.clone(), key.to_string(), session_id);
             } else {
                 // Host 模式：使用 room_id + seed 创建存档
-                attach_storage_async(app.clone(), room_id.to_string(), seed);
+                attach_storage_async(app.clone(), room_id.to_string(), seed, session_id);
             }
         }
         Err(e) => {
@@ -1144,6 +1202,7 @@ fn start_remote(app: &Rc<RefCell<App>>, room_id: &str, display_name: &str) {
             game.camera.position = game.physics.eye_position();
             game.camera.pitch = -0.4;
 
+            prepare_world_start(&mut a);
             a.game = Some(game);
             a.state = AppState::Connecting;
             a.connecting_mode = GameMode::Remote;
@@ -1159,7 +1218,7 @@ fn start_remote(app: &Rc<RefCell<App>>, room_id: &str, display_name: &str) {
     }
 }
 
-fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
+fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, session_id: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::open(&room_id, seed).await {
@@ -1186,6 +1245,10 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
                 }
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    log::debug!("[storage] 丢弃过期 Host 存档加载结果");
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     for (pos, chunk) in loaded {
                         g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
@@ -1199,6 +1262,9 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
             }
             Err(e) => {
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     g.storage_error = Some(format!("{e:?}"));
                 }
@@ -1208,7 +1274,7 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64) {
 }
 
 /// 创建新存档（用当前时间戳 + seed 生成 key）
-fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
+fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::create_new(seed).await {
@@ -1235,6 +1301,10 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
                 }
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    log::debug!("[storage] 丢弃过期新存档加载结果");
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     for (pos, chunk) in loaded {
                         g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
@@ -1248,6 +1318,9 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
             }
             Err(e) => {
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     g.storage_error = Some(format!("{e:?}"));
                 }
@@ -1257,7 +1330,7 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64) {
 }
 
 /// 通过 key 加载已有存档
-fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String) {
+fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) {
     wasm_bindgen_futures::spawn_local(async move {
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::open_by_key(&key).await {
@@ -1284,6 +1357,10 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String) {
                 }
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    log::debug!("[storage] 丢弃过期已有存档加载结果");
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     for (pos, chunk) in loaded {
                         g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
@@ -1297,6 +1374,9 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String) {
             }
             Err(e) => {
                 let mut a = app.borrow_mut();
+                if a.world_session_id != session_id {
+                    return;
+                }
                 if let Some(g) = a.game.as_mut() {
                     g.storage_error = Some(format!("{e:?}"));
                 }
@@ -1477,12 +1557,8 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
     };
 
     if matches!(cancel, Some(ConnectingAction::Cancel)) {
-        // 直接丢掉 game，回 Lobby
         let mut a = app.borrow_mut();
-        a.game = None;
-        a.preload_state = None;
-        a.state = AppState::Lobby;
-        a.connecting_error = None;
+        return_to_lobby(&mut a);
         return Ok(());
     }
 
@@ -1620,9 +1696,7 @@ fn render_disconnected_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result
 
     if matches!(action, ui::disconnected::DisconnectedAction::BackToLobby) {
         let mut a = app.borrow_mut();
-        a.state = AppState::Lobby;
-        a.disconnect_reason = None;
-        a.connecting_error = None;
+        return_to_lobby(&mut a);
         return Ok(());
     }
 
@@ -1780,13 +1854,11 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
         }
         RoomEvent::Disconnected { reason } => {
             log::warn!("[net] Disconnected: {reason}");
+            clear_world_runtime(&mut a);
             a.disconnect_reason = Some(reason.clone());
             a.connecting_error = Some(reason);
-            a.preload_state = None;
-            a.relayed_peers.clear();
             // Phase 6：Connecting / InGame 失联都跳到 Disconnected 页让用户看到原因
             a.state = AppState::Disconnected;
-            a.game = None;
         }
         RoomEvent::RemoteLeft { peer_id } => {
             log::info!("[net] RemoteLeft: peer {peer_id}");
@@ -2331,10 +2403,7 @@ fn render_game_frame(
     }
     if pause_exit_to_lobby {
         let mut a = app.borrow_mut();
-        a.game = None;
-        a.state = AppState::Lobby;
-        a.disconnect_reason = None;
-        a.preload_state = None;
+        return_to_lobby(&mut a);
         return Ok(());
     }
 
