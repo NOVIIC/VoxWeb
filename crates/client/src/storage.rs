@@ -3,6 +3,8 @@
 //! Phase 8 默认走 Variant A：主线程 async OPFS。这里不保存 `Chunk` 本体，
 //! 只保存 `voxweb_core::chunk::encode` 产出的字节，调用方负责 encode/decode。
 
+use std::collections::HashMap;
+
 use js_sys::{Array, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
@@ -64,6 +66,14 @@ pub struct WorldSummary {
     pub key: String,
     pub display_name: String,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub used_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StorageOverview {
+    pub worlds: Vec<WorldSummary>,
+    pub quota: Option<QuotaInfo>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -74,7 +84,6 @@ pub trait WorldStorage {
     async fn list_chunks(&self) -> Result<Vec<ChunkPos>, StorageError>;
     async fn load_chunk(&self, pos: ChunkPos) -> Result<Option<Vec<u8>>, StorageError>;
     async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError>;
-    async fn delete_world(&self) -> Result<(), StorageError>;
     async fn quota(&self) -> Option<QuotaInfo>;
 }
 
@@ -181,6 +190,26 @@ impl OpfsStorage {
         .ok()?;
         load_world_record(&root).await.ok().flatten()
     }
+
+    /// 获取当前世界每个 chunk 文件的持久化大小，供 HUD 增量维护世界占用。
+    pub async fn chunk_file_sizes(&self) -> Result<HashMap<ChunkPos, u64>, StorageError> {
+        chunk_file_sizes(&self.chunks_dir).await
+    }
+
+    /// 获取当前世界 `world.json` 的大小。文件不存在时按 0 处理。
+    pub async fn world_record_size(&self) -> Result<u64, StorageError> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await?;
+        match file_size(&root, "world.json").await {
+            Ok(size) => Ok(size),
+            Err(StorageError::NotFound) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl WorldStorage for OpfsStorage {
@@ -242,18 +271,6 @@ impl WorldStorage for OpfsStorage {
         Ok(())
     }
 
-    async fn delete_world(&self) -> Result<(), StorageError> {
-        let opts = FileSystemRemoveOptions::new();
-        opts.set_recursive(true);
-        JsFuture::from(
-            self.worlds_root
-                .remove_entry_with_options(&self.world_key, &opts),
-        )
-        .await
-        .map_err(js_error)?;
-        Ok(())
-    }
-
     async fn quota(&self) -> Option<QuotaInfo> {
         quota().await
     }
@@ -290,7 +307,21 @@ pub async fn list_saved_worlds() -> Result<Vec<WorldSummary>, StorageError> {
     let worlds_root = get_dir(&opfs_root, "voxweb", &create_dir).await?;
 
     let meta = load_meta(&worlds_root).await.unwrap_or_default();
-    Ok(meta.worlds)
+    let mut worlds = meta.worlds;
+    for world in &mut worlds {
+        world.used_bytes = world_size_bytes(&worlds_root, &world.key)
+            .await
+            .unwrap_or(0);
+    }
+    worlds.sort_by_key(|w| std::cmp::Reverse(w.updated_at_ms));
+    Ok(worlds)
+}
+
+/// 大厅一次性需要的存储概览：世界列表（含各自大小）+ 浏览器配额。
+pub async fn storage_overview() -> Result<StorageOverview, StorageError> {
+    let worlds = list_saved_worlds().await?;
+    let quota = quota().await;
+    Ok(StorageOverview { worlds, quota })
 }
 
 /// 删除指定世界（通过 key）
@@ -470,6 +501,7 @@ async fn update_meta(
         key: record.key.clone(),
         display_name: record.display_name.clone(),
         updated_at_ms: record.updated_at_ms,
+        used_bytes: 0,
     });
     meta.worlds
         .sort_by_key(|w| std::cmp::Reverse(w.updated_at_ms));
@@ -494,6 +526,94 @@ async fn load_meta(root: &FileSystemDirectoryHandle) -> Result<MetaRecord, Stora
     let text = String::from_utf8(Uint8Array::new(&buffer).to_vec())
         .map_err(|e| StorageError::Io(e.to_string()))?;
     serde_json::from_str(&text).map_err(|e| StorageError::Io(e.to_string()))
+}
+
+async fn world_size_bytes(
+    worlds_root: &FileSystemDirectoryHandle,
+    key: &str,
+) -> Result<u64, StorageError> {
+    let root = get_dir(worlds_root, key, &{
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(false);
+        opts
+    })
+    .await?;
+
+    let mut total = match file_size(&root, "world.json").await {
+        Ok(size) => size,
+        Err(StorageError::NotFound) => 0,
+        Err(e) => return Err(e),
+    };
+    let chunks_dir = match get_dir(&root, "chunks", &{
+        let opts = FileSystemGetDirectoryOptions::new();
+        opts.set_create(false);
+        opts
+    })
+    .await
+    {
+        Ok(dir) => dir,
+        Err(StorageError::NotFound) => return Ok(total),
+        Err(e) => return Err(e),
+    };
+    total = total.saturating_add(chunk_file_sizes(&chunks_dir).await?.values().sum::<u64>());
+    Ok(total)
+}
+
+async fn chunk_file_sizes(
+    chunks_dir: &FileSystemDirectoryHandle,
+) -> Result<HashMap<ChunkPos, u64>, StorageError> {
+    let mut out = HashMap::new();
+    let iter = chunks_dir.keys();
+    loop {
+        let next = JsFuture::from(iter.next().map_err(js_error)?)
+            .await
+            .map_err(js_error)?;
+        let done = Reflect::get(&next, &JsValue::from_str("done"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if done {
+            break;
+        }
+        let Some(name) = Reflect::get(&next, &JsValue::from_str("value"))
+            .ok()
+            .and_then(|v| v.as_string())
+        else {
+            continue;
+        };
+        let Some(pos) = parse_chunk_filename(&name) else {
+            continue;
+        };
+        match file_size(chunks_dir, &name).await {
+            Ok(size) => {
+                out.insert(pos, size);
+            }
+            Err(StorageError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+async fn file_size(dir: &FileSystemDirectoryHandle, name: &str) -> Result<u64, StorageError> {
+    let handle = get_file(dir, name, false).await?;
+    let file: Blob = JsFuture::from(handle.get_file())
+        .await
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(js_error)?;
+    Ok(file.size().max(0.0) as u64)
+}
+
+pub fn format_storage_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while unit + 1 < UNITS.len() && value >= 100.0 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 async fn write_text_file(
@@ -608,5 +728,15 @@ mod tests {
     fn parse_world_key_invalid() {
         assert_eq!(parse_world_key("invalid"), None);
         assert_eq!(parse_world_key("abc__def"), None);
+    }
+
+    #[test]
+    fn format_storage_bytes_keeps_one_decimal() {
+        assert_eq!(format_storage_bytes(0), "0.0 B");
+        assert_eq!(format_storage_bytes(42), "42.0 B");
+        assert_eq!(format_storage_bytes(100), "0.1 KB");
+        assert_eq!(format_storage_bytes(12 * 1024), "12.0 KB");
+        assert_eq!(format_storage_bytes(100 * 1024), "0.1 MB");
+        assert_eq!(format_storage_bytes(12 * 1024 * 1024), "12.0 MB");
     }
 }

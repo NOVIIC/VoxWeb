@@ -23,8 +23,6 @@ pub enum PauseAction {
     Resume,
     /// 立即保存当前 dirty chunks。
     SaveNow,
-    /// 删除当前世界存档。调用方负责二次确认状态和真实副作用。
-    DeleteWorld,
     /// 退出到大厅：调用方 drop game + state = Lobby。
     ExitToLobby,
 }
@@ -87,9 +85,6 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             ui.horizontal(|ui| {
                 if ui.button("Save Now").clicked() {
                     action = PauseAction::SaveNow;
-                }
-                if ui.button("Delete Save").clicked() {
-                    action = PauseAction::DeleteWorld;
                 }
                 if ui.button("Resume").clicked() {
                     action = PauseAction::Resume;

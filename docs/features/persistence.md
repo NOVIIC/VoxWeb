@@ -5,7 +5,7 @@
 >
 > **Phase 8 状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
 > `PersistenceManager` snapshot/commit/failure、启动 prime、1s 周期 flush、LRU/pinned、配额 UI、
-> `storage_version` 高版本拒绝与删档入口已实现。Worker sync handle 仍按本文 §十二保留为后续升级路径。
+> `storage_version` 高版本拒绝与大厅删档入口已实现。Worker sync handle 仍按本文 §十二保留为后续升级路径。
 
 ---
 
@@ -179,8 +179,6 @@ pub trait WorldStorage {
     /// 批量写入 encoded chunks。失败时调用者负责把失败的 pos 标回 dirty。
     async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError>;
 
-    async fn delete_world(&self) -> Result<(), StorageError>;
-
     /// 配额信息，UI 显示用；不可用时返回 None。
     async fn quota(&self) -> Option<QuotaInfo>;
 }
@@ -322,7 +320,7 @@ window.add_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())
 ```rust
 if ui.button("立即保存").clicked() {
     let all = persistence.snapshot_dirty(usize::MAX);
-    // ... encode + save_chunks（同步反馈进度条）
+    // ... encode + save_chunks，完成后显示 "Save complete" 顶部提示
 }
 ```
 
@@ -388,15 +386,18 @@ pub async fn check_quota() -> Option<QuotaInfo> {
 }
 ```
 
-UI（暂停菜单）：
+UI：
 
 ```
-存档使用：12.3 MB / 8.0 GB（0.15%）
-[导出存档（FSA）]  [删除存档]
+大厅：Storage: 12.3 MB / 8.0 GB
+世界列表：2026-06-01 12:00:00 · 4.2 MB
+HUD：SAVE 4.2 MB / 7.9 GB
 ```
 
 - 用量 > 80%：黄色警告
 - 用量 > 95%：红色 + 暂停新挖块的持久化（仍允许在内存内编辑，但拒新 dirty 入 flush 队列）
+- HUD 的分母不是浏览器全局剩余空间，而是 `quota - 其它世界占用空间`，用于提示当前世界还能增长到多大。
+- 暂停菜单仅保留"立即保存"，删除世界只在大厅世界列表提供入口。
 
 ### 持久化授权
 

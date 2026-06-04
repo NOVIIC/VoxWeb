@@ -278,6 +278,13 @@ fn return_to_lobby(a: &mut App) {
     mark_lobby_saves_stale(a);
 }
 
+fn push_notification(a: &mut App, message: impl Into<String>) {
+    a.notifications.push((now_ms(), message.into()));
+    if a.notifications.len() > 8 {
+        a.notifications.remove(0);
+    }
+}
+
 // ============================================================
 // 主循环 & 事件
 // ============================================================
@@ -746,13 +753,14 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
             a.lobby_state.saves_loading = true;
             let app_ref = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let result = crate::storage::list_saved_worlds().await;
+                let result = crate::storage::storage_overview().await;
                 let mut a = app_ref.borrow_mut();
                 a.lobby_state.saves_loading = false;
                 a.lobby_state.saves_loaded = true;
                 match result {
-                    Ok(worlds) => {
-                        a.lobby_state.saved_worlds = worlds;
+                    Ok(overview) => {
+                        a.lobby_state.saved_worlds = overview.worlds;
+                        a.lobby_state.storage_quota = overview.quota;
                     }
                     Err(e) => {
                         log::warn!("[lobby] 加载存档列表失败: {e:?}");
@@ -859,11 +867,12 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
                     return;
                 }
                 // 刷新列表
-                let result = crate::storage::list_saved_worlds().await;
+                let result = crate::storage::storage_overview().await;
                 let mut a = app_ref.borrow_mut();
                 match result {
-                    Ok(worlds) => {
-                        a.lobby_state.saved_worlds = worlds;
+                    Ok(overview) => {
+                        a.lobby_state.saved_worlds = overview.worlds;
+                        a.lobby_state.storage_quota = overview.quota;
                         a.lobby_state.selected_save = None; // 重置选择
                     }
                     Err(e) => {
@@ -877,11 +886,12 @@ fn render_lobby_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(), St
         Some(LobbyAction::RefreshSaves) => {
             let app_ref = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let result = crate::storage::list_saved_worlds().await;
+                let result = crate::storage::storage_overview().await;
                 let mut a = app_ref.borrow_mut();
                 match result {
-                    Ok(worlds) => {
-                        a.lobby_state.saved_worlds = worlds;
+                    Ok(overview) => {
+                        a.lobby_state.saved_worlds = overview.worlds;
+                        a.lobby_state.storage_quota = overview.quota;
                     }
                     Err(e) => {
                         log::warn!("[lobby] 刷新存档列表失败: {e:?}");
@@ -1230,8 +1240,9 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::open(&room_id, seed).await {
             Ok(storage) => {
-                let known = storage.list_chunks().await.unwrap_or_default();
-                let known_set: HashSet<_> = known.iter().copied().collect();
+                let (chunk_sizes, current_world_bytes, other_worlds_bytes) =
+                    storage_size_snapshot(&storage).await;
+                let known_set: HashSet<_> = chunk_sizes.keys().copied().collect();
                 let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
                 let mut loaded = Vec::new();
                 for dx in -4..=4 {
@@ -1262,6 +1273,9 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.current_world_bytes = current_world_bytes;
+                    g.other_worlds_bytes = other_worlds_bytes;
+                    g.persisted_chunk_sizes = chunk_sizes;
                     g.quota = quota;
                     g.storage = Some(storage);
                     g.storage_error = None;
@@ -1286,8 +1300,9 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::create_new(seed).await {
             Ok(storage) => {
-                let known = storage.list_chunks().await.unwrap_or_default();
-                let known_set: HashSet<_> = known.iter().copied().collect();
+                let (chunk_sizes, current_world_bytes, other_worlds_bytes) =
+                    storage_size_snapshot(&storage).await;
+                let known_set: HashSet<_> = chunk_sizes.keys().copied().collect();
                 let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
                 let mut loaded = Vec::new();
                 for dx in -4..=4 {
@@ -1318,6 +1333,9 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.current_world_bytes = current_world_bytes;
+                    g.other_worlds_bytes = other_worlds_bytes;
+                    g.persisted_chunk_sizes = chunk_sizes;
                     g.quota = quota;
                     g.storage = Some(storage);
                     g.storage_error = None;
@@ -1342,8 +1360,9 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
         let _ = OpfsStorage::request_persistence().await;
         match OpfsStorage::open_by_key(&key).await {
             Ok(storage) => {
-                let known = storage.list_chunks().await.unwrap_or_default();
-                let known_set: HashSet<_> = known.iter().copied().collect();
+                let (chunk_sizes, current_world_bytes, other_worlds_bytes) =
+                    storage_size_snapshot(&storage).await;
+                let known_set: HashSet<_> = chunk_sizes.keys().copied().collect();
                 let spawn = crate::chunk_loader::chunk_pos_of(voxweb_server::DEFAULT_SPAWN);
                 let mut loaded = Vec::new();
                 for dx in -4..=4 {
@@ -1374,6 +1393,9 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.current_world_bytes = current_world_bytes;
+                    g.other_worlds_bytes = other_worlds_bytes;
+                    g.persisted_chunk_sizes = chunk_sizes;
                     g.quota = quota;
                     g.storage = Some(storage);
                     g.storage_error = None;
@@ -1390,6 +1412,23 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
             }
         }
     });
+}
+
+async fn storage_size_snapshot(
+    storage: &OpfsStorage,
+) -> (HashMap<voxweb_core::ChunkPos, u64>, u64, u64) {
+    let chunk_sizes = storage.chunk_file_sizes().await.unwrap_or_default();
+    let chunk_bytes = chunk_sizes.values().copied().sum::<u64>();
+    let record_bytes = storage.world_record_size().await.unwrap_or(0);
+    let current_world_bytes = record_bytes.saturating_add(chunk_bytes);
+    let total_world_bytes = crate::storage::list_saved_worlds()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|world| world.used_bytes)
+        .sum::<u64>();
+    let other_worlds_bytes = total_world_bytes.saturating_sub(current_world_bytes);
+    (chunk_sizes, current_world_bytes, other_worlds_bytes)
 }
 
 // ============================================================
@@ -1881,12 +1920,7 @@ fn apply_room_event(app: &Rc<RefCell<App>>, ev: RoomEvent) {
             log::warn!("[net] signaling error: {msg}");
             // InGame 状态下将错误推入通知队列，让玩家在游戏内看到浮窗提示
             if matches!(a.state, AppState::InGame { .. }) {
-                let now = now_ms();
-                a.notifications.push((now, msg.clone()));
-                // 最多保留 8 条通知，超出时移除最旧的
-                if a.notifications.len() > 8 {
-                    a.notifications.remove(0);
-                }
+                push_notification(&mut a, msg.clone());
             }
             a.connecting_error = Some(msg);
         }
@@ -2226,6 +2260,8 @@ fn render_game_frame(
             show_stats: g.settings.show_stats,
             depth_prepass_enabled: g.settings.depth_prepass_enabled,
             quota: g.quota,
+            current_world_bytes: g.current_world_bytes,
+            other_worlds_bytes: g.other_worlds_bytes,
             storage_error: g.storage_error.clone(),
             perf,
         });
@@ -2379,18 +2415,8 @@ fn render_game_frame(
             }
             ui::pause::PauseAction::SaveNow => {
                 if let Some(g) = a.game.as_mut() {
+                    g.save_now_requested = true;
                     g.last_persist_ms = 0.0;
-                }
-            }
-            ui::pause::PauseAction::DeleteWorld => {
-                if let Some(storage) = a.game.as_ref().and_then(|g| g.storage.clone()) {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) = storage.delete_world().await {
-                            log::warn!("[storage] delete world failed: {e:?}");
-                        } else {
-                            log::info!("[storage] world deleted");
-                        }
-                    });
                 }
             }
             ui::pause::PauseAction::None => {}
@@ -2582,7 +2608,15 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         let Some(g) = a.game.as_mut() else {
             return;
         };
-        if matches!(g.mode, GameMode::Remote) || now - g.last_persist_ms < 1000.0 {
+        let save_now = g.save_now_requested;
+        if matches!(g.mode, GameMode::Remote) {
+            if save_now {
+                g.save_now_requested = false;
+                push_notification(&mut a, "Remote worlds are saved by the host");
+            }
+            return;
+        }
+        if !save_now && now - g.last_persist_ms < 1000.0 {
             return;
         }
         if let Some(q) = g.quota {
@@ -2593,10 +2627,14 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 .set_quota_pause_dirty(q.usage_ratio() > 0.95);
         }
         let Some(storage) = g.storage.clone() else {
+            if save_now {
+                g.save_now_requested = false;
+                push_notification(&mut a, "Save unavailable");
+            }
             return;
         };
         let tick = g.server.borrow().world.tick_count;
-        if !g.server.borrow().world.persistence.should_flush(tick) {
+        if !save_now && !g.server.borrow().world.persistence.should_flush(tick) {
             return;
         }
         let positions = g
@@ -2604,35 +2642,95 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             .borrow_mut()
             .world
             .persistence
-            .snapshot_dirty(4, tick);
+            .snapshot_dirty(if save_now { usize::MAX } else { 4 }, tick);
         if positions.is_empty() {
+            if save_now {
+                let dirty = g.server.borrow().world.persistence.dirty_len();
+                let in_flight = g.server.borrow().world.persistence.in_flight_len();
+                g.save_now_requested = false;
+                if dirty == 0 && in_flight == 0 {
+                    push_notification(&mut a, "Save complete");
+                } else if in_flight > 0 {
+                    push_notification(&mut a, "Save already in progress");
+                } else {
+                    push_notification(&mut a, "Save will retry soon");
+                }
+            }
             return;
         }
         let server = g.server.clone();
         let mut encoded = Vec::new();
+        let mut encoded_sizes = Vec::new();
         {
             let server_ref = server.borrow();
             for pos in &positions {
                 if let Some(chunk) = server_ref.world.chunks.get(pos) {
-                    encoded.push((*pos, voxweb_core::chunk::encode(chunk)));
+                    let bytes = voxweb_core::chunk::encode(chunk);
+                    encoded_sizes.push((*pos, bytes.len() as u64));
+                    encoded.push((*pos, bytes));
                 }
             }
         }
+        g.save_now_requested = false;
         g.last_persist_ms = now;
-        Some((storage, server, positions, encoded, tick))
+        Some((
+            storage,
+            server,
+            positions,
+            encoded,
+            encoded_sizes,
+            tick,
+            save_now,
+        ))
     };
 
-    let Some((storage, server, positions, encoded, tick)) = maybe_job else {
+    let Some((storage, server, positions, encoded, encoded_sizes, tick, save_now)) = maybe_job
+    else {
         return;
     };
+    let app_ref = app.clone();
     wasm_bindgen_futures::spawn_local(async move {
         let result = storage.save_chunks(encoded).await;
+        let refreshed_quota = if result.is_ok() {
+            storage.quota().await
+        } else {
+            None
+        };
         let mut s = server.borrow_mut();
         match result {
-            Ok(()) => s.world.persistence.commit_flushed(&positions),
+            Ok(()) => {
+                s.world.persistence.commit_flushed(&positions);
+                drop(s);
+                let mut a = app_ref.borrow_mut();
+                if let Some(g) = a.game.as_mut() {
+                    for (pos, size) in encoded_sizes {
+                        let old_size = g.persisted_chunk_sizes.insert(pos, size).unwrap_or(0);
+                        if size >= old_size {
+                            g.current_world_bytes =
+                                g.current_world_bytes.saturating_add(size - old_size);
+                        } else {
+                            g.current_world_bytes =
+                                g.current_world_bytes.saturating_sub(old_size - size);
+                        }
+                    }
+                    if let Some(quota) = refreshed_quota {
+                        g.quota = Some(quota);
+                    }
+                }
+                if save_now && matches!(a.state, AppState::InGame { .. }) {
+                    push_notification(&mut a, "Save complete");
+                }
+            }
             Err(e) => {
                 log::warn!("[storage] save failed: {e:?}");
                 s.world.persistence.record_flush_failure(&positions, tick);
+                drop(s);
+                if save_now {
+                    let mut a = app_ref.borrow_mut();
+                    if matches!(a.state, AppState::InGame { .. }) {
+                        push_notification(&mut a, format!("Save failed: {e:?}"));
+                    }
+                }
             }
         }
     });
@@ -3012,6 +3110,8 @@ struct HudData {
     show_stats: bool,
     depth_prepass_enabled: bool,
     quota: Option<crate::storage::QuotaInfo>,
+    current_world_bytes: u64,
+    other_worlds_bytes: u64,
     storage_error: Option<String>,
     /// Phase 7：上一帧渲染 / 网格化统计。
     perf: FramePerfStats,
@@ -3069,16 +3169,28 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             ),
                         );
                         if let Some(q) = data.quota {
-                            let mb = q.usage as f32 / (1024.0 * 1024.0);
-                            let gb = q.quota as f32 / (1024.0 * 1024.0 * 1024.0);
-                            let color = if q.usage_ratio() > 0.95 {
+                            let available_for_world =
+                                q.quota.saturating_sub(data.other_worlds_bytes);
+                            let ratio = if available_for_world == 0 {
+                                1.0
+                            } else {
+                                data.current_world_bytes as f32 / available_for_world as f32
+                            };
+                            let color = if ratio > 0.95 {
                                 egui::Color32::from_rgb(240, 80, 80)
-                            } else if q.usage_ratio() > 0.80 {
+                            } else if ratio > 0.80 {
                                 egui::Color32::from_rgb(230, 190, 80)
                             } else {
                                 egui::Color32::from_rgb(160, 200, 170)
                             };
-                            ui.colored_label(color, format!("SAVE {:>6.1} MB / {:>4.1} GB", mb, gb));
+                            ui.colored_label(
+                                color,
+                                format!(
+                                    "SAVE {} / {}",
+                                    crate::storage::format_storage_bytes(data.current_world_bytes),
+                                    crate::storage::format_storage_bytes(available_for_world)
+                                ),
+                            );
                         }
                         if let Some(err) = data.storage_error.as_deref() {
                             ui.colored_label(
