@@ -414,16 +414,16 @@ pub struct PersistenceManager {
 
 impl PersistenceManager {
     pub fn mark_dirty(&mut self, pos: ChunkPos);
-    pub fn snapshot_dirty(&mut self, limit: usize) -> Vec<ChunkPos>;   // dirty → in_flight，不删
+    pub fn snapshot_dirty(&mut self, limit: usize, current_tick: u64) -> Vec<ChunkPos>;
     pub fn commit_flushed(&mut self, positions: &[ChunkPos]);           // 写入成功后清理 in_flight
-    pub fn record_flush_failure(&mut self, positions: &[ChunkPos]);     // 失败：in_flight → dirty + 退避
+    pub fn record_flush_failure(&mut self, positions: &[ChunkPos], current_tick: u64);
     pub fn should_flush(&self, current_tick: u64) -> bool;
 }
 ```
 
 **实际存储实现不在 server crate 内**（避免引入 `web-sys` 依赖污染 server 的平台无关性）：
 - Client 端 [`crates/client/src/storage.rs`](../../crates/client/src/storage.rs) 实现 `WorldStorage` trait（默认 `OpfsStorage`）
-- Client 主循环每 1 秒：`let to_flush = persistence.snapshot_dirty(64);` → 主线程 encode（每帧最多 4 chunk）→ `spawn_local(async { storage.save_chunks(...).await })` → 成功 commit / 失败 record_failure
+- Client 主循环每 3 秒：`let to_flush = persistence.snapshot_dirty(4, tick);` → 主线程 encode（每批最多 4 chunk）→ `spawn_local(async { storage.save_chunks(...).await })` → 成功 commit / 失败 record_failure
 - 加载请求由 client 触发：`storage.load_chunk(pos)` → `decode` → `server.load_chunk_from_storage(pos, chunk)`
 
 `World` 还配套 LRU + pinned 集合避免内存爆炸（capacity 4096，渲染距离内 chunk 不可驱逐；dirty chunk 驱逐前必须先 flush）。

@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use voxweb_core::chunk::ChunkPos;
 
-/// Phase 8 默认每秒 flush 一次（60Hz 逻辑 tick）。
-pub const DEFAULT_FLUSH_INTERVAL_TICKS: u64 = 60;
+/// Phase 8 默认每 3 秒 flush 一次（60Hz 逻辑 tick）。
+pub const DEFAULT_FLUSH_INTERVAL_TICKS: u64 = 180;
 
 /// dirty chunk 的 snapshot/commit/retry 管理器。
 #[derive(Clone, Debug)]
@@ -168,5 +168,13 @@ mod tests {
         p.set_quota_pause_dirty(true);
         p.mark_dirty(ChunkPos::new(5, 5));
         assert_eq!(p.dirty_len(), 0);
+    }
+
+    #[test]
+    fn default_flush_interval_is_three_seconds_at_60hz() {
+        let mut p = PersistenceManager::new();
+        p.mark_dirty(ChunkPos::new(0, 0));
+        assert!(!p.should_flush(DEFAULT_FLUSH_INTERVAL_TICKS - 1));
+        assert!(p.should_flush(DEFAULT_FLUSH_INTERVAL_TICKS));
     }
 }

@@ -345,7 +345,7 @@ fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
     self.mesh_jobs.run_until_budget(MESH_BUDGET_MS, &mut self.renderer);
     let egui_output = self.build_ui();
     self.renderer.render_frame(&self.frame_data(), egui_output);
-    self.maybe_flush_persistence();      // 每 1 秒触发一次 OPFS 写入（snapshot dirty + 异步 save）
+    self.maybe_flush_persistence();      // 每 3 秒触发一次 OPFS 写入（snapshot dirty + 异步 save）
 }
 ```
 
@@ -556,7 +556,7 @@ pub struct OpfsStorage {
 }
 ```
 
-**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后通过 `futures-channel::oneshot` 把结果投递回主循环。chunk 字节流的 encode/decode 由 [`crates/core/src/chunk.rs`](../../crates/core/src/chunk.rs) 的 `encode` / `decode`（palette + RLE）负责，storage 层只处理原始字节。
+**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后回写主循环持有的 `Game`。当前新存档 key 为 `<created_at_s>__<seed>`；大厅选择已有存档时通过 `OpfsStorage::open_by_key(key)` 打开。chunk 字节流的 encode/decode 由 [`crates/core/src/chunk.rs`](../../crates/core/src/chunk.rs) 的 `encode` / `decode`（palette + RLE）负责，storage 层只处理原始字节。
 
 大厅通过 `storage_overview()` 同时读取 `navigator.storage.estimate()` 与世界列表，每个 `WorldSummary.used_bytes` 由 `world.json + chunks/*.bin` 文件大小求和得到。游戏内 HUD 不逐帧扫描 OPFS：启动时记录当前世界 chunk 文件大小表，周期保存成功后按本次 encoded chunk 字节数做增量修正。
 
