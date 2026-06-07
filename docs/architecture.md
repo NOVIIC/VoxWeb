@@ -41,7 +41,7 @@
                 │  TURN 中继（v2，可选；当 P2P 直连失败时降级走中继）
                 ↓
         ┌────────────────────────────────────────────────────────────────┐
-        │   公共 STUN 服务器 / TURN 服务器（v2 阶段：cloudflare-turn 或自建） │
+        │   公共 STUN 服务器 / TURN 服务器（可选：cloudflare-turn 或自建）       │
         └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -64,9 +64,9 @@
 | **Remote Client** | 不持有 | 与 Host 单向 P2P | 玩家选择"加入房间" |
 
 **角色切换路径**：
-- Local-Only ↔ Host：可在游戏中"开放联机"（停用：本期不做切换，仅在大厅决定一次）
+- Local-Only ↔ Host：当前仅在大厅决定一次，不支持游戏中直接开放联机
 - Host ↔ Remote：不可切换；房间销毁后所有人回到大厅
-- Remote 升 Host：v2 stretch（"可迁移主机"，本期不做）
+- Remote 升 Host：可选增强（主机迁移）
 
 > 设计含义：`server` crate 在 Local-Only 与 Host 模式下代码完全相同，只是消息源不同（Local-Only 走内存通道；Host 走 P2P + 内存通道复用）。这让单人模式与多人模式共享 90% 服务端代码。
 
@@ -161,14 +161,14 @@ VoxWeb/
 │   │   └── src/
 │   │       ├── lib.rs          # Renderer + 公开 API
 │   │       ├── device.rs       # Surface + Device 与 canvas 绑定
-│   │       ├── graph.rs        # Render Graph 调度框架（trait，当前未接入渲染路径）
+│   │       ├── graph.rs        # Render Graph 调度框架（trait，主路径仍是固定顺序调用）
 │   │       ├── passes/
 │   │       │   ├── mod.rs
 │   │       │   ├── opaque.rs   # 实体方块 Pass
-│   │       │   ├── skybox.rs   # 天空盒 Pass（Phase 8 实装）
-│   │       │   ├── transparent.rs # 半透明 Pass（Phase 8 实装）
-│   │       │   └── selection.rs   # 选中方块线框 Pass（Phase 3）
-│   │       ├── chunk_mesh.rs   # 贪婪网格化 + 跨区块面剔除 + AO + bounds（Phase 7）
+│   │       │   ├── skybox.rs   # 天空盒 Pass
+│   │       │   ├── transparent.rs # 半透明 Pass
+│   │       │   └── selection.rs   # 选中方块线框 Pass
+│   │       ├── chunk_mesh.rs   # 贪婪网格化 + 跨区块面剔除 + AO + bounds
 │   │       ├── vertex.rs       # u32 压缩格式
 │   │       ├── texture.rs      # 纹理图集
 │   │       └── shaders/
@@ -181,7 +181,7 @@ VoxWeb/
 │   │       ├── world.rs        # World + 玩家表 + tick
 │   │       ├── terrain.rs      # Perlin 地形
 │   │       ├── physics.rs      # 物理仲裁
-│   │       └── persistence.rs  # PersistenceManager（Phase 8 实装 full API；Phase 5 仅 dirty_chunks 标记）
+│   │       └── persistence.rs  # PersistenceManager + dirty snapshot/commit/retry
 │   ├── net/                    # P2P 网络层
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -200,7 +200,7 @@ VoxWeb/
 │           ├── physics.rs      # 玩家本地物理（Walk/Fly）
 │           ├── raycast.rs      # DDA 射线
 │           ├── prediction.rs   # 客户端预测 + PendingActions rollback
-│           ├── interp.rs       # 远端玩家插值（Phase 5 实装）
+│           ├── interp.rs       # 远端玩家插值
 │           ├── mesh_jobs.rs    # 网格化任务队列 + 分帧调度
 │           ├── chunk_loader.rs # 区块滚动加载 / 卸载
 │           ├── hotbar.rs       # 9 格快捷栏
@@ -208,11 +208,11 @@ VoxWeb/
 │           │   ├── mod.rs
 │           │   ├── lobby.rs    # 大厅 + Connecting UI
 │           │   ├── hud.rs      # HUD 绘制函数
-│           │   ├── pause.rs    # 暂停菜单（Phase 6）
-│           │   ├── chat.rs     # 聊天（Phase 6）
-│           │   ├── players.rs  # 玩家列表/名牌（Phase 6）
+│           │   ├── pause.rs    # 暂停菜单
+│           │   ├── chat.rs     # 聊天
+│           │   ├── players.rs  # 玩家列表/名牌
 │           │   └── ui_state.rs # UI 状态哈希（防止重复渲染判断）
-│           └── storage.rs      # OPFS 异步包装（Phase 8 实装，当前为 stub）
+│           └── storage.rs      # OPFS 异步包装
 └── signaling/                  # 独立部署（TS 项目）
     ├── wrangler.toml
     ├── package.json

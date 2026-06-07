@@ -31,10 +31,10 @@ crates/render/src/
 ├── passes/
 │   ├── mod.rs
 │   ├── opaque.rs       实体方块 Pass
-│   ├── skybox.rs       天空盒 Pass（Phase 8 实装）
-│   ├── transparent.rs  半透明 Pass（Phase 8 实装）
-│   └── selection.rs    选中方块线框 Pass（Phase 3）
-├── chunk_mesh.rs       贪婪网格化 + 跨区块面剔除 + AO + bounds（Phase 7）
+│   ├── skybox.rs       天空盒 Pass
+│   ├── transparent.rs  半透明 Pass
+│   └── selection.rs    选中方块线框 Pass
+├── chunk_mesh.rs       贪婪网格化 + 跨区块面剔除 + AO + bounds
 ├── vertex.rs           u32 压缩格式 + 解包工具
 ├── texture.rs          纹理图集
 └── shaders/
@@ -115,15 +115,15 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 ## 五、`texture.rs` — 纹理图集
 
 **设计**：
-- 单张大图（如 256×256，每格 16×16 → 16×16 = 256 个纹理槽，足够本期所有方块）
+- 单张大图（如 256×256，每格 16×16 → 16×16 = 256 个纹理槽，足够当前方块表）
 - 每方块的纹理由 `BlockProperties.texture_index: u8` 指定槽位
 - WGSL 中 UV 计算：`uv = (texture_index_to_grid(idx) + face_local_uv) / atlas_size`
 
 **纹理来源**：
-- 本期：项目内嵌（`include_bytes!` 加载，编译进 wasm）
-- v2：可选远程加载（fetch + Image bitmap）
+- 当前：项目内嵌（`include_bytes!` 加载，编译进 wasm）
+- 可选增强：远程加载（fetch + Image bitmap）
 
-**Mipmap**：本期不开（避免远处纹理颜色混叠产生彩虹），用 `MagFilter::Nearest` + `MinFilter::Nearest` 保持像素风。
+**Mipmap**：当前不开（避免远处纹理颜色混叠产生彩虹），用 `MagFilter::Nearest` + `MinFilter::Nearest` 保持像素风。
 
 ---
 
@@ -133,7 +133,7 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 - **声明式**：每个 Pass 声明输入资源（贴图/UB）+ 输出资源（render target）
 - **依赖排序**：自动按依赖关系排序 Pass
 - **资源复用**：同一 frame 内的中间贴图（如 SSAO 输出）可共享
-- **简化版**：本期不实现完整 DAG 调度，使用**固定顺序**（Depth → Opaque → Skybox → Transparent → UI）；预留 trait 便于后期扩展
+- **当前实现**：主路径使用固定顺序（Skybox → Depth Pre-Pass → Opaque → Player → Transparent → Selection → UI）；`RenderGraph` trait 保留为扩展点
 
 ### Trait
 
@@ -205,11 +205,11 @@ graph.add_pass(Box::new(UiPass::new(...)));            // egui-wgpu 容器
 **输出**：写入 color + depth（`Less`，`store`）
 **Pipeline 设置**：
 - 深度比较：`Less`（如果有 Depth Pre-Pass，可改 `Equal` 进一步省 fragment work）
-- Cull 模式：当前为 `None`（贪婪网格 winding 已保持外侧 CCW，但 Phase 7 优先保证可视正确性；后续可单独启用 Back-face culling 验证收益）
+- Cull 模式：当前为 `None`（贪婪网格 winding 已保持外侧 CCW；后续可单独启用 Back-face culling 验证收益）
 - Blend：禁用
 - 顶点格式：`PackedVertex`（u32）+ `u32` index buffer
 
-**Draw 调用顺序**：Phase 7 先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
+**Draw 调用顺序**：先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 
@@ -240,7 +240,7 @@ fn sky_color(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 - Draw 顺序：按距离从远到近排序（保证混合顺序）
 - 网格独立：透明方块不参与贪婪网格化的合并（不同方块属性不能合并）；用单独的 mesh buffer
 
-**简化策略**：本期透明方块不超过 2 种（水 + 玻璃），不实现"Order-Independent Transparency"等高级技术。
+**简化策略**：当前透明方块不超过 2 种（水 + 玻璃），不实现"Order-Independent Transparency"等高级技术。
 
 ### 7.5 `passes/ui.rs` — UI Pass
 
@@ -320,7 +320,7 @@ impl Renderer {
 }
 ```
 
-> **Phase 8 更新**：Renderer 已接入固定顺序多 Pass：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI（UI 仍由 client 持有 egui-wgpu renderer 编码）。透明方块拥有独立 mesh buffer，并按 chunk 中心到相机距离远到近绘制。`RenderGraph` trait 继续作为扩展点保留，当前主路径使用显式方法调用以减少 egui 生命周期改动。Pass 耗时仍是 CPU 编码耗时，不是 GPU timestamp query。
+> Renderer 已接入固定顺序多 Pass：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI（UI 仍由 client 持有 egui-wgpu renderer 编码）。透明方块拥有独立 mesh buffer，并按 chunk 中心到相机距离远到近绘制。`RenderGraph` trait 继续作为扩展点保留，当前主路径使用显式方法调用以减少 egui 生命周期改动。Pass 耗时仍是 CPU 编码耗时，不是 GPU timestamp query。
 
 ---
 

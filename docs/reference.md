@@ -7,7 +7,7 @@
 
 ## 一、技术栈版本表
 
-> 实际编码阶段会锁定具体版本到 Cargo.lock；下表是规划版本范围，新成员对齐时使用。
+> 实际实现会锁定具体版本到 Cargo.lock；下表是规划版本范围，新成员对齐时使用。
 
 ### Rust 与 Cargo
 
@@ -66,7 +66,7 @@ features = [
 ]
 ```
 
-> 已移除 `Idb*` / `BeforeUnloadEvent`：本项目 Phase 5 起改用 OPFS（详见 [`features/persistence.md`](features/persistence.md)），退出 flush 监听 `pagehide` 而非 `beforeunload`。
+> 已移除 `Idb*` / `BeforeUnloadEvent`：本项目使用 OPFS（详见 [`features/persistence.md`](features/persistence.md)），退出 flush 监听 `pagehide` 而非 `beforeunload`。
 
 ### 信令服务（TS）
 
@@ -87,8 +87,8 @@ features = [
 | Safari 17+ | ✅（macOS Sonoma+ / iOS 17+） | ✅ | ✅（17+） | ✅（macOS） | 推荐（桌面） |
 | Firefox 115+ stable | ❌ WebGPU 默认（需 nightly） | ✅ | ✅（111+） | ✅ | 不推荐 |
 | Firefox Nightly | ✅（about:config 开启 dom.webgpu.enabled） | ✅ | ✅ | ✅ | 可用 |
-| 移动 Chrome (Android) | ✅（114+） | ✅ | ✅ | ❌ 部分 | 不在本期范围 |
-| 移动 Safari (iOS) | ✅（17+） | ✅ | ✅（17+） | ❌ | 不在本期范围 |
+| 移动 Chrome (Android) | ✅（114+） | ✅ | ✅ | ❌ 部分 | 当前不支持触屏操作 |
+| 移动 Safari (iOS) | ✅（17+） | ✅ | ✅（17+） | ❌ | 当前不支持触屏操作 |
 
 ### 浏览器能力前置检测（wasm 加载之前）
 
@@ -122,7 +122,7 @@ const missing = required.filter(k => !checks[k]());
 
 **特殊处理**：若 **仅 `webrtc` 缺失** 而其他必备项都满足 → 提供"仅单机模式"按钮，wasm 启动后强制走 Local-Only 路径，禁用大厅"创建/加入房间"。其他必备项缺失 → 拒绝加载 wasm，显示降级页面（纯 HTML/CSS）。
 
-**移动设备拦截（commit 34ebd73）**：即便 API 全部满足，UA 命中 `Mobi|Android|iPhone|iPad|iPod` 或"Macintosh + maxTouchPoints > 2"（iPad 桌面模式）也会拒绝加载 wasm，提示"VoxWeb 暂不支持触屏操作，请使用桌面浏览器"。理由：当前无虚拟摇杆 / 触屏挖放按钮（[`roadmap.md`](roadmap.md) Phase 9.3 stretch），即使强行加载也无法操作。降级页面会把 `mobile` 行排在最前，便于用户立即理解。
+**移动设备拦截（commit 34ebd73）**：即便 API 全部满足，UA 命中 `Mobi|Android|iPhone|iPad|iPod` 或"Macintosh + maxTouchPoints > 2"（iPad 桌面模式）也会拒绝加载 wasm，提示"VoxWeb 暂不支持触屏操作，请使用桌面浏览器"。理由：当前无虚拟摇杆 / 触屏挖放按钮，即使强行加载也无法操作。降级页面会把 `mobile` 行排在最前，便于用户立即理解。
 
 **最低浏览器版本**（取所有必备项交集）：
 
@@ -140,11 +140,11 @@ const missing = required.filter(k => !checks[k]());
 
 ### 3.1 WebGPU
 
-- **Adapter 选择**：`request_adapter` 在桌面 Linux 集显上可能选错；本期使用 `power_preference: HighPerformance`
+- **Adapter 选择**：`request_adapter` 在桌面 Linux 集显上可能选错；当前使用 `power_preference: HighPerformance`
 - **Surface 配置**：`alpha_mode` 必须设置（否则 Safari 可能透明），用 `Opaque`
 - **Texture 格式**：用 `surface.get_capabilities(&adapter).formats[0]` 取 preferred；不要硬编码
-- **Storage Buffer**：WebGPU 已支持，但本期未使用（贪婪网格化在 CPU 跑）；v2 GPU 网格化时启用
-- **Compute shader**：本期不用
+- **Storage Buffer**：WebGPU 已支持，但当前未使用（贪婪网格化在 CPU 跑）；GPU 网格化时再启用
+- **Compute shader**：当前不用
 - **错误处理**：浏览器 `unhandledpromiserejection` 可能因为 wgpu 内部错误触发；`set_uncaught_error_handler` 截获并 console.error
 - **`queue.write_buffer` 在 submit 前会合并到同一 buffer 的最后一次写入**：
   错误模式：
@@ -172,12 +172,12 @@ const missing = required.filter(k => !checks[k]());
 ### 3.3 WebSocket
 
 - **wss URL**：HTTPS 站点必须用 wss（混合内容会被浏览器拦截）
-- **重连**：本期不实现；用户主动重新加入
+- **重连**：当前不实现；用户主动重新加入
 
 ### 3.4 OPFS
 
 - **配额**：通常磁盘 60% 上限（chromium）；隐身模式下大幅缩水至几十 MB；可调 `navigator.storage.persist()` 申请持久存储以避免自动清理
-- **同步 API 仅 Worker 内可用**：`FileSystemSyncAccessHandle.write()`，主线程只有 async 路径；Phase 8 默认走 async（Variant A），视情况升级到 Worker（Variant B）
+- **同步 API 仅 Worker 内可用**：`FileSystemSyncAccessHandle.write()`，主线程只有 async 路径；当前走 async（Variant A），视情况升级到 Worker（Variant B）
 - **`removeEntry({recursive:true})`**：Chromium / Firefox 较新版本支持；旧 Safari 需逐文件 `removeEntry` 自实现递归删
 - **大目录性能**：单目录 ≥ 10k 文件时 OPFS 内部 SQLite-like 索引仍可承担；但 `entries()` 异步迭代会拖到 100-300 ms，需要 loading UI 遮蔽
 - **DevTools 入口**：
@@ -279,7 +279,7 @@ let normalized = if is_firefox() { dx / dpr } else { dx };
 ### 4.8 文件系统
 
 - 无 `std::fs`
-- 持久化使用 **OPFS**（[`features/persistence.md`](features/persistence.md)）；localStorage 仅存轻量配置；File System Access API 仅 Phase 9 stretch 用作可选导出
+- 持久化使用 **OPFS**（[`features/persistence.md`](features/persistence.md)）；localStorage 仅存轻量配置；File System Access API 仅作为可选导出渠道
 - 加载 assets 用 `include_bytes!`（编译期嵌入）或运行时 `fetch`
 
 ---
@@ -320,7 +320,7 @@ WebGPU 状态、当前后端、错误日志。
 
 ### 6.4 性能 overlay（项目内）
 
-启用 `AppSettings.show_stats`（暂停菜单）后，HUD 显示 FPS、chunk/mesh 队列、Phase 7 视锥剔除数量、draw 顶点/索引数、mesh 批次耗时和各 pass 的 CPU 编码耗时。
+启用 `AppSettings.show_stats`（暂停菜单）后，HUD 显示 FPS、chunk/mesh 队列、视锥剔除数量、draw 顶点/索引数、mesh 批次耗时和各 pass 的 CPU 编码耗时。
 
 ### 6.5 远程 Source Map
 

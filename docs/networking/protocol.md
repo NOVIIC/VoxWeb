@@ -22,18 +22,18 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 6; // Phase 8: Host 视距上限同步
+pub const PROTOCOL_VERSION: u32 = 6; // Host 视距上限同步
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
 
 | 版本 | 变化 |
 |---|---|
-| v6 (Phase 8) | `Welcome` 增加 `host_render_distance: u32`；`ChunkRequest` 增加 `center` / `render_distance`；新增 `HostSettings` 用于 Host 视距变化通知 |
-| v5 (Phase 8) | 新增 `ClientMessage::ChunkRequest { chunks: Vec<ChunkPos> }`；Remote 移动或渲染距离变化时向 Host 请求视距内缺失区块 |
-| v4 (Phase 8) | `Break` / `Place` 增加 `input_tick: u32` 与 `player_position: Vec3`；Host 用点击时玩家脚底位置校验挖放范围，避免高 RTT / unreliable 丢包时用旧位置误拒 |
-| v3 (Phase 8) | `PlayerSnapshot` 增加 `last_input_tick: u32`；客户端用它对齐预测历史，避免高延迟下把旧回声当成当前位置校正 |
-| v2 (Phase 6) | Welcome 增加 `host_entity_id: u32` + `players: Vec<PlayerEntry>`；新增 `PlayerEntry { entity_id, display_name }` |
+| v6 | `Welcome` 增加 `host_render_distance: u32`；`ChunkRequest` 增加 `center` / `render_distance`；新增 `HostSettings` 用于 Host 视距变化通知 |
+| v5 | 新增 `ClientMessage::ChunkRequest { chunks: Vec<ChunkPos> }`；Remote 移动或渲染距离变化时向 Host 请求视距内缺失区块 |
+| v4 | `Break` / `Place` 增加 `input_tick: u32` 与 `player_position: Vec3`；Host 用点击时玩家脚底位置校验挖放范围，避免高 RTT / unreliable 丢包时用旧位置误拒 |
+| v3 | `PlayerSnapshot` 增加 `last_input_tick: u32`；客户端用它对齐预测历史，避免高延迟下把旧回声当成当前位置校正 |
+| v2 | Welcome 增加 `host_entity_id: u32` + `players: Vec<PlayerEntry>`；新增 `PlayerEntry { entity_id, display_name }` |
 
 ---
 
@@ -270,7 +270,7 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 - `Break.pos` 与玩家位置 distance > 6.0 → ActionAck rejected with `OutOfRange`
 - `Place.pos` 同上 + 不能与玩家 AABB 重叠 → ActionAck rejected with `Overlap`
 - `Chat.content.chars().count() > 256` → 静默丢弃（不应答错误，避免被穷举）
-- 速率限制：每玩家 5 条 / 3s（180 tick 滑窗），超出静默丢弃（Phase 6 起服务端实装；Protocol v1 没有）
+- 速率限制：每玩家 5 条 / 3s（180 tick 滑窗），超出静默丢弃（Protocol v1 没有）
 - 操作签名 / 加密令牌（DataChannel 已 DTLS 加密）
 
 ---
@@ -311,10 +311,8 @@ bootstrap 初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB�
 
 ---
 
-## 十一、Future Work（v2/v3）
+## 十一、可选演进
 
 - 操作日志同步（让 Remote 重放 BlockUpdate 历史，避免重复全量同步）
-- ~~区块按需请求~~ ✅ 已实现（Remote 按视距发送 `ChunkRequest`）
 - 端到端加密（双重保险）
 - 更复杂的 Welcome 流程（双向能力协商，如纹理包版本）
-- ~~Delta 玩家广播~~ ✅ 已实现（见 §六.1）

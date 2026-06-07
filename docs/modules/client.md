@@ -9,7 +9,7 @@
 
 `client` 是 **orchestrator**：把 `core` / `render` / `server` / `net` 粘合成一个 WASM 应用。
 - 浏览器入口（`#[wasm_bindgen(start)]`）
-- AppState 状态机（Lobby / Connecting / InGame / EscMenu / ChatOpen）
+- AppState 状态机（Lobby / Connecting / InGame / Disconnected，暂停和聊天是 InGame 内叠加状态）
 - 主循环（RAF + 固定 60Hz 逻辑帧累加器）
 - 输入（键盘/鼠标）、相机控制、本地物理预测、DDA 射线
 - UI（egui）— 大厅、HUD、暂停、聊天、玩家列表、名牌
@@ -20,17 +20,16 @@
 
 ---
 
-### 阶段实装范围
+### 当前组成
 
-| 阶段 | 包含 |
-|---|---|
-| **Phase 2 ✅** | `AppState::{Lobby, InGame}`；`Game` 子结构持 `server / net / camera / mesh_jobs / chunk_loader`；`ui::lobby` 实装；`mesh_jobs.rs` / `chunk_loader.rs` 新模块；Fly 模式相机 |
-| **Phase 3 ✅** | Walk 模式 + `physics.rs` + `raycast.rs`；挖放 hotbar；PendingActions rollback；server validate_break/place 闭环；选中方块线框 SelectionPass；PlayerInput 上报 |
-| Phase 4 ✅ | `AppState::Connecting / Disconnected`；`NetEndpoint::Host / Remote`（Ping-Pong 闭环） |
-| Phase 5 ✅ | `prediction.rs`（InputHistory + reconcile_self）/ `interp.rs`（PlayerInterp 100ms 延迟）/ `chunk_assembler.rs`（ChunkSnapshot 分片组装）；远端玩家身体渲染（PlayerPass）；outbox+Recipient 路由；OPFS 持久化整体延后至 Phase 8 |
-| Phase 8 | 补 `storage.rs` OPFS 完整实现（`WorldStorage` trait + `OpfsStorage` + prime + 按需 load + 1s flush + pagehide） |
+当前 `client` 同时覆盖单机、Host 和 Remote 三种运行路径：
 
-下面 §4 起的 `App` 完整结构是**Phase 5+ 终态**。Phase 2 实际仅需子集，标注见 §4。
+- `app.rs` 管理跨状态资源、世界会话、连接进度和游戏内 `Game` 运行时
+- `mesh_jobs.rs` / `chunk_loader.rs` 负责 chunk 滚动加载、网格化优先级和分帧预算
+- `physics.rs` / `raycast.rs` / `hotbar.rs` 负责本地移动、DDA 命中和挖放输入
+- `prediction.rs` / `interp.rs` / `chunk_assembler.rs` 负责预测协调、远端插值和快照分片组装
+- `storage.rs` 负责 OPFS 世界列表、chunk 读写、配额查询和删除存档
+- `ui/` 下的模块按 AppState 绘制大厅、连接进度、HUD、暂停菜单、聊天、玩家列表、名牌和断线页面
 
 ---
 
@@ -42,22 +41,22 @@ crates/client/src/
 ├── app.rs              AppState 状态机 + App / Game 主结构
 ├── camera.rs           第一人称相机
 ├── input.rs            键盘/鼠标输入管理
-├── mesh_jobs.rs        [Phase 2] 网格化任务队列 + 分帧调度
-├── chunk_loader.rs     [Phase 2] 区块滚动加载 / 卸载 + affected_chunks 工具
-├── physics.rs          [Phase 3 ✅] 玩家本地物理预测（Walk/Fly 双模式）
-├── raycast.rs          [Phase 3 ✅] DDA 射线
-├── hotbar.rs           [Phase 3 ✅] 9 格快捷栏 + 方块标签
-├── prediction.rs       [Phase 3 ✅] 挖放 PendingActions（rollback）；[Phase 5] 完整输入历史+协调
-├── interp.rs           [Phase 5 ✅] 远端玩家位置插值（PlayerInterp, 100ms 延迟）
-├── chunk_assembler.rs  [Phase 5 ✅] ChunkSnapshot 分片接收与组装
-├── storage.rs          [Phase 8] OPFS 异步包装（`WorldStorage` trait + `OpfsStorage`；当前为 stub）
+├── mesh_jobs.rs        网格化任务队列 + 分帧调度
+├── chunk_loader.rs     区块滚动加载 / 卸载 + affected_chunks 工具
+├── physics.rs          玩家本地物理预测（Walk/Fly 双模式）
+├── raycast.rs          DDA 射线
+├── hotbar.rs           9 格快捷栏 + 方块标签
+├── prediction.rs       输入历史、位置协调、挖放 PendingActions
+├── interp.rs           远端玩家位置插值（PlayerInterp, 100ms 延迟）
+├── chunk_assembler.rs  ChunkSnapshot 分片接收与组装
+├── storage.rs          OPFS 异步包装（WorldStorage trait + OpfsStorage）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
-    ├── lobby.rs        [Phase 2] 大厅 + Connecting UI（单机/Host/Remote 入口 + 连接进度）
-    ├── hud.rs          [Phase 1+] HUD 绘制函数（供 lib.rs 调用）
-    ├── pause.rs        [Phase 6] 暂停菜单（当前 stub）
-    ├── chat.rs         [Phase 6] 聊天框 + 消息历史（当前 stub）
-    ├── players.rs      [Phase 6] 玩家名牌（3D billboard）+ 玩家列表 widget（当前 stub）
+    ├── lobby.rs        大厅 + Connecting UI（单机/Host/Remote 入口 + 连接进度）
+    ├── hud.rs          HUD 绘制函数（供 lib.rs 调用）
+    ├── pause.rs        暂停菜单
+    ├── chat.rs         聊天框 + 消息历史
+    ├── players.rs      玩家名牌（3D billboard）+ 玩家列表 widget
     └── ui_state.rs     UI 状态哈希（防止重复渲染判断）
 ```
 
@@ -65,7 +64,7 @@ crates/client/src/
 
 ## 三、`lib.rs` — wasm 入口
 
-Phase 2 实装：直接通过浏览器原生 API（`add_event_listener_with_callback`）注册事件，不引入 `winit` 事件循环。`#[wasm_bindgen(start)]` 异步函数完成 Renderer + egui 初始化后挂上 RAF 闭包链。
+入口直接通过浏览器原生 API（`add_event_listener_with_callback`）注册事件，不引入 `winit` 事件循环。`#[wasm_bindgen(start)]` 异步函数完成 Renderer + egui 初始化后挂上 RAF 闭包链。
 
 ```rust
 #[wasm_bindgen(start)]
@@ -104,7 +103,7 @@ pub async fn start() -> Result<(), JsValue> {
 - `mousemove` on document：指针锁时累积相机 dx/dy；否则上报 `egui::Event::PointerMoved`（让 Lobby 按钮能接收 hover）
 - `mousedown` / `mouseup`：InGame 时写 InputState，Lobby 时转 `egui::Event::PointerButton`
 
-> 关键修复（commit edae0e6）：早期版本只在 InGame 才向 egui 喂事件，导致大厅按钮无法点击。Phase 2 起 mouse 事件在所有 state 下都会推到 `egui_events` 累加器，每帧 drain 入 `RawInput.events`。
+> 事件约束：鼠标事件在所有 state 下都会推到 `egui_events` 累加器，每帧 drain 入 `RawInput.events`；否则大厅按钮和连接界面无法稳定接收 hover/click。
 
 ---
 
@@ -114,11 +113,11 @@ pub async fn start() -> Result<(), JsValue> {
 
 ```rust
 pub enum AppState {
-    Loading,                                      // [Phase 0+] 初始占位，实际未使用
-    Lobby,                                        // [Phase 2+] 大厅
-    Connecting,                                   // [Phase 4+] 网络协商 + 区块预载
-    InGame { paused: bool, chat_open: bool },     // [Phase 6+] 游戏中（可叠加暂停 / 聊天）
-    Disconnected,                                 // [Phase 6+] 连接断开页面
+    Loading,                                      // 初始占位，实际未使用
+    Lobby,                                        // 大厅
+    Connecting,                                   // 网络协商 + 区块预载
+    InGame { paused: bool, chat_open: bool },     // 游戏中（可叠加暂停 / 聊天）
+    Disconnected,                                 // 连接断开页面
 }
 impl AppState {
     pub fn is_in_game(&self) -> bool;             // 匹配任意 InGame 子状态
@@ -126,13 +125,13 @@ impl AppState {
 }
 ```
 
-Phase 6 把原 `EscMenu` / `ChatOpen` unit variant 合入 `InGame` 结构变体，让 HUD 与名牌在暂停 / 聊天期间仍可绘制，且两个叠加层可并存。
+暂停和聊天不再是独立页面，而是 `InGame` 的叠加状态位。HUD 与名牌在暂停 / 聊天期间仍可绘制，且两个叠加层可并存。
 
 Connecting 期间不携带子状态结构体——进度信息由 `RoomSession::loading_steps()`（网络步骤）和 `App::preload_state`（区块预载步骤）联合提供。
 
 ### 区块预载
 
-`PreloadState` 追踪出生点周围 chunk 的加载进度（Phase 5+）：
+`PreloadState` 追踪出生点周围 chunk 的加载进度：
 
 ```rust
 pub struct PreloadState {
@@ -148,7 +147,7 @@ pub struct PreloadState {
 
 ### App / Game 主结构
 
-Phase 2 起，`App` 容器只持有跨状态资源（renderer / egui / input / 大厅 UI state）。游戏内运行时持有于 `Game` 子结构，仅 `InGame` 时存在：
+`App` 容器只持有跨状态资源（renderer / egui / input / 大厅 UI state）。游戏内运行时持有于 `Game` 子结构，仅 `InGame` 时存在：
 
 ```rust
 struct App {
@@ -167,7 +166,7 @@ struct App {
     connecting_mode: GameMode,          // Host / Remote / Local
     connecting_room_id: String,
     connecting_error: Option<String>,
-    preload_state: Option<PreloadState>, // [Phase 5+] 区块预载进度
+    preload_state: Option<PreloadState>, // 区块预载进度
 
     disconnect_reason: Option<String>,
 
@@ -180,36 +179,36 @@ struct App {
 }
 
 pub struct Game {
-    pub server: Rc<RefCell<Server>>,   // [Phase 2] Local-Only 持有完整 Server
-    pub server_inbox: ServerInbox,     // [Phase 2] mpsc 服务端侧
-    pub net: NetEndpoint,              // [Phase 2] ::Local；Phase 4 → Host/Remote
-    pub camera: Camera,                // [Phase 1+] 朝向+矩阵；位置由 physics 每帧同步
-    pub physics: LocalPhysics,         // [Phase 3 ✅] Walk/Fly + 分轴碰撞 + 重力
-    pub hotbar: Hotbar,                // [Phase 3 ✅] 9 格快捷栏
-    pub pending: PendingActions,       // [Phase 3 ✅] 挖放 rollback 队列
-    pub current_hit: Option<RaycastHit>, // [Phase 3 ✅] DDA 命中缓存
-    pub last_break_at_ms: f64,         // [Phase 3 ✅] 连续挖掘冷却
-    pub mesh_jobs: MeshJobQueue,       // [Phase 2]
-    pub chunk_loader: ChunkLoader,     // [Phase 2]
-    pub frame_clock: FrameClock,       // [Phase 2+]
-    pub settings: AppSettings,             // [Phase 6+] 用户设置（曾用名 GameSettings）
-    pub entity_id: u32,                    // [Phase 2] 由 Welcome 填充
-    pub display_name: String,              // [Phase 6] 由 lobby 注入
-    pub host_entity_id: EntityId,          // [Phase 6] Host=自己；Remote=Welcome 填
+    pub server: Rc<RefCell<Server>>,   // Local-Only / Host 持有完整 Server
+    pub server_inbox: ServerInbox,     // mpsc 服务端侧
+    pub net: NetEndpoint,              // Local / Host / Remote 统一端点
+    pub camera: Camera,                // 朝向+矩阵；位置由 physics 每帧同步
+    pub physics: LocalPhysics,         // Walk/Fly + 分轴碰撞 + 重力
+    pub hotbar: Hotbar,                // 9 格快捷栏
+    pub pending: PendingActions,       // 挖放 rollback 队列
+    pub current_hit: Option<RaycastHit>, // DDA 命中缓存
+    pub last_break_at_ms: f64,         // 连续挖掘冷却
+    pub mesh_jobs: MeshJobQueue,
+    pub chunk_loader: ChunkLoader,
+    pub frame_clock: FrameClock,
+    pub settings: AppSettings,             // 用户设置
+    pub entity_id: u32,                    // 由 Welcome 填充
+    pub display_name: String,              // 由 lobby 注入
+    pub host_entity_id: EntityId,          // Host=自己；Remote=Welcome 填
 
-    // —— 以下为后续 Phase 引入 ——
-    pub interp: PlayerInterp,          // [Phase 5 ✅]
-    pub chunk_assembler: ChunkAssembler, // [Phase 5 ✅]
-    pub remote_players: HashMap<EntityId, RemotePlayerState>, // [Phase 5 ✅]
-    pub local_input_tick: u32,         // [Phase 8] 本地输入序号；Remote 也单调递增
-    pub input_history: InputHistory,   // [Phase 5 ✅] 以 local_input_tick 记录预测位置
-    pub pending_position_correction: Vec3, // [Phase 8] 中等误差按帧软修正，避免高延迟回弹
-    pub server_clock_offset_ms: f64,   // [Phase 8] 平滑后的 Host 时钟偏移；Pong 半 RTT 校正 + PlayerTick 低权重补充
-    pub server_clock_synced: bool,     // [Phase 8] 第一条时钟样本直接采用，后续指数平滑
-    pub chat: ChatHistory,             // [Phase 6 ✅] 聊天历史（含本地合成的系统消息）
+    // —— 网络、预测、持久化与 UI 状态 ——
+    pub interp: PlayerInterp,
+    pub chunk_assembler: ChunkAssembler,
+    pub remote_players: HashMap<EntityId, RemotePlayerState>,
+    pub local_input_tick: u32,         // 本地输入序号；Remote 也单调递增
+    pub input_history: InputHistory,   // 以 local_input_tick 记录预测位置
+    pub pending_position_correction: Vec3, // 中等误差按帧软修正，避免高延迟回弹
+    pub server_clock_offset_ms: f64,   // 平滑后的 Host 时钟偏移；Pong 半 RTT 校正 + PlayerTick 低权重补充
+    pub server_clock_synced: bool,     // 第一条时钟样本直接采用，后续指数平滑
+    pub chat: ChatHistory,             // 聊天历史（含本地合成的系统消息）
 }
 
-/// 用户设置（[Phase 6 ✅] 取代 [`GameSettings`]；serde JSON 持久化到 localStorage）。
+/// 用户设置；serde JSON 持久化到 localStorage。
 ///
 /// 开发/调优字段（fly_speed / mesh_budget_ms / min_action_interval_ms）标 `#[serde(skip)]`，
 /// 不污染存储，仅在运行时可用。
@@ -235,12 +234,12 @@ pub mod settings_storage {
     pub fn save(settings: &AppSettings);
 }
 
-/// [Phase 2+] 固定步长（1/60）累加器：渲染帧的 dt 累加到 `accumulator`，
+/// 固定步长（1/60）累加器：渲染帧的 dt 累加到 `accumulator`，
 /// 每次 `consume_logic_step` 扣除一步返回 true；累加上限 0.25s 防止后台 Tab 回前台时风暴。
 pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 ```
 
-> Phase 2 不引入 `world_view`：Local 模式下 mesh 回调直接借 `server.world.get_block_world`。Phase 5 加入 Remote 模式时才有 `WorldView` 副本（由 ChunkSnapshot 喂数据）。
+Local / Host 模式下 mesh 回调可直接借 `server.world.get_block_world`；Remote 模式的世界视图由 ChunkSnapshot 和 BlockUpdate 喂入，再交给同一套 mesh job 管线。
 
 ### 世界会话清理
 
@@ -252,7 +251,7 @@ pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 
 ## 五、主循环
 
-### Phase 2 主循环（Lobby / InGame 二态）
+### 主循环分流
 
 `render_frame` 按 `app.state` 分流：
 
@@ -263,18 +262,18 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
 
     match app.borrow().state.clone() {
         AppState::InGame => render_game_frame(app, dt, cw, ch),
-        AppState::Connecting => render_connecting_frame(app, cw, ch),  // [Phase 4+]
+        AppState::Connecting => render_connecting_frame(app, cw, ch),
         _ => render_lobby_frame(app, cw, ch),
     }
 }
 ```
 
-#### `render_connecting_frame`（Phase 4+）
+#### `render_connecting_frame`
 
 专用于 `Connecting` 状态：
 1. `poll_net(app)` — 推进网络状态机（信令+WebRTC 协商）
-2. **drain Server→Client inbox** — Remote 端收 Welcome / ChunkSnapshot / BlockUpdate 等消息（[Phase 5+]）
-3. **区块预载**（[Phase 5+]）：若 `preload_state.active`：
+2. **drain Server→Client inbox** — Remote 端收 Welcome / ChunkSnapshot / BlockUpdate 等消息
+3. **区块预载**：若 `preload_state.active`：
    - Host/Local：调 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成出生点周围 chunk 并入队网格化
    - Remote：仅运行 `mesh_jobs.run_until_budget(16ms)`（chunk 由上一步的 inbox drain 喂入）
    - 统计 `received`（存在于 `world.chunks`）和 `meshed`（有 GPU mesh）
@@ -293,7 +292,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
    - 置 `state = InGame`、`request_pointer_lock_next = true`
 4. 编码 lobby Pass：先 `Clear` 暗蓝色背景，再画 egui
 
-#### `render_game_frame`（9 步，Phase 3）
+#### `render_game_frame`
 
 ```rust
 fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
@@ -328,7 +327,7 @@ fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Resul
 > 2. 后续 ChunkLoader.update 需 `&mut Server` + `&mut Renderer`，用结构体解构借出
 > 3. mesh_jobs.run_until_budget 用 `server.borrow()`（immutable）+ `&mut Renderer`，与上一步不重叠
 
-### Phase 5+ 完整主循环（前瞻）
+### 完整帧顺序
 
 ```rust
 fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -358,7 +357,7 @@ fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
 
 ```rust
 pub struct Camera {
-    pub position: glam::Vec3,    // [Phase 3] 由 LocalPhysics.eye_position() 每帧同步
+    pub position: glam::Vec3,    // 由 LocalPhysics.eye_position() 每帧同步
     pub yaw: f32,                // 弧度
     pub pitch: f32,
     pub fov: f32,
@@ -368,13 +367,13 @@ pub struct Camera {
 }
 
 pub enum CameraMode {
-    Walk,    // [Phase 3 ✅] 受重力、AABB 碰撞
-    Fly,     // [Phase 1+] 无重力、自由飞行
+    Walk,    // 受重力、AABB 碰撞
+    Fly,     // 无重力、自由飞行
 }
 
 impl Camera {
     pub fn forward(&self) -> Vec3;              // 单位向量（含 pitch）
-    pub fn forward_horizontal(&self) -> Vec3;   // [Phase 3] XZ 面单位向量，丢弃 pitch
+    pub fn forward_horizontal(&self) -> Vec3;   // XZ 面单位向量，丢弃 pitch
     pub fn right(&self) -> Vec3;                // 水平面右向
     pub fn view_matrix(&self) -> Mat4;
     pub fn projection_matrix(&self) -> Mat4;
@@ -383,11 +382,11 @@ impl Camera {
 }
 ```
 
-`Camera` **不**持有移动输入逻辑：位置由 `LocalPhysics` 每帧 `eye_position()` 同步覆盖；Fly 移动也归入 physics（Phase 3 删除了 `apply_fly_input`，统一在 `LocalPhysics::step_fly` 中实现）。
+`Camera` **不**持有移动输入逻辑：位置由 `LocalPhysics` 每帧 `eye_position()` 同步覆盖；Fly 移动也归入 physics，统一在 `LocalPhysics::step_fly` 中实现。
 
 ### 6.2 `input.rs`
 
-Phase 3 实装是**扁平 InputState**：每帧累加按键 / 鼠标事件，按"持续"vs"边沿"两类语义存储；帧末 `reset_delta()` 清掉所有边沿，保留持续按下状态。WASM 侧浏览器事件经 `lib.rs::map_key`（`KeyboardEvent.code` → `winit::keyboard::KeyCode`）路由到 `on_key_down/up`。
+`InputState` 是扁平事件缓存：每帧累加按键 / 鼠标事件，按"持续"vs"边沿"两类语义存储；帧末 `reset_delta()` 清掉所有边沿，保留持续按下状态。WASM 侧浏览器事件经 `lib.rs::map_key`（`KeyboardEvent.code` → `winit::keyboard::KeyCode`）路由到 `on_key_down/up`。
 
 ```rust
 pub struct InputState {
@@ -425,7 +424,7 @@ impl InputState {
 
 **指针锁**：进入 InGame 时调用 `canvas.request_pointer_lock()`（必须由用户手势触发，故"开始游戏"按钮的点击事件中发起）。`pointerlockchange` 监听器写回 `pointer_locked`，主循环只在 `pointer_locked=true` 时消费 `mouse_dx/dy` 和 WASD（避免后台移动）。ESC 释放。
 
-### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`（[Phase 2 / Phase 7]）
+### 6.7 `mesh_jobs.rs` · `chunk_loader.rs`
 
 **MeshJobQueue**：
 
@@ -500,21 +499,21 @@ pub fn priority_for_distance(pos: ChunkPos, center: ChunkPos) -> MeshPriority;
 4. 对**这一批新 chunk** 的 4 个水平邻居（已在 `loaded` 中且 `renderer.has_chunk_mesh(neighbor) == true`）以 `MeshPriority::Low` 重新入队，使跨区块剔除生效
 5. 卸载：`loaded` 中切比雪夫距离 `> render_distance + unload_buffer` 的 chunk → `server.unload_chunk` + `mesh_jobs.cancel` + `renderer.drop_chunk_mesh`
 
-> **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠。Phase 2 主循环（[`crates/client/src/lib.rs`](../../crates/client/src/lib.rs)）严格遵守此顺序。
+> **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠，主循环（[`crates/client/src/lib.rs`](../../crates/client/src/lib.rs)）严格遵守此顺序。
 
-### 6.8 `physics.rs`（[Phase 3 ✅]，详见 [`features/physics.md`](../features/physics.md)）
+### 6.8 `physics.rs`（详见 [`features/physics.md`](../features/physics.md)）
 `LocalPhysics { feet_position, velocity, on_ground, mode }`—— Walk 模式：重力（−32 m/s²）、跳跃（8.4 m/s）、lerp 水平加速（HORIZ_ACC=12）、Y/X/Z 分轴碰撞、5cm 地面探测。Fly 模式：直接 `position += dir * FLY_SPEED * dt`。位置驱动 `camera.position = physics.eye_position()`。
 
-### 6.9 `raycast.rs`（[Phase 3 ✅]，详见 [`features/physics.md`](../features/physics.md)）
+### 6.9 `raycast.rs`（详见 [`features/physics.md`](../features/physics.md)）
 Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, normal: IVec3, face: Face, distance }`——`Face` 复用 `render::vertex::Face`。命中条件 `block != AIR && properties(block).solid`。
 
-### 6.10 `hotbar.rs`（[Phase 3 ✅]）
+### 6.10 `hotbar.rs`
 `Hotbar { items: [BlockID; 9], selected: usize }`，1-9 键切换（`InputState::hotbar_request` 边沿）。`block_label(id) -> &'static str` 供 HUD 显示。
 
-### 6.11 `prediction.rs`（[Phase 3 ✅]/[Phase 5 完整]，详见 [`networking/prediction.md`](../networking/prediction.md)）
-Phase 3 已实装 `PendingActions`：挖放操作乐观记录 + ActionAck 协调（commit/rollback）。Phase 5 补输入历史缓冲 + PlayerTick 协调（位置预测）。
+### 6.11 `prediction.rs`（详见 [`networking/prediction.md`](../networking/prediction.md)）
+`PendingActions` 记录挖放操作的乐观结果和 ActionAck 协调（commit/rollback）；`InputHistory` 以本地输入 tick 记录位置，用 PlayerTick 的 `last_input_tick` 做预测协调。
 
-### 6.11 `interp.rs`（[Phase 5 ✅]）
+### 6.12 `interp.rs`
 
 远端玩家位置插值缓冲区：
 
@@ -538,7 +537,7 @@ impl PlayerInterp {
 }
 ```
 
-### 6.12 `storage.rs`（[Phase 8]，Phase 5 仅保留 stub 签名）
+### 6.13 `storage.rs`
 
 ```rust
 #[async_trait::async_trait(?Send)]
@@ -604,7 +603,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
    - Host：信令注册成功后即视为网络 Connected
    - Remote：等 DataChannel 打开后才 Connected
    - Local：跳过此步，直接进入区块预载
-5. **区块预载**（[Phase 5+] 全部三种模式）：网络 Connected 后启动，加载出生点周围 `(2*render_distance+1)^2` 个 chunk：
+5. **区块预载**：网络 Connected 后启动，加载出生点周围 `(2*render_distance+1)^2` 个 chunk：
    - Host/Local：本地 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成 + 入队，每帧 `mesh_jobs.run_until_budget(16ms)` 网格化
    - Remote：先消费 Host bootstrap `ChunkSnapshot`；随后使用 `min(local_render_distance, host_render_distance)` 作为有效视距，若范围内还有缺失 chunk，则发送 `ClientMessage::ChunkRequest` 请求 Host 补齐，收到快照后入队网格化
    - 完成条件：`received >= total && mesh_jobs.is_empty()` → `state = InGame`
@@ -651,7 +650,7 @@ pub struct AppSettings {
 }
 ```
 
-存放：localStorage（轻量配置）；不进 OPFS（OPFS 留给世界数据）。
+存放：localStorage（轻量配置）；不进 OPFS（OPFS 专用于世界数据）。
 
 ---
 

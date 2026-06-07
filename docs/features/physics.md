@@ -200,7 +200,7 @@ fn collides_with_world(world: &WorldView, aabb: &Aabb) -> bool {
 }
 ```
 
-`properties(block).solid` 区分实体与非实体：AIR/WATER/GLASS 不参与碰撞（玻璃可碰撞，看实际游戏设计；本期默认玻璃可碰撞）。
+`properties(block).solid` 区分实体与非实体：AIR/WATER/GLASS 不参与碰撞（玻璃是否碰撞取决于方块表配置；当前默认玻璃可碰撞）。
 
 ### 4.5 地面检测
 
@@ -402,7 +402,7 @@ fn on_right_click(&mut self) {
 
     // 计算放置位置 = 命中面外侧
     let neighbor_pos = neighbor_of(hit.block_pos, hit.face);
-    let block_to_place = self.selected_block;   // HUD hotbar 选择的方块（本期固定 STONE 或简单 1-9 切换）
+    let block_to_place = self.selected_block;   // HUD hotbar 选择的方块
 
     // 校验本地：放置位置不能与玩家 AABB 重叠
     let block_aabb = Aabb::block_at(neighbor_pos.x, neighbor_pos.y, neighbor_pos.z);

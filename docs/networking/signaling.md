@@ -309,7 +309,7 @@ new_classes = ["Room"]
 ICE_SERVERS_PUBLIC = '[{"urls":["stun:stun.l.google.com:19302"]}]'
 
 # 敏感配置通过 wrangler secret put 注入：
-# TURN_SECRET = "..."          （v2 阶段使用）
+# TURN_SECRET = "..."          （可选 TURN 中继使用）
 ```
 
 部署：

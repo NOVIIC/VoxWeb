@@ -3,9 +3,9 @@
 > **何时阅读**：改存档逻辑；增删存储字段；调写入频率；处理配额异常；评估迁移到 Worker 同步路径
 > **关联文档**：[`README.md`](../../README.md) · [`modules/server.md`](../modules/server.md) · [`modules/client.md`](../modules/client.md) · [`reference.md`](../reference.md) · [`roadmap.md`](../roadmap.md)
 >
-> **Phase 8 状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
+> **当前状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
 > `PersistenceManager` snapshot/commit/failure、启动 prime、1s 周期 flush、LRU/pinned、配额 UI、
-> `storage_version` 高版本拒绝与大厅删档入口已实现。Worker sync handle 仍按本文 §十二保留为后续升级路径。
+> `storage_version` 高版本拒绝与大厅删档入口已实现。Worker sync handle 作为可选升级路径保留在 §十二。
 
 ---
 
@@ -17,7 +17,7 @@
 
 存档生命周期绑定到 **房间号 + 世界种子**。同一房间号 + 同一种子 → 同一份存档；不同种子 → 不同存档（同房间号下的"另开一个世界"）。
 
-> 历史：本项目曾计划用 IndexedDB（[git log](../) 可查 Phase 5 早期草案），但在评估"多人长期房间"（约 10000 dirty chunk）压力时发现 IDB 在配额、内存常驻、启动加载、退出 flush 四方面会同时撞墙，故改为 OPFS。详见下节对比。
+> 背景：本项目评估过 IndexedDB，但在"多人长期房间"（约 10000 dirty chunk）压力下，IDB 在配额、内存常驻、启动加载、退出 flush 四方面都会撞墙，故改为 OPFS。详见下节对比。
 
 ---
 
@@ -31,9 +31,9 @@
 | 用户可见文件 | 否 | 否 | ✅ 是 |
 | 每次会话需授权 | 否 | 否 | ✅ 是 |
 | `pagehide` 同步落盘 | 不可能 | ✅ Worker + sync handle 可 | 不可能 |
-| 选用为主存储 | ✗ | ✅ | ✗（作为 Phase 9 stretch 可选导出） |
+| 选用为主存储 | ✗ | ✅ | ✗（仅作为可选导出渠道） |
 
-OPFS 是当前唯一同时满足"全浏览器、多 GB 容量、可同步落盘"的方案。File System Access API 留作 Phase 9 「导出存档到本地文件夹」可选导出渠道。
+OPFS 是当前唯一同时满足"全浏览器、多 GB 容量、可同步落盘"的方案。File System Access API 留作「导出存档到本地文件夹」可选导出渠道。
 
 ---
 
@@ -87,7 +87,7 @@ opfs:/voxweb/
 
 ## 四、Chunk 压缩格式（palette + RLE）
 
-> 此格式同时用于 **OPFS 磁盘存储**（本节）和 **ChunkSnapshot 网络传输**（[`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。网络侧已实装 `encode_chunk` / `decode_chunk`（`crates/core/src/chunk.rs`）；磁盘侧延后至 Phase 8。
+> 此格式同时用于 **OPFS 磁盘存储**（本节）和 **ChunkSnapshot 网络传输**（[`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。网络和磁盘侧都复用 `crates/core/src/chunk.rs` 的 encode/decode 逻辑。
 
 未压缩的 `Chunk` 在内存中是 `Vec<BlockID>`，长度 65536，每个 `BlockID` 2 字节 = **128 KB/chunk**。万级 chunk 直接 dump 会撑爆 OPFS 配额。
 
@@ -209,7 +209,7 @@ pub struct OpfsStorage {
 
 ## 六、读写时机
 
-### 6.1 启动 prime 阶段（同步预加载）
+### 6.1 启动 prime（同步预加载）
 
 **目的**：让玩家出生即看到正确地形，避免落地后才异步覆盖造成视觉跳变。
 
@@ -253,7 +253,7 @@ async fn start_host(app: &mut App, room_id: String, seed: u64) {
 
 注意：server crate 本身保持平台无关（无 `web-sys` 依赖）。异步 load 由 client 端协程发起，通过 `futures-channel` mpsc 把 `(pos, decoded_chunk)` 推给 server tick 消费。
 
-副作用：在极短时间内（异步 load 完成前）玩家可能看到 terrain 生成的"原始版本"。缓解：prime 阶段已覆盖出生点；玩家不可能瞬间走出 prime 半径。
+副作用：在极短时间内（异步 load 完成前）玩家可能看到 terrain 生成的"原始版本"。缓解：prime 已覆盖出生点；玩家不可能瞬间走出 prime 半径。
 
 ### 6.3 周期 flush
 
@@ -345,7 +345,7 @@ struct World {
 
 **容量选择**：4096 chunk 约 1 km² 实加载区，覆盖渲染距离 16 仍有余量。容量做 runtime 可调（设置菜单 + 配置上限 1 万），以兼容设置渲染距离极高的桌面用户。
 
-> **注意**：未压缩 chunk in-memory 仍是 128 KB；4096 chunk = 512 MB，在 wasm32 限额内但偏紧。Phase 8 可考虑 in-memory 也用 palette 压缩（懒解码），但初期不做。
+> **注意**：未压缩 chunk in-memory 仍是 128 KB；4096 chunk = 512 MB，在 wasm32 限额内但偏紧。若后续继续提高 cache capacity，可考虑 in-memory 也用 palette 压缩（懒解码）。
 
 ---
 
@@ -417,7 +417,7 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 }
 ```
 
-`migrations` 是有序数组，每项 `fn(&mut World, &OpfsStorage) -> Result<(), MigrationError>`。Phase 8 仅含 identity（v1→v1）；v2 协议升级时新增 v1→v2 步骤。
+`migrations` 是有序数组，每项 `fn(&mut World, &OpfsStorage) -> Result<(), MigrationError>`。当前仅含 identity（v1→v1）；后续 schema 升级时新增对应迁移步骤。
 
 不再"版本不同就删档"——大存档用户的累积损失不可接受。
 
@@ -439,9 +439,9 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 
 ## 十二、Variant A vs Variant B（Worker）
 
-两种实现路径，Phase 8 默认走 A，视真实丢数据投诉决定是否升级 B。
+当前实现走 A；若出现可观察的关闭 Tab 丢数据，再升级到 B。
 
-### Variant A：无 Worker，单线程 async（**Phase 8 默认**）
+### Variant A：无 Worker，单线程 async（当前实现）
 
 - 序列化在主线程；OPFS 写入走 `createWritable / write / close` 异步 API
 - `pagehide` 内 `spawn_local`，尽力 await；BFCache 路径下浏览器会等待完成
@@ -449,7 +449,7 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 - 代码量：≈ 600 行 Rust，0 行 JS
 - 风险：极端情况下关 Tab 仍可能丢 < 1 秒编辑；万级 chunk 一次性 encode 可能造成单帧卡顿（缓解：每帧最多 4 chunk encode）
 
-### Variant B：Dedicated Worker + sync handle（**Phase 8 升级路径**）
+### Variant B：Dedicated Worker + sync handle（可选升级）
 
 - 新增 `crates/client/src/storage_worker.rs`，独立 wasm 包
 - Worker 内独占 `FileSystemSyncAccessHandle`，可同步 `write()` 落盘
@@ -492,7 +492,7 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 
 ```js
 window.voxwebDebug.listWorlds()              // 列所有存档 key
-window.voxwebDebug.exportWorld(roomId, seed) // 触发 .l3w 下载（Phase 9）
+window.voxwebDebug.exportWorld(roomId, seed) // 触发 .l3w 下载
 window.voxwebDebug.clearAllWorlds()          // 一键清空 OPFS
 window.voxwebDebug.fillDirty(n)              // 注入 n 个伪 dirty chunk（stress 测试）
 window.voxwebDebug.quota()                   // 打印 quota / usage
@@ -520,7 +520,7 @@ window.voxwebDebug.quota()                   // 打印 quota / usage
 
 ---
 
-## 十六、世界导出 / 导入（Phase 9 stretch）
+## 十六、世界导出 / 导入（可选）
 
 格式：`.l3w` 文件（zip 压缩 bincode）
 - 内含 `world.json` + `_meta_local.json` + 若干 `chunks/<cx>_<cz>.bin`
@@ -529,7 +529,7 @@ window.voxwebDebug.quota()                   // 打印 quota / usage
   - Firefox / Safari：触发浏览器单文件下载
 - 大厅"导入存档" → `<input type="file">` → 解压写入 OPFS
 
-不在 Phase 8 范围。
+当前未实现，作为可选增强保留。
 
 ---
 

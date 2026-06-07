@@ -113,8 +113,7 @@ wasm-pack test --headless --chrome -p voxweb-client
 > - `?signaling=ws://host:port`：覆盖 `<meta name="signaling-url">`，**仅当 query 缺失时才回退到 meta**。
 > - `?room=<id>`：进入 Lobby 时自动填入 Room ID 输入框；房主点 Create Room 后也会通过 `history.replaceState` 写回这个参数。
 
-预期：双方都进入 InGame，HUD 出现 `RTT xx.x ms`；`chrome://webrtc-internals` 可见双 DC `open`。
-Phase 4 本期两端各自渲染独立的本地世界（不互相同步），世界同步在 Phase 5 实装。
+预期：双方都进入 InGame，HUD 出现 `RTT xx.x ms`；`chrome://webrtc-internals` 可见双 DC `open`。Remote 能看到 Host 推送的初始地形、玩家列表和 BlockUpdate。
 
 ---
 
@@ -193,7 +192,7 @@ trunk build --release
 #     voxweb-client-<hash>_bg.wasm
 ```
 
-> ⚠️ **`wasm-opt` 当前未在工具链中**：`start.html` 的 `data-wasm-opt="z"` 已配置好，trunk 检测到 `wasm-opt` 在 PATH 时会自动调用；否则跳过并 warn。本机器人当前观察到 `wasm-opt` 缺失，导致 wasm 体积偏大（Phase 0 实测 2.10 MB gz，目标 1.5 MB）。
+> ⚠️ **`wasm-opt` 可能未在工具链中**：`start.html` 的 `data-wasm-opt="z"` 已配置好，trunk 检测到 `wasm-opt` 在 PATH 时会自动调用；否则跳过并 warn，导致 wasm 体积偏大。
 > 安装：
 > - Windows：`winget install -e --id WebAssembly.WABT` 或下载 [binaryen release](https://github.com/WebAssembly/binaryen/releases) 解压加 PATH
 > - macOS：`brew install binaryen`
@@ -216,11 +215,11 @@ strip = "symbols"
 
 ### 4.3 体积目标
 
-| 阶段 | WASM 大小（gz） | 总下载（gz） |
+| 构建形态 | WASM 大小（gz） | 总下载（gz） |
 |---|---|---|
-| Phase 0-2 | < 2 MB | < 3 MB |
-| Phase 5 完成 | < 4 MB | < 5 MB |
-| 全功能（Phase 9） | < 6 MB | < 8 MB |
+| 调试 / 未优化 | < 8 MB | < 10 MB |
+| release + wasm-opt | < 6 MB | < 8 MB |
+| release + wasm-opt + 后续素材增长 | < 8 MB | < 12 MB |
 
 超出预期时检查：
 ```bash
@@ -311,7 +310,7 @@ wrangler deploy
 ### 6.4 环境变量
 
 ```bash
-wrangler secret put TURN_SECRET     # v2 阶段
+wrangler secret put TURN_SECRET     # 可选 TURN 中继
 wrangler secret put ALLOWED_ORIGINS # 仅放游戏域名
 ```
 

@@ -17,15 +17,14 @@
 
 ---
 
-### 阶段实装范围
+### 当前管线
 
-| 阶段 | 包含 |
-|---|---|
-| **Phase 1 ✅** | u32 顶点压缩格式（§2）；朴素逐面（`generate_opaque_mesh`） |
-| **Phase 2 ✅** | `generate_with_neighbors`（§4 跨区块面剔除）；`MeshJobQueue` + `MeshPriority` 4 档枚举（§6） |
-| **Phase 7 ✅** | 贪婪网格化（§3 替换朴素逐面）；AO（§5）；视锥剔除（§9）；index buffer + 性能统计 |
+当前默认路径为 `generate_with_neighbors`：
 
-Phase 7 已将默认路径切到贪婪网格化 + AO + index buffer；`ChunkMeshCpu::visible_faces` 保留 Phase 2 等价顶点数，供 HUD 展示优化比例。
+- 先用 `get_block_world` 做跨区块面剔除
+- 再按方向构造 mask，用贪婪网格化合并同材质且 AO 一致的可见单位面
+- 输出 `vertices + indices + bounds + visible_faces`
+- `visible_faces` 记录逐面基线的可见单位面数量，供 HUD 展示优化比例
 
 ---
 
@@ -114,7 +113,7 @@ UV 计算：贪婪合并后的大矩形，UV 从 (0,0) 一直平铺到 (w, h) �
 
 ## 三、贪婪网格化算法
 
-> **Phase 7 已实装**。`generate_with_neighbors` 保持原入口，但内部已从逐面遍历切换为贪婪 mask 合并；同材质且 4 个角点 AO 完全一致的单位面才会合并。
+`generate_with_neighbors` 保持稳定入口，内部使用贪婪 mask 合并；同材质且 4 个角点 AO 完全一致的单位面才会合并。
 
 ### 思路
 对每个面方向（6 个），按层（如 PosY 面就按 Y 层）扫描每一层 16×16 平面，把"需要绘制此面"的格子加入 mask，然后从 mask 中提取最大矩形（贪婪扩展宽高），生成一个大四边形。
@@ -202,8 +201,6 @@ for ly in 0..CHUNK_Y {
 
 ## 四、跨区块面剔除
 
-> **Phase 2** 实装。这是 Phase 2 体素单人模式的视觉正确性关键。
-
 ### 问题
 普通"面剔除"只看同一 chunk 内的相邻方块。chunk 边界处的方块永远找不到邻居（其它 chunk 数据），导致边界面被多绘制。
 
@@ -212,7 +209,7 @@ for ly in 0..CHUNK_Y {
 
 ```rust
 /// 跨区块面剔除版本的网格化。
-/// Phase 7 内部使用贪婪 mask 合并；每个候选面仍通过 get_block_world 判断可见性。
+/// 内部使用贪婪 mask 合并；每个候选面仍通过 get_block_world 判断可见性。
 /// 同 chunk 内的查询也走这个回调（统一接口，回调内部自行判断 chunk 内/外）。
 pub fn generate_with_neighbors(
     chunk: &Chunk,
@@ -239,7 +236,7 @@ let mesh = chunk_mesh::generate_with_neighbors(
 
 ## 五、AO 计算
 
-> **Phase 7 已实装**。Phase 2 顶点 AO 一律为 3（最亮，无遮蔽）；Phase 7 起 AO 写入 packed vertex 的最高 2 bit，并由 `chunk.wgsl` 做亮度衰减。
+AO 写入 packed vertex 的最高 2 bit，并由 `chunk.wgsl` 做亮度衰减。
 
 每个顶点的 AO 取决于附近 3 个方块（同面方向的两个邻接边 + 一个对角）：
 
@@ -258,8 +255,6 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
 ---
 
 ## 六、网格化任务调度
-
-> **Phase 2** 实装。
 
 ### 优先级
 
@@ -305,15 +300,15 @@ pub fn run_until_budget(
 }
 ```
 
-`now_ms` 在运行期是 `web_sys::Performance::now()` 的薄包装；单元测试可注入受控时钟。`MeshRunStats` 被 HUD 用来显示本批 mesh 的耗时、上传顶点/索引数和相对 Phase 2 的顶点减少比例。
+`now_ms` 在运行期是 `web_sys::Performance::now()` 的薄包装；单元测试可注入受控时钟。`MeshRunStats` 被 HUD 用来显示本批 mesh 的耗时、上传顶点/索引数和相对逐面基线的顶点减少比例。
 
 ### 触发条件
 
 将 chunk 加入网格化队列：
-- 首次加载（Local 模式由 `ChunkLoader.update` 触发；Phase 5 Remote 模式由 ChunkSnapshot 组装完成触发）
-- 方块更新（自身或相邻 chunk 边界方块）— Phase 3
-- 邻居 chunk 由"未加载"变"已加载"时 — Phase 2 由 `ChunkLoader.update` 显式触发（见 `docs/modules/client.md` §6.7）
-- 玩家走出后再回来 — Phase 2 由 `ChunkLoader.update` 触发
+- 首次加载（Local / Host 由 `ChunkLoader.update` 触发；Remote 由 ChunkSnapshot 组装完成触发）
+- 方块更新（自身或相邻 chunk 边界方块）
+- 邻居 chunk 由"未加载"变"已加载"时，由 `ChunkLoader.update` 显式触发（见 `docs/modules/client.md` §6.7）
+- 玩家走出后再回来，由 `ChunkLoader.update` 触发
 
 ### 防重复 / 优先级升级
 `pending: HashMap<ChunkPos, MeshPriority>` 防止同一 chunk 入队两次；若已排队的 chunk 又以更高优先级入队，则从旧队列移除并升级到新队列。这样玩家脚下的 `Critical` chunk 不会被早先的 `Medium/Low` 任务卡住。
@@ -323,10 +318,10 @@ pub fn run_until_budget(
 ## 七、与远程数据流的协同
 
 ### Local-Only / Host
-- 本地 `server.world` 改 → 标记 dirty → 入队（Phase 3 后挖放，Phase 2 仅 ChunkLoader 滚动触发）
+- 本地 `server.world` 改 → 标记 dirty → 入队
 - 同步快
 
-### Remote（[Phase 5]）
+### Remote
 - 收到 `ChunkSnapshot` → assembler 组装完成 → `world_view.insert(pos, chunk)` → 入队
 - 收到 `BlockUpdate` → `world_view.set_block` → 该 chunk + 6 邻居（如果方块在边界）入队
 
@@ -349,14 +344,14 @@ fn enqueue_with_neighbors(&mut self, pos: Position, priority: Priority) {
 
 ## 八、CPU 数据结构
 
-### Phase 7 实装（贪婪网格 + index buffer + bounds）
+### 当前结构（贪婪网格 + index buffer + bounds）
 
 ```rust
 pub struct ChunkMeshCpu {
     pub vertices: Vec<PackedVertex>, // packed u32
     pub indices: Vec<u32>,         // 贪婪合并后每 quad 6 个索引
     pub bounds: Aabb,              // 视锥剔除用
-    pub visible_faces: u32,         // Phase 2 等价可见单位面数量
+    pub visible_faces: u32,         // 逐面基线的可见单位面数量
 }
 
 pub struct ChunkMeshGpu {
@@ -368,13 +363,13 @@ pub struct ChunkMeshGpu {
 }
 ```
 
-`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 vertex/index buffers + 写入世界坐标 bounds）。每个 chunk 继续持有独立 `globals_buffer + bind_group`，以规避 `queue.write_buffer` 合并写入问题（详见 [`docs/reference.md` §3.1](../reference.md#31-webgpu)）。Phase 7 的 OpaquePass 在单个 render pass 内循环 `set_bind_group` + `draw_indexed`，不再为每个 chunk 开一个 render pass。
+`Renderer::upload_chunk_mesh` 把 `ChunkMeshCpu` 转 `ChunkMeshGpu`（创建 vertex/index buffers + 写入世界坐标 bounds）。每个 chunk 继续持有独立 `globals_buffer + bind_group`，以规避 `queue.write_buffer` 合并写入问题（详见 [`docs/reference.md` §3.1](../reference.md#31-webgpu)）。OpaquePass 在单个 render pass 内循环 `set_bind_group` + `draw_indexed`，不再为每个 chunk 开一个 render pass。
 
 ---
 
 ## 九、视锥剔除
 
-> **Phase 7 已实装**。`Renderer::render_world` 从 `view_proj` 抽取 6 个平面，按 chunk 的世界 AABB 做正顶点测试，HUD 显示 `VISIBLE / CULLED / DRAW_V/I`。
+`Renderer::render_world` 从 `view_proj` 抽取 6 个平面，按 chunk 的世界 AABB 做正顶点测试，HUD 显示 `VISIBLE / CULLED / DRAW_V/I`。
 
 每帧渲染前根据相机视锥过滤需要 draw 的 chunk：
 

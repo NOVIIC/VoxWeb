@@ -19,7 +19,7 @@
 
 ## 二、UI 状态路由
 
-每帧 `client::ui::draw` 按 `AppState` 决定渲染什么。Phase 6 的终态枚举把 `EscMenu` / `ChatOpen` 升级为 `InGame` 子状态位，让 HUD / 名牌可无视暂停 / 聊天叠加层始终绘制。参见 [`crates/client/src/app.rs:48-66`](../../crates/client/src/app.rs)：
+每帧 `client::ui::draw` 按 `AppState` 决定渲染什么。暂停和聊天是 `InGame` 的子状态位，让 HUD / 名牌可无视暂停 / 聊天叠加层始终绘制。参见 [`crates/client/src/app.rs:48-66`](../../crates/client/src/app.rs)：
 
 ```rust
 pub enum AppState {
@@ -170,7 +170,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 ## 四、`ui/lobby.rs` — 连接中视图
 
-`draw_connecting()` 负责 Connecting 状态下的加载界面（[Phase 4+ 网络协商] + [Phase 5+ 区块预载]）。
+`draw_connecting()` 负责 Connecting 状态下的加载界面（网络协商 + 区块预载）。
 
 函数签名：
 ```rust
@@ -231,12 +231,12 @@ FPS: 60.2
 延迟: 78ms (peer)
 状态: Connected
 VISIBLE / CULLED / DRAW_V/I
-MESH ms / jobs / Phase2→Greedy 顶点
+MESH ms / jobs / naive→greedy 顶点
 PASS world / player / selection / ui ms
 SAVE 当前世界占用 / (总空间 - 其它世界占用)
 ```
 
-仅在 `app.settings.show_stats == true` 显示（暂停菜单可切换）。Phase 7 起左上角统计面板也显示视锥剔除数量、draw 顶点/索引数、网格化批次耗时和各 pass 的 CPU 编码耗时。
+仅在 `app.settings.show_stats == true` 显示（暂停菜单可切换）。左上角统计面板也显示视锥剔除数量、draw 顶点/索引数、网格化批次耗时和各 pass 的 CPU 编码耗时。
 空间数值由 `format_storage_bytes` 统一格式化，保留一位小数并在 B/KB/MB/GB/TB 间自适应切换。
 
 ### 右上角：玩家列表
@@ -305,7 +305,7 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 最近 5 条消息浮窗，5 秒后渐隐。聊天框打开时显示完整历史。详见下文。
 
-### 屏幕底部中央：Hotbar（Phase 3 ✅ · 9 格）
+### 屏幕底部中央：Hotbar（9 格）
 
 横向 9 格，每格 54×36，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格上行显示槽位号 1-9，下行显示方块标签（`STONE` / `DIRT` / ...）；选中格金色高亮（240, 200, 80, 220），文字反色为黑；非选中格深灰底（60, 70, 80, 200）+ 浅色文字。
 
@@ -335,7 +335,7 @@ egui::Area::new(egui::Id::new("hud_hotbar"))
     });
 ```
 
-切换：1-9 数字键（`InputState::hotbar_request` 边沿）。鼠标滚轮切换 + 图标渲染留给 Phase 6（egui ImageButton + 纹理图集裁剪）。
+切换：1-9 数字键（`InputState::hotbar_request` 边沿）。鼠标滚轮切换和图标渲染属于可选增强。
 
 > **历史坑**：早期实现用 `set_min_size + vertical_centered` 组合，导致 9 个 Frame 均摊到完整屏幕宽，只剩第 1 格可见（commit 95b262a 修复）。新代码不要再用这两个 API 嵌套在 horizontal 内。
 
@@ -411,10 +411,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
 `resume_game` 必须重新发起 `request_pointer_lock`（在按钮的点击 closure 内同步发起）。
 
-> **Phase 6 实装差异**：
-> - 上图与示例代码里的「☐ 启用 Depth Pre-Pass」复选框**Phase 6 内未暴露**，留到 Phase 8 的多 Pass 重构一起加（届时整个渲染管线会切到 Render Graph）。当前 [`crates/client/src/ui/pause.rs`](../../crates/client/src/ui/pause.rs) 只渲染 FOV / 灵敏度 / 渲染距离 / 插值延迟 / 显示统计 5 项。
-> - 实际函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, SaveNow, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 立即保存 / 切回大厅 / 重新请求指针锁。
-> - 设置在 `Resume` / `ExitToLobby` 时通过 [`settings_storage::save`](../../crates/client/src/settings_storage.rs) 写入 localStorage（键 `voxweb.settings.v1`，JSON 编码 + schema 版本头）。下次进入大厅时由 `settings_storage::load()` 读回，失败回退 `AppSettings::default()`。
+当前函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, SaveNow, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 立即保存 / 切回大厅 / 重新请求指针锁。
+
+设置在 `Resume` / `ExitToLobby` 时通过 [`settings_storage::save`](../../crates/client/src/settings_storage.rs) 写入 localStorage（键 `voxweb.settings.v1`，JSON 编码 + schema 版本头）。下次进入大厅时由 `settings_storage::load()` 读回，失败回退 `AppSettings::default()`。
 
 ---
 
@@ -546,7 +545,7 @@ pub fn draw_nameplates(app: &App, ctx: &egui::Context) {
 }
 ```
 
-**深度遮挡**：本期不实现"被墙挡住时变半透明"（需要从深度纹理采样，复杂）。v2 可以加。
+**深度遮挡**：当前用相机到玩家头顶的 DDA 射线判断遮挡；被方块挡住时名牌淡出。
 
 **距离衰减**：超过 32m 不显示（避免远处密密麻麻）。
 
@@ -619,7 +618,7 @@ ctx.set_pixels_per_point(dpr);
 
 ## 十三、不在范围
 
-- 拖拽 / 调整窗口大小（egui 自带；本期使用 anchor 固定布局）
+- 拖拽 / 调整窗口大小（egui 自带；当前使用 anchor 固定布局）
 - 主题切换 / 亮色暗色
 - 国际化（仅中文）
 - 复杂 hotbar UI（图标渲染）— v2

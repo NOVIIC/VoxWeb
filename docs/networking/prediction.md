@@ -330,7 +330,7 @@ pub fn advance(&mut self, _dt: f32) {
 ### 5.4 渲染时使用
 
 `render` 模块通过 `frame_data.remote_players` 拿到所有远端玩家的 `current_pos / yaw / pitch`，渲染：
-- 玩家身体（一个简单 box / capsule，Phase 6 加入）
+- 玩家身体（一个简单 box / capsule）
 - 名牌（egui billboard，详见 [`features/ui.md`](../features/ui.md)）
 
 ### 5.5 参数调优

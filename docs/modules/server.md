@@ -21,19 +21,17 @@
 
 ---
 
-### 阶段实装范围
+### 当前组成
 
-本文档涵盖 server crate 的**长期完整设计**。各阶段实装范围：
+当前 server crate 覆盖完整权威世界循环：
 
-| 阶段 | 包含 |
-|---|---|
-| **Phase 2 ✅** | `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk`；`TerrainGenerator`（已在 Phase 1 stub）；`Server::handle_message` 仅 `Hello → Welcome` 占位 + `Break/Place` 无校验直改 |
-| **Phase 3 ✅** | `physics::validate_break/place`（6m 射程 + AABB overlap）；`Server::players` 最小 tracker（feat Hello 插入 + PlayerInput 更新）；Break/Place 调 validate → ActionAck + BlockUpdate 闭环 |
-| **Phase 4 ✅** | Server 不变；`net` 层新增 Host/Remote 角色以 P2P 转发 ClientMessage/ServerMessage；Server 通过 `handle_message` 闭包被 `NetEndpoint::poll` 驱动处理 peer 消息 |
-| Phase 5 ✅ | `PlayerEntity` 表 + `add_player/remove_player`；`PlayerInput` 限速校验；`broadcast_tick`（PlayerTick 广播）；`send_initial_snapshot`；`outbox` + `Recipient` 路由；OPFS 持久化整体延后至 Phase 8 |
-| Phase 8 | 补 Phase 5 延后的持久化全套（chunk encode/decode、OpfsStorage、PersistenceManager、LRU、迁移框架、配额 UI）；新增 `ChunkRequest` 处理与 Host 视距上限同步 |
-
-下面 §3 起描述的是**完整设计**；每节遇到 Phase 3+ 才引入的字段会用 `> Phase N` 注明。
+- `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
+- `TerrainGenerator` 负责确定性 Perlin 高度图地形
+- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性
+- `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
+- `Server` 通过 `handle_message` 消费 Local / Host / Remote 输入，向 outbox 写入点对点或广播消息
+- `send_initial_snapshot` 与 `ChunkRequest` 负责 Remote 初始和运行时 chunk 同步
+- `dirty_chunks`、LRU 和 pinned 集合为 OPFS 持久化提供最小变更集和内存上限
 
 ---
 
@@ -58,36 +56,34 @@ crates/server/src/
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
-    pub terrain: TerrainGenerator,           // [Phase 2] Perlin 高度图
-    pub tick_count: u64,                     // [Phase 2] tick 累加器；Phase 5 起驱动玩家广播
-    pub dirty_chunks: HashSet<ChunkPos>,     // [Phase 5] 需要持久化的 chunk
-    pub players: HashMap<EntityId, PlayerEntity>,  // [Phase 5] 完整玩家实体表
+    pub terrain: TerrainGenerator,           // Perlin 高度图
+    pub tick_count: u64,                     // tick 累加器；驱动玩家广播
+    pub dirty_chunks: HashSet<ChunkPos>,     // 需要持久化的 chunk
+    pub players: HashMap<EntityId, PlayerEntity>,
 }
 
 impl World {
-    /// [Phase 2] 若 chunk 未生成则调 terrain 生成并插入；已存在则跳过。
+    /// 若 chunk 未生成则调 terrain 生成并插入；已存在则跳过。
     pub fn ensure_chunk_generated(&mut self, pos: ChunkPos);
 
-    /// [Phase 2] 世界坐标查询；chunk 未加载或 y 越界一律返回 AIR。
+    /// 世界坐标查询；chunk 未加载或 y 越界一律返回 AIR。
     /// 用于 chunk_mesh::generate_with_neighbors 的回调。
     pub fn get_block_world(&self, wx: i32, wy: i32, wz: i32) -> BlockID;
 
-    /// [Phase 2] 卸载 chunk（移除 chunks 表）。dirty_chunks 不在 Phase 2 使用。
+    /// 卸载 chunk（移除 chunks 表）。调用方需要先处理 dirty flush / pinned 约束。
     pub fn unload_chunk(&mut self, pos: ChunkPos);
 
-    /// [Phase 1/2] 直接读写方块（Phase 3 起会触发 dirty）。
-    /// Phase 2：`get_block` 等价于 `get_block_world(pos.x, pos.y, pos.z)`；
-    /// `set_block` 在 chunk 未加载或 local_index 越界时静默忽略。
+    /// 直接读写方块；`set_block` 会标记 dirty，chunk 未加载或 local_index 越界时静默忽略。
     pub fn get_block(&self, pos: Position) -> BlockID;
     pub fn set_block(&mut self, pos: Position, block: BlockID);
 
-    /// [Phase 1/2] 推进 tick 计数（Phase 5 起会驱动玩家广播）。
+    /// 推进 tick 计数。
     pub fn tick(&mut self);
 }
 
-pub type EntityId = u32;     // [Phase 5]
+pub type EntityId = u32;
 
-/// [Phase 5] 玩家实体
+/// 玩家实体
 pub struct PlayerEntity {
     pub entity_id: EntityId,
     pub display_name: String,
@@ -104,16 +100,15 @@ pub struct PlayerEntity {
 ```rust
 pub struct Server {
     pub world: World,
-    pub tick: u32,                           // [Phase 1+]
-    pub seed: u64,                           // [Phase 1+]
-    pub players: HashMap<u32, Vec3>,         // [Phase 3 ✅] entity_id → feet_position（挖放仲裁用）
-    pub outbox: VecDeque<OutboundMessage>,   // [Phase 5] 待广播的消息
+    pub tick: u32,
+    pub seed: u64,
+    pub players: HashMap<u32, Vec3>,         // entity_id → feet_position（挖放仲裁用）
+    pub outbox: VecDeque<OutboundMessage>,   // 待广播的消息
 }
 
 // ServerConfig 和 physics 常量直接写在 physics.rs（MAX_REACH=6.0 等），
-// Phase 3 不引入 ServerConfig 结构体（Keep It Simple）。
+// 目前不引入 ServerConfig 结构体（Keep It Simple）。
 
-/// [Phase 5]
 pub struct OutboundMessage {
     pub recipient: Recipient,
     pub message: ServerMessage,
@@ -126,18 +121,17 @@ pub enum Recipient {
 }
 
 impl Server {
-    /// [Phase 1+]
     pub fn new(seed: u64) -> Self;
 
-    /// [Phase 3 ✅] 处理来自客户端的消息（Local 或 Remote）。
+    /// 处理来自客户端的消息（Local 或 Remote）。
     /// Hello → 插入 players 表 + Welcome；PlayerInput → 更新 players 表；
     /// Break/Place → 调 validate → Ok 则 set_block + ActionAck + BlockUpdate；失败仅 ActionAck。
     pub fn handle_message(&mut self, sender: u32, msg: ClientMessage) -> Vec<ServerMessage>;
 
-    /// [Phase 1+] 推进一个逻辑帧（60Hz 调用）。Phase 2-3 仅累加 tick + world.tick。
+    /// 推进一个逻辑帧（60Hz 调用）。
     pub fn tick(&mut self);
 
-    // —— 以下为 Phase 5 引入 ——
+    // —— 多人同步与 outbox ——
     pub fn add_player(&mut self, display_name: String) -> EntityId;
     pub fn remove_player(&mut self, entity_id: EntityId);
     pub fn drain_outbox(&mut self) -> Vec<OutboundMessage>;
@@ -153,26 +147,19 @@ impl Server {
 ### Chunk 生命周期
 
 ```
-[Phase 2 simplified]
-  ChunkLoader 滚动 ──▶ World::ensure_chunk_generated(pos)
-                          ├─ 已加载？跳过
-                          └─ 未加载？terrain.generate_chunk(pos) → 插入
+ChunkLoader / ChunkRequest ──▶ World::ensure_chunk_generated(pos)
+                                  ├─ 已加载？跳过
+                                  ├─ OPFS 有存档？由 client::storage 异步加载后回写
+                                  └─ 未加载且无存档？terrain.generate_chunk(pos) → 插入
 
-  ChunkLoader 滚动 ──▶ World::unload_chunk(pos)
-                          └─ 直接 remove
-
-[Phase 5 完整版]
-  首次访问 ──▶ get_or_generate(pos)
-                ├─ 已加载？返回引用
-                ├─ 持久化中有？load（异步，先返回 Empty 占位 + 标记 loading）
-                └─ 都没有？terrain::generate(seed, pos) → 插入
+LRU / 视距卸载 ──▶ flush dirty（由 client 触发） ──▶ World::unload_chunk(pos)
 ```
 
-**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`（Phase 8）。
+**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`。
 
 ### 玩家位置更新
 
-> Phase 5 引入。Phase 2 单人 Fly 模式不走该路径。
+Remote 加入房间后走玩家实体表；Local-Only 仍可通过同一套消息入口维护用于挖放仲裁的 feet position。
 
 ```rust
 fn handle_player_input(&mut self, entity: EntityId, msg: PlayerInput) {
@@ -234,9 +221,7 @@ fn broadcast_tick(&mut self) {
 
 ## 五、`terrain.rs` — 地形生成
 
-> Phase 2 ✅ 已实装基础形态（在 Phase 1 stub 基础上接入 `World::ensure_chunk_generated`）。
-
-### 算法（Phase 2 实装版）
+### 算法
 
 1. `TerrainGenerator::new(seed)`：用 `noise::Perlin::new(seed as u32)` 构造一个噪声源
 2. 对 chunk 内每个 `(lx, lz)` 列：
@@ -252,19 +237,17 @@ fn broadcast_tick(&mut self) {
 
 > 见 [`crates/server/src/terrain.rs`](../../crates/server/src/terrain.rs)。
 >
-> 注意：Phase 2 仅使用单一 Perlin 通道；多倍频叠加 / 山脉 / 平原差异化留给 v2。
+> 注意：当前仅使用单一 Perlin 通道；多倍频叠加 / 山脉 / 平原差异化属于地形增强项。
 
-### v2 扩展点
+### 扩展点
 - 生物群系（草原 / 沙漠 / 雪地）
 - 树木 / 矿物随机分布
 - 水面（海平面以下填 WATER）
-- 自定义地形 trait 让模块化（不在本期范围）
+- 自定义地形 trait 让模块化
 
 ---
 
 ## 六、`physics.rs` — 物理仲裁
-
-> **Phase 3 ✅** 实装。Phase 2 stub 仅占位。
 
 > 玩家本地物理预测在 `client::physics`；这里只做**仲裁**（防作弊最低限度）。
 
@@ -302,17 +285,10 @@ pub fn validate_place(
 ## 七、`tick()` 流程
 
 ```rust
-// [Phase 2] 仅累加 tick 计数 + 推进 world tick；无玩家广播、无 dirty 处理
-pub fn tick(&mut self) {
-    self.tick = self.tick.wrapping_add(1);
-    self.world.tick();
-}
-
-// [Phase 5+] 完整版
 pub fn tick(&mut self) {
     self.world.current_tick += 1;
 
-    // 当前实现：仅广播玩家位置；未来扩展：实体物理、方块更新（流体）等
+    // 当前实现：广播玩家位置；可扩展实体物理、方块更新（流体）等
     self.broadcast_tick();
 
     // 周期性持久化触发：每 30 秒（即每 1800 tick）
@@ -327,15 +303,7 @@ pub fn tick(&mut self) {
 
 ## 八、消息分发逻辑
 
-> **Phase 2 ✅**：仅 `Hello`→`Welcome` 与 `Break/Place` 无校验直改。`PlayerInput / Chat / Ping` 忽略。
->
-> **Phase 3 ✅**：`validate_break/place` 接入；`players` 表由 Hello/PlayerInput 维护。实际实现见 [`crates/server/src/lib.rs`](../../crates/server/src/lib.rs)。
->
-> **Phase 5**：补 `broadcast_tick`（PlayerTick）+ `send_initial_snapshot` + `Recipient` + outbox。
->
-> **Phase 8**：补 `ChunkRequest`，让 Remote 移动后继续请求 Host 的新区块。
-
-`Server::handle_client_message` 的核心 dispatch（Phase 5 完整版）：
+`Server::handle_client_message` 的核心 dispatch：
 
 ```rust
 match msg {
@@ -384,7 +352,7 @@ match msg {
 
 ## 九、初始与按需快照同步
 
-> **Phase 5** 引入（与 ChunkSnapshot 分片协议一起）。Phase 2 单人模式不走该路径：客户端通过 `Rc<RefCell<Server>>` 共享读 `server.world`，由 `ChunkLoader` 自身触发 `ensure_chunk_generated`。
+Remote 通过 ChunkSnapshot 分片拿到初始世界；Local-Only / Host 的本地玩家则通过 `ChunkLoader` 直接触发 `server.world.ensure_chunk_generated`。
 
 新玩家 `Hello` → `Welcome` 之后，Server 先把出生点附近 bootstrap 半径内的 chunk 通过 `ChunkSnapshot` 分片发给该玩家（仅该玩家，`Recipient::One`）。bootstrap 半径不会超过 Host 的视距。Remote 端随后按 `min(local_render_distance, host_render_distance)` 计算缺失区块，发送 `ChunkRequest` 补齐外圈；进入游戏后每次跨 chunk 边界继续按这个机制请求新区块。
 
@@ -434,8 +402,6 @@ fn handle_chunk_request(&mut self, recipient: EntityId, center: ChunkPos, render
 
 ## 十、与持久化的交互
 
-> **Phase 5** 引入。Phase 2 / 3 / 4 不持久化（每次进入世界重生成；同 seed 确定性保证一致）。
-
 `server` 通过抽象接口不感知具体存储，仅维护"哪些 chunk 脏了"以及"何时把它们交给 client 写"。具体接口在 [`crates/server/src/persistence.rs`](../../crates/server/src/persistence.rs)：
 
 ```rust
@@ -470,12 +436,12 @@ impl PersistenceManager {
 
 可在原生 target 直接 `cargo test -p voxweb-server` 运行：
 
-**Phase 2**：
+**Chunk / terrain**：
 - `terrain::generate_chunk(seed=固定, pos=(0,0))` 输出稳定（基线 hash 比对）
 - `World::ensure_chunk_generated` 幂等（二次调用不重生成）
 - `World::get_block_world` chunk 内 / 未加载 / y 越界三种情况
 
-**Phase 3 ✅**：
+**Physics / message dispatch**：
 - `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / AIR → BlockNotEmpty
 - `physics::validate_place`：y 越界 / 射程 / BlockNotEmpty / AABB Overlap
 - `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
@@ -491,4 +457,4 @@ impl PersistenceManager {
 - 时间循环（昼夜变化的服务端建模 — 客户端做即可）
 - 区域权限 / 玩家管理（v2）
 - 玩家死亡 / 掉血
-- 外部数据库（Postgres 等） — 本期仅浏览器 OPFS
+- 外部数据库（Postgres 等） — 当前仅使用浏览器 OPFS

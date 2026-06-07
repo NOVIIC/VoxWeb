@@ -16,12 +16,12 @@
 
 ---
 
-### 阶段实装范围
+### 当前组成
 
-| 阶段 | 包含 |
-|---|---|
-| **Phase 2 ✅** | `NetEndpoint::Local` 走 `futures::channel::mpsc` 双向通道；`new_local_pair` + `send_client_message` + `try_recv_server_message` + `ServerInbox` |
-| **Phase 4 ✅** | `signaling.rs` / `peer.rs` / `room.rs` / `transport.rs` 完整实装；`NetEndpoint::Host / Remote`；信令 WebSocket + WebRTC PeerConnection + 双 DataChannel；Ping/Pong RTT 测量 |
+- `NetEndpoint::Local` 使用 `futures::channel::mpsc` 双向通道，把单机路径也包装成消息驱动
+- `NetEndpoint::Host` 持有本地 Local 通道、多个 Remote Peer、信令客户端和房间状态
+- `NetEndpoint::Remote` 持有到 Host 的 PeerConnection、信令客户端和房间状态
+- `signaling.rs` 管 WebSocket 信令；`peer.rs` 管 WebRTC PeerConnection；`room.rs` 管房间状态；`transport.rs` 管可靠/不可靠通道选择和序列化
 
 ---
 
@@ -46,19 +46,19 @@ crates/net/src/
 
 ```rust
 pub enum NetEndpoint {
-    /// [Phase 2] 单机模式：基于 futures mpsc 的内存通道
+    /// 单机模式：基于 futures mpsc 的内存通道
     Local {
         tx_client: mpsc::UnboundedSender<ClientMessage>,
         rx_server: mpsc::UnboundedReceiver<ServerMessage>,
     },
-    /// [Phase 4] 房主：自身 Server + 多个 Remote Peer
+    /// 房主：自身 Server + 多个 Remote Peer
     Host {
         local: Box<NetEndpoint>,               // 自身的 Local 通道（仍走内存）
         peers: HashMap<PeerId, PeerConnection>,
         signaling: SignalingClient,
         room: RoomSession,
     },
-    /// [Phase 4] 远程客户端：单条到 Host 的 PeerConnection
+    /// 远程客户端：单条到 Host 的 PeerConnection
     Remote {
         host: PeerConnection,
         signaling: SignalingClient,
@@ -66,7 +66,7 @@ pub enum NetEndpoint {
     },
 }
 
-/// [Phase 2] Server 侧持有的 mpsc 端，与 NetEndpoint::Local 对偶。
+/// Server 侧持有的 mpsc 端，与 NetEndpoint::Local 对偶。
 pub struct ServerInbox {
     pub rx_client: mpsc::UnboundedReceiver<ClientMessage>,
     pub tx_server: mpsc::UnboundedSender<ServerMessage>,
@@ -75,25 +75,25 @@ pub struct ServerInbox {
 pub type PeerId = u32;
 
 impl NetEndpoint {
-    /// [Phase 2] 创建 Local 端点 + 对偶 ServerInbox。
+    /// 创建 Local 端点 + 对偶 ServerInbox。
     pub fn new_local_pair() -> (Self, ServerInbox);
 
-    /// [Phase 4] 创建房主，并连接信令服务
+    /// 创建房主，并连接信令服务
     pub async fn host(signaling_url: &str, room_id: &str) -> Result<Self, NetError>;
 
-    /// [Phase 4] 加入房间
+    /// 加入房间
     pub async fn join(signaling_url: &str, room_id: &str) -> Result<Self, NetError>;
 
-    /// [Phase 2+] 发送一条客户端消息（Local 入 tx_client；Remote 序列化走 DataChannel）
+    /// 发送一条客户端消息（Local 入 tx_client；Remote 序列化走 DataChannel）
     pub fn send_client_message(&self, msg: ClientMessage);
 
-    /// [Phase 2+] 非阻塞拉取一条 ServerMessage
+    /// 非阻塞拉取一条 ServerMessage
     pub fn try_recv_server_message(&mut self) -> Option<ServerMessage>;
 
-    /// [Phase 4+] Host 广播 ServerMessage
+    /// Host 广播 ServerMessage
     pub fn broadcast(&mut self, recipient: Recipient, msg: ServerMessage);
 
-    /// [Phase 4+] 房间生命周期事件
+    /// 房间生命周期事件
     pub fn poll_events(&mut self) -> Vec<RoomEvent>;
 }
 
@@ -111,18 +111,16 @@ pub enum NetError {
 }
 ```
 
-> **Phase 2 driver 模式**：client 主循环每帧
+> **统一收发循环**：client 主循环每帧
 > 1. 用 `server_inbox.try_recv_client_message()` 拉客户端消息，喂给 `server.handle_message(...)`；
 > 2. 把 handle_message 返回的 `Vec<ServerMessage>` 通过 `server_inbox.send_server_message(msg)` 推回；
 > 3. 在 client 端 `net.try_recv_server_message()` 消费并应用到 Game。
 
-> **设计意图**：`client` 不需要 `match endpoint { Local => ..., Host => ..., Remote => ... }`。把所有差异封装在 `net` 内，`client` 只调 `send_client_message` / `try_recv_server_message` / `broadcast`（Phase 4+） / `poll_events`（Phase 4+）。
+> **设计意图**：`client` 不需要 `match endpoint { Local => ..., Host => ..., Remote => ... }`。把所有差异封装在 `net` 内，`client` 只调 `send_client_message` / `try_recv_server_message` / `broadcast` / `poll_events`。
 
 ---
 
 ## 四、`signaling.rs` — WebSocket 信令客户端
-
-> **Phase 4** 引入。Phase 2 仅 Local 模式不走信令。
 
 ### 协议
 完整协议见 [`networking/signaling.md`](../networking/signaling.md)。简要：
@@ -181,8 +179,6 @@ impl SignalingClient {
 ---
 
 ## 五、`peer.rs` — RtcPeerConnection 包装
-
-> **Phase 4** 引入。
 
 ### 设计
 
@@ -261,7 +257,7 @@ config.ice_servers(&ice_servers);
 let rtc = web_sys::RtcPeerConnection::new_with_configuration(&config)?;
 ```
 
-**TURN 凭据下发**：v2 阶段，信令服务 `Registered` 消息中携带短期 TURN 凭据（防泄漏），客户端动态注入到 `iceServers`。本期固定使用公共 STUN，TURN 槽位预留。
+**TURN 凭据下发**：可选增强中，信令服务 `Registered` 消息可携带短期 TURN 凭据（防泄漏），客户端动态注入到 `iceServers`。当前固定使用公共 STUN，TURN 槽位预留。
 
 ### IPv6 优先策略
 
@@ -306,8 +302,6 @@ impl PeerConnection {
 
 ## 六、`room.rs` — 房间会话状态机
 
-> **Phase 4** 引入。
-
 ```rust
 pub enum RoomSession {
     Idle,
@@ -342,7 +336,7 @@ Idle ──connect()──▶ SignalingConnect ──WS open──▶ AwaitRegis
                                    Disconnected
 ```
 
-### 加载步骤（Phase 5+）
+### 加载步骤
 
 为支持加载界面列表式显示，新增两个类型和 `loading_steps()` 方法：
 
@@ -373,7 +367,7 @@ impl RoomSession {
 
 ## 七、`transport.rs` — 通道选择与路由
 
-> **Phase 4** 引入。Phase 2 的 Local 通道不区分 reliable/unreliable，单 mpsc 即可。
+Local 通道不区分 reliable/unreliable，单 mpsc 即可；Host / Remote 走下表的 DataChannel 选择规则。
 
 ### 通道选择规则
 
@@ -418,7 +412,7 @@ impl RoomSession {
 | Host 的某个 Remote PeerConnection 断开 | Host 调 `server.remove_player(entity)`，广播 `PeerLeft` |
 | `RoomClosed`（信令通知） | 双方都断开 |
 
-**重连**：本期不实现自动重连（避免协议状态复杂）；用户手动从大厅再次加入。
+**重连**：当前不实现自动重连（避免协议状态复杂）；用户手动从大厅再次加入。
 
 ---
 
@@ -444,13 +438,13 @@ pub use transport::{ChannelKind};
 
 ### 集成测试
 - WebRTC 必须在浏览器跑：用 Playwright 起两个 headless 浏览器互联，验证 Hello/Welcome 闭环
-- 本期暂不上 CI（v2 加上）
+- 当前暂不上 CI（可选增强）
 
 ---
 
 ## 十一、不在范围
 
-- 端到端加密（DataChannel 默认 DTLS 已加密；本期不在应用层再加）
+- 端到端加密（DataChannel 默认 DTLS 已加密；当前不在应用层再加）
 - 多 Host 故障转移
 - 自动重连
 - 拥塞控制 / 限流（依赖浏览器 SCTP 实现）
