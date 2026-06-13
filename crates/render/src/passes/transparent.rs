@@ -12,6 +12,10 @@ use crate::vertex::{PackedVertex, vertex_buffer_layout};
 pub struct TransparentGlobals {
     pub view_proj: [[f32; 4]; 4],
     pub chunk_origin: [f32; 4],
+    pub camera_pos: [f32; 4],
+    pub fog_color: [f32; 4],
+    pub fog_params: [f32; 4],
+    pub sun_dir: [f32; 4],
 }
 
 pub struct TransparentMeshGpu {
@@ -32,12 +36,13 @@ impl TransparentPass {
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        atlas_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transparent.globals_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -54,7 +59,7 @@ impl TransparentPass {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("transparent.layout"),
-            bind_group_layouts: &[Some(&globals_layout)],
+            bind_group_layouts: &[Some(&globals_layout), Some(atlas_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

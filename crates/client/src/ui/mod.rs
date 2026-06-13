@@ -6,5 +6,6 @@ pub mod hud;
 pub mod lobby;
 pub mod pause;
 pub mod players;
+pub mod theme;
 
 pub mod ui_state;

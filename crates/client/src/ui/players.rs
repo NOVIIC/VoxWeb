@@ -13,6 +13,8 @@ use glam::{Mat4, Vec3, Vec4};
 use voxweb_core::PLAYER_HEIGHT;
 use voxweb_core::protocol::EntityId;
 
+use crate::ui::theme;
+
 /// 单条玩家列表条目。`lib.rs` 每帧按 `entity_id` 升序构造。
 pub struct PlayerListEntry {
     pub entity_id: EntityId,
@@ -40,7 +42,7 @@ pub fn draw_player_list(ctx: &egui::Context, entries: &[PlayerListEntry]) {
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
         .interactable(false)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            theme::compact_frame().show(ui, |ui| {
                 ui.label(format!("Online Players ({})", entries.len()));
                 ui.separator();
                 for entry in entries {
@@ -87,21 +89,31 @@ pub fn draw_nameplates(ctx: &egui::Context, entries: &[NameplateEntry], view_pro
             continue;
         };
 
-        // 半透明黑底矩形（80×22 圆角 4）+ 居中白字。alpha 乘到底色 180 / 字色 255。
+        // 半透明底色 + 居中白字。宽度随昵称增长，避免长名字被硬裁。
         let bg_alpha = (alpha * 180.0).round().clamp(0.0, 255.0) as u8;
         let text_alpha = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-        let rect = egui::Rect::from_center_size(screen_pos, egui::vec2(80.0, 22.0));
+        let width = (entry.display_name.chars().count() as f32 * 8.0 + 22.0).clamp(72.0, 180.0);
+        let rect = egui::Rect::from_center_size(screen_pos, egui::vec2(width, 22.0));
         painter.rect_filled(
             rect,
             egui::CornerRadius::same(4),
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, bg_alpha),
+            egui::Color32::from_rgba_unmultiplied(22, 29, 31, bg_alpha),
+        );
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(180, 198, 190, (alpha * 70.0) as u8),
+            ),
+            egui::StrokeKind::Inside,
         );
         painter.text(
             screen_pos,
             egui::Align2::CENTER_CENTER,
             &entry.display_name,
             egui::FontId::proportional(14.0),
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, text_alpha),
+            egui::Color32::from_rgba_unmultiplied(226, 234, 229, text_alpha),
         );
     }
 }

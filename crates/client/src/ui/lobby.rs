@@ -7,6 +7,7 @@
 
 use crate::app::GameMode;
 use crate::storage::{QuotaInfo, WorldSummary, format_creation_time, format_storage_bytes};
+use crate::ui::theme;
 use voxweb_net::{LoadingStep, StepStatus};
 
 /// Cargo 在构建 `voxweb-client` 时从 Cargo.toml 注入的包版本。
@@ -107,275 +108,248 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
     // 主面板
     #[allow(deprecated)]
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(60.0);
+        ui.add_space(42.0);
         ui.vertical_centered(|ui| {
-            ui.heading(
-                egui::RichText::new("VoxWeb")
-                    .size(48.0)
-                    .color(egui::Color32::from_rgb(230, 240, 245)),
-            );
-            ui.add_space(8.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(160, 170, 180),
-                "Browser Voxel Sandbox",
-            );
+            theme::panel_frame().show(ui, |ui| {
+                ui.set_width(560.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading(egui::RichText::new("VoxWeb").size(48.0).color(theme::TEXT));
+                    ui.add_space(8.0);
+                    ui.colored_label(theme::MUTED, "Browser Voxel Sandbox");
 
-            ui.add_space(40.0);
+                    ui.add_space(40.0);
 
-            // —— 昵称输入（Phase 6）——
-            // 放在所有进入游戏按钮上方，让用户先确定身份再选模式。
-            ui.horizontal(|ui| {
-                ui.add_space(120.0);
-                ui.label(
-                    egui::RichText::new("Nickname:").color(egui::Color32::from_rgb(180, 190, 200)),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.display_name)
-                        .desired_width(220.0)
-                        .hint_text("Player"),
-                );
-            });
-
-            ui.add_space(12.0);
-
-            // —— 单机模式按钮 ——
-            let btn = egui::Button::new(
-                egui::RichText::new("Single Player")
-                    .size(20.0)
-                    .color(egui::Color32::from_rgb(230, 240, 245)),
-            )
-            .min_size(egui::vec2(260.0, 44.0))
-            .fill(egui::Color32::from_rgb(60, 90, 120));
-            if ui.add(btn).clicked() {
-                let seed = if let Some(key) = &state.selected_save {
-                    // 从存档 key 获取 seed
-                    crate::storage::seed_from_key(key)
-                } else {
-                    // New World：从输入框获取或随机生成；解析失败时提示用户
-                    match parse_seed(&state.seed_input) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            state.error_message = Some(e);
-                            return;
-                        }
-                    }
-                };
-                let display_name = resolve_display_name(state);
-                state.error_message = None;
-                action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
-            }
-
-            ui.add_space(20.0);
-
-            // —— Room ID 输入 ——
-            ui.horizontal(|ui| {
-                ui.add_space(120.0);
-                ui.label(
-                    egui::RichText::new("Room ID").color(egui::Color32::from_rgb(180, 190, 200)),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.room_id_input)
-                        .desired_width(160.0)
-                        .hint_text("e.g. abc123"),
-                );
-            });
-
-            ui.add_space(8.0);
-
-            // —— Create / Join 按钮 ——
-            ui.horizontal(|ui| {
-                ui.add_space(120.0);
-                let create = egui::Button::new(
-                    egui::RichText::new("Create Room")
-                        .size(16.0)
-                        .color(egui::Color32::from_rgb(230, 240, 245)),
-                )
-                .min_size(egui::vec2(120.0, 36.0))
-                .fill(egui::Color32::from_rgb(90, 60, 120));
-                if ui.add(create).clicked() {
-                    let room_id = state.room_id_input.trim().to_string();
-                    let seed = if let Some(key) = &state.selected_save {
-                        // 从存档 key 获取 seed
-                        crate::storage::seed_from_key(key)
-                    } else {
-                        // New World：从输入框获取或随机生成；解析失败时提示用户
-                        match parse_seed(&state.seed_input) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                state.error_message = Some(e);
-                                return;
-                            }
-                        }
-                    };
-                    let display_name = resolve_display_name(state);
-                    state.error_message = None;
-                    action = Some(LobbyAction::CreateRoom {
-                        room_id,
-                        seed,
-                        display_name,
+                    // —— 昵称输入（Phase 6）——
+                    // 放在所有进入游戏按钮上方，让用户先确定身份再选模式。
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0);
+                        ui.label(egui::RichText::new("Nickname:").color(theme::MUTED));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.display_name)
+                                .desired_width(220.0)
+                                .hint_text("Player"),
+                        );
                     });
-                }
-                let join = egui::Button::new(
-                    egui::RichText::new("Join Room")
-                        .size(16.0)
-                        .color(egui::Color32::from_rgb(230, 240, 245)),
-                )
-                .min_size(egui::vec2(120.0, 36.0))
-                .fill(egui::Color32::from_rgb(60, 120, 90));
-                if ui.add(join).clicked() {
-                    let room_id = state.room_id_input.trim().to_string();
-                    if let Err(msg) = validate_room_id(&room_id) {
-                        state.error_message = Some(msg);
-                    } else {
+
+                    ui.add_space(12.0);
+
+                    // —— 单机模式按钮 ——
+                    let btn =
+                        theme::primary_button("Single Player").min_size(egui::vec2(260.0, 44.0));
+                    if ui.add(btn).clicked() {
+                        let seed = if let Some(key) = &state.selected_save {
+                            // 从存档 key 获取 seed
+                            crate::storage::seed_from_key(key)
+                        } else {
+                            // New World：从输入框获取或随机生成；解析失败时提示用户
+                            match parse_seed(&state.seed_input) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    state.error_message = Some(e);
+                                    return;
+                                }
+                            }
+                        };
                         let display_name = resolve_display_name(state);
                         state.error_message = None;
-                        action = Some(LobbyAction::JoinRoom {
-                            room_id,
-                            display_name,
-                        });
+                        action = Some(LobbyAction::StartSinglePlayer { seed, display_name });
                     }
-                }
-            });
 
-            // —— 提示信息：自动生成的房间号 / 错误 ——
-            if let Some(room) = &state.last_generated_room {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(140, 200, 160),
-                    format!("Generated room id: {room} (share with friends)"),
-                );
-            }
-            if let Some(err) = &state.error_message {
-                ui.add_space(6.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 130, 130), err);
-            }
+                    ui.add_space(20.0);
 
-            ui.add_space(24.0);
+                    // —— Room ID 输入 ——
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0);
+                        ui.label(egui::RichText::new("Room ID").color(theme::MUTED));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.room_id_input)
+                                .desired_width(160.0)
+                                .hint_text("e.g. abc123"),
+                        );
+                    });
 
-            // —— 我的存档区块 ——
-            ui.separator();
-            ui.add_space(8.0);
-            if let Some(quota) = state.storage_quota {
-                let color = if quota.usage_ratio() > 0.95 {
-                    egui::Color32::from_rgb(240, 100, 100)
-                } else if quota.usage_ratio() > 0.80 {
-                    egui::Color32::from_rgb(230, 190, 90)
-                } else {
-                    egui::Color32::from_rgb(150, 195, 165)
-                };
-                ui.colored_label(
-                    color,
-                    format!(
-                        "Storage: {} / {}",
-                        format_storage_bytes(quota.usage),
-                        format_storage_bytes(quota.quota)
-                    ),
-                );
-            } else if state.saves_loading {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 130, 140),
-                    "Storage: Loading...",
-                );
-            } else {
-                ui.colored_label(
-                    egui::Color32::from_rgb(120, 130, 140),
-                    "Storage: Unavailable",
-                );
-            }
-            ui.add_space(8.0);
-            let save_count = state.saved_worlds.len();
-            let header_text = if state.saves_loading {
-                "My Saves (Loading...)".to_string()
-            } else {
-                format!("My Saves ({})", save_count)
-            };
-            ui.label(
-                egui::RichText::new(&header_text)
-                    .size(14.0)
-                    .color(egui::Color32::from_rgb(180, 190, 200)),
-            );
-            ui.add_space(4.0);
+                    ui.add_space(8.0);
 
-            // New World 选项（默认选中）
-            let is_new_world = state.selected_save.is_none();
-            let radio = egui::RadioButton::new(is_new_world, "New World");
-            if ui.add(radio).clicked() {
-                action = Some(LobbyAction::SelectSave { key: None });
-            }
+                    // —— Create / Join 按钮 ——
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0);
+                        let create = theme::secondary_button("Create Room")
+                            .min_size(egui::vec2(120.0, 36.0));
+                        if ui.add(create).clicked() {
+                            let room_id = state.room_id_input.trim().to_string();
+                            let seed = if let Some(key) = &state.selected_save {
+                                // 从存档 key 获取 seed
+                                crate::storage::seed_from_key(key)
+                            } else {
+                                // New World：从输入框获取或随机生成；解析失败时提示用户
+                                match parse_seed(&state.seed_input) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        state.error_message = Some(e);
+                                        return;
+                                    }
+                                }
+                            };
+                            let display_name = resolve_display_name(state);
+                            state.error_message = None;
+                            action = Some(LobbyAction::CreateRoom {
+                                room_id,
+                                seed,
+                                display_name,
+                            });
+                        }
+                        let join =
+                            theme::primary_button("Join Room").min_size(egui::vec2(120.0, 36.0));
+                        if ui.add(join).clicked() {
+                            let room_id = state.room_id_input.trim().to_string();
+                            if let Err(msg) = validate_room_id(&room_id) {
+                                state.error_message = Some(msg);
+                            } else {
+                                let display_name = resolve_display_name(state);
+                                state.error_message = None;
+                                action = Some(LobbyAction::JoinRoom {
+                                    room_id,
+                                    display_name,
+                                });
+                            }
+                        }
+                    });
 
-            // 已有存档列表
-            for world in &state.saved_worlds {
-                let is_selected = state.selected_save.as_deref() == Some(&world.key);
-                let time_str = format_creation_time(&world.key);
-                let world_label =
-                    format!("{} · {}", time_str, format_storage_bytes(world.used_bytes));
-
-                // horizontal 内容居中：先测量文字宽度，再算间距
-                let text_w = ui
-                    .painter()
-                    .layout_no_wrap(
-                        world_label.clone(),
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::WHITE,
-                    )
-                    .size()
-                    .x;
-                let icon_w = ui.spacing().icon_width;
-                let gap = ui.spacing().item_spacing.x;
-                let del_w = ui.spacing().interact_size.x;
-                let content_w = icon_w + gap + text_w + gap + del_w;
-
-                ui.horizontal(|ui| {
-                    let avail = ui.available_width();
-                    if avail > content_w {
-                        ui.add_space((avail - content_w) / 2.0);
+                    // —— 提示信息：自动生成的房间号 / 错误 ——
+                    if let Some(room) = &state.last_generated_room {
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            theme::SUCCESS,
+                            format!("Generated room id: {room} (share with friends)"),
+                        );
                     }
-                    let radio = egui::RadioButton::new(is_selected, &world_label);
+                    if let Some(err) = &state.error_message {
+                        ui.add_space(6.0);
+                        ui.colored_label(theme::DANGER, err);
+                    }
+
+                    ui.add_space(24.0);
+
+                    // —— 我的存档区块 ——
+                    ui.separator();
+                    ui.add_space(8.0);
+                    if let Some(quota) = state.storage_quota {
+                        let color = if quota.usage_ratio() > 0.95 {
+                            theme::DANGER
+                        } else if quota.usage_ratio() > 0.80 {
+                            theme::WARNING
+                        } else {
+                            theme::SUCCESS
+                        };
+                        ui.colored_label(
+                            color,
+                            format!(
+                                "Storage: {} / {}",
+                                format_storage_bytes(quota.usage),
+                                format_storage_bytes(quota.quota)
+                            ),
+                        );
+                    } else if state.saves_loading {
+                        ui.colored_label(theme::SUBTLE, "Storage: Loading...");
+                    } else {
+                        ui.colored_label(theme::SUBTLE, "Storage: Unavailable");
+                    }
+                    ui.add_space(8.0);
+                    let save_count = state.saved_worlds.len();
+                    let header_text = if state.saves_loading {
+                        "My Saves (Loading...)".to_string()
+                    } else {
+                        format!("My Saves ({})", save_count)
+                    };
+                    ui.label(
+                        egui::RichText::new(&header_text)
+                            .size(14.0)
+                            .color(theme::MUTED),
+                    );
+                    ui.add_space(4.0);
+
+                    // New World 选项（默认选中）
+                    let is_new_world = state.selected_save.is_none();
+                    let radio = egui::RadioButton::new(is_new_world, "New World");
                     if ui.add(radio).clicked() {
-                        action = Some(LobbyAction::SelectSave {
-                            key: Some(world.key.clone()),
+                        action = Some(LobbyAction::SelectSave { key: None });
+                    }
+
+                    // 已有存档列表
+                    for world in &state.saved_worlds {
+                        let is_selected = state.selected_save.as_deref() == Some(&world.key);
+                        let time_str = format_creation_time(&world.key);
+                        let world_label =
+                            format!("{} · {}", time_str, format_storage_bytes(world.used_bytes));
+
+                        // horizontal 内容居中：先测量文字宽度，再算间距
+                        let text_w = ui
+                            .painter()
+                            .layout_no_wrap(
+                                world_label.clone(),
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x;
+                        let icon_w = ui.spacing().icon_width;
+                        let gap = ui.spacing().item_spacing.x;
+                        let del_w = ui.spacing().interact_size.x;
+                        let content_w = icon_w + gap + text_w + gap + del_w;
+
+                        ui.horizontal(|ui| {
+                            let avail = ui.available_width();
+                            if avail > content_w {
+                                ui.add_space((avail - content_w) / 2.0);
+                            }
+                            let radio = egui::RadioButton::new(is_selected, &world_label);
+                            if ui.add(radio).clicked() {
+                                action = Some(LobbyAction::SelectSave {
+                                    key: Some(world.key.clone()),
+                                });
+                            }
+                            if ui
+                                .small_button("Delete")
+                                .on_hover_text("Delete this save")
+                                .clicked()
+                            {
+                                action = Some(LobbyAction::DeleteSave {
+                                    key: world.key.clone(),
+                                });
+                            }
                         });
                     }
-                    if ui
-                        .small_button("Delete")
-                        .on_hover_text("Delete this save")
-                        .clicked()
-                    {
-                        action = Some(LobbyAction::DeleteSave {
-                            key: world.key.clone(),
-                        });
+
+                    // 空列表提示
+                    if !state.saves_loading && save_count == 0 {
+                        ui.label(
+                            egui::RichText::new("No saves")
+                                .size(12.0)
+                                .color(theme::SUBTLE),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // —— 种子输入（折叠区，仅 New World 时显示）——
+                    if state.selected_save.is_none() {
+                        egui::CollapsingHeader::new("Advanced / Seed")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Seed (u64, blank = random):");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut state.seed_input)
+                                            .desired_width(180.0)
+                                            .hint_text("e.g. 1234567"),
+                                    );
+                                });
+                            });
                     }
                 });
-            }
-
-            // 空列表提示
-            if !state.saves_loading && save_count == 0 {
-                ui.label(
-                    egui::RichText::new("No saves")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(120, 130, 140)),
-                );
-            }
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // —— 种子输入（折叠区，仅 New World 时显示）——
-            if state.selected_save.is_none() {
-                egui::CollapsingHeader::new("Advanced / Seed")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Seed (u64, blank = random):");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut state.seed_input)
-                                    .desired_width(180.0)
-                                    .hint_text("e.g. 1234567"),
-                            );
-                        });
-                    });
-            }
+            });
         });
     });
 
@@ -383,10 +357,7 @@ pub fn draw_lobby(ctx: &egui::Context, state: &mut LobbyState) -> Option<LobbyAc
     egui::Area::new(egui::Id::new("lobby_version"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
         .show(ctx, |ui| {
-            ui.colored_label(
-                egui::Color32::from_rgb(100, 110, 120),
-                format!("VoxWeb {APP_VERSION}"),
-            );
+            ui.colored_label(theme::SUBTLE, format!("VoxWeb {APP_VERSION}"));
         });
 
     action
@@ -404,58 +375,50 @@ pub fn draw_connecting(
 
     #[allow(deprecated)]
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.add_space(120.0);
+        ui.add_space(96.0);
         ui.vertical_centered(|ui| {
-            let title = match mode {
-                GameMode::Host => format!("Hosting room {room_id}…"),
-                GameMode::Remote => format!("Joining room {room_id}…"),
-                GameMode::Local => "Loading…".to_string(),
-            };
-            ui.heading(
-                egui::RichText::new(title)
-                    .size(28.0)
-                    .color(egui::Color32::from_rgb(230, 240, 245)),
-            );
-            ui.add_space(24.0);
+            theme::panel_frame().show(ui, |ui| {
+                ui.set_width(480.0);
+                ui.vertical_centered(|ui| {
+                    let title = match mode {
+                        GameMode::Host => format!("Hosting room {room_id}…"),
+                        GameMode::Remote => format!("Joining room {room_id}…"),
+                        GameMode::Local => "Loading…".to_string(),
+                    };
+                    ui.heading(egui::RichText::new(title).size(28.0).color(theme::TEXT));
+                    ui.add_space(24.0);
 
-            // —— 步骤列表 ——
-            for step in steps {
-                let (icon, color) = match step.status {
-                    StepStatus::Done => ("✓", egui::Color32::from_rgb(100, 200, 120)),
-                    StepStatus::InProgress => ("⟳", egui::Color32::from_rgb(220, 200, 100)),
-                    StepStatus::Pending => ("○", egui::Color32::from_rgb(120, 130, 140)),
-                };
-                ui.horizontal(|ui| {
-                    ui.add_space(40.0);
-                    ui.colored_label(color, egui::RichText::new(icon).size(16.0));
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(180, 190, 200),
-                        egui::RichText::new(&step.label).size(16.0),
-                    );
+                    // —— 步骤列表 ——
+                    for step in steps {
+                        let (icon, color) = match step.status {
+                            StepStatus::Done => ("✓", theme::SUCCESS),
+                            StepStatus::InProgress => ("⟳", theme::WARNING),
+                            StepStatus::Pending => ("○", theme::SUBTLE),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.add_space(40.0);
+                            ui.colored_label(color, egui::RichText::new(icon).size(16.0));
+                            ui.add_space(8.0);
+                            ui.colored_label(
+                                theme::MUTED,
+                                egui::RichText::new(&step.label).size(16.0),
+                            );
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    if let Some(msg) = error {
+                        ui.add_space(12.0);
+                        ui.colored_label(theme::DANGER, egui::RichText::new(msg).size(15.0));
+                    }
+
+                    ui.add_space(32.0);
+                    let btn = theme::danger_button("Cancel").min_size(egui::vec2(160.0, 36.0));
+                    if ui.add(btn).clicked() {
+                        action = Some(ConnectingAction::Cancel);
+                    }
                 });
-                ui.add_space(4.0);
-            }
-
-            if let Some(msg) = error {
-                ui.add_space(12.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 130, 130),
-                    egui::RichText::new(msg).size(15.0),
-                );
-            }
-
-            ui.add_space(32.0);
-            let btn = egui::Button::new(
-                egui::RichText::new("Cancel")
-                    .size(16.0)
-                    .color(egui::Color32::from_rgb(230, 240, 245)),
-            )
-            .min_size(egui::vec2(160.0, 36.0))
-            .fill(egui::Color32::from_rgb(100, 70, 70));
-            if ui.add(btn).clicked() {
-                action = Some(ConnectingAction::Cancel);
-            }
+            });
         });
     });
 
