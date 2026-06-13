@@ -210,6 +210,40 @@ impl OpfsStorage {
             Err(e) => Err(e),
         }
     }
+
+    /// 将当前世界的更新时间写回 `world.json` 和 `_meta.json`。
+    pub async fn touch_updated_at(&self) -> Result<(), StorageError> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await?;
+        let now = now_ms() as u64;
+        let mut record = load_world_record(&root).await?.unwrap_or_else(|| {
+            let seed = seed_from_key(&self.world_key).unwrap_or(0);
+            WorldRecord {
+                key: self.world_key.clone(),
+                room_id: "local".to_string(),
+                seed: seed.to_string(),
+                display_name: "Unknown".to_string(),
+                created_at_ms: parse_world_key(&self.world_key)
+                    .map(|(ts, _)| ts * 1000)
+                    .unwrap_or(now),
+                updated_at_ms: now,
+                storage_version: STORAGE_VERSION,
+                protocol_version: PROTOCOL_VERSION,
+            }
+        });
+        record.updated_at_ms = now;
+        write_text_file(
+            &root,
+            "world.json",
+            &serde_json::to_string_pretty(&record).unwrap(),
+        )
+        .await?;
+        update_meta(&self.worlds_root, &record).await
+    }
 }
 
 impl WorldStorage for OpfsStorage {
@@ -265,8 +299,12 @@ impl WorldStorage for OpfsStorage {
     }
 
     async fn save_chunks(&self, items: Vec<(ChunkPos, Vec<u8>)>) -> Result<(), StorageError> {
+        let touched = !items.is_empty();
         for (pos, bytes) in items {
             write_bytes_file(&self.chunks_dir, &chunk_filename(pos), &bytes).await?;
+        }
+        if touched {
+            self.touch_updated_at().await?;
         }
         Ok(())
     }

@@ -322,6 +322,10 @@ pub struct Game {
     /// Phase 8：Local/Host 的 OPFS 存储句柄。Remote 不写存档。
     pub storage: Option<OpfsStorage>,
     pub known_persisted: HashSet<voxweb_core::ChunkPos>,
+    /// 已经从 OPFS 覆盖进运行时世界的 chunk，避免远距离存档重复异步读取。
+    pub loaded_persisted_chunks: HashSet<voxweb_core::ChunkPos>,
+    /// 已发起但尚未完成的 OPFS chunk 读取。
+    pub pending_persisted_loads: HashSet<voxweb_core::ChunkPos>,
     /// 当前世界在 OPFS 中已落盘的字节数（world.json + chunk 文件）。
     pub current_world_bytes: u64,
     /// 除当前世界以外，世界列表中其它存档的总字节数。
@@ -485,6 +489,8 @@ impl Game {
             server_clock_synced: false,
             storage: None,
             known_persisted: HashSet::new(),
+            loaded_persisted_chunks: HashSet::new(),
+            pending_persisted_loads: HashSet::new(),
             current_world_bytes: 0,
             other_worlds_bytes: 0,
             persisted_chunk_sizes: HashMap::new(),

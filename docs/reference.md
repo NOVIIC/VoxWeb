@@ -337,7 +337,7 @@ trunk 在 release 模式下默认不带 sourcemap（节省体积）。debug 模�
 | 单线程网格化卡顿 | 中 | 分帧 budget + 优先级队列 |
 | WASM 体积超 6MB | 中 | 持续 twiggy 监测 |
 | OPFS 配额耗尽（隐身模式 / 长期世界） | 中 | UI 显示用量；> 80% 警告；> 95% 暂停 dirty 写入；引导导出/删档 |
-| OPFS 写入失败 / `pagehide` 未完成 flush | 中 | 1s 周期 flush 兜底；Variant B（Worker + sync handle）作为升级路径 |
+| OPFS 写入失败 / `pagehide` 未完成 flush | 中 | 3s 周期 flush + 回大厅 / pagehide best-effort 兜底；Variant B（Worker + sync handle）作为升级路径 |
 | 浏览器后台 Tab 时间漂移 | 低 | dt 上限 + 跳过过大逻辑步 |
 | egui 中文字体嵌入体积 | 中 | 用 subset font 仅嵌入常用字 |
 | 协议版本不兼容 | 中 | `world.json.storage_version` 校验 + migrations 数组（详见 [`features/persistence.md`](features/persistence.md) §十） |

@@ -89,14 +89,29 @@ impl World {
     /// 在世界坐标处放置一个方块（若 chunk 未加载则忽略）。
     /// Phase 5 起：成功写入会把该 chunk 标记为 dirty。
     pub fn set_block(&mut self, pos: Position, block: BlockID) {
+        self.set_block_inner(pos, block, true);
+    }
+
+    /// 写入本地世界视图但不标记 dirty。Remote 客户端接收 Host 快照 / 乐观预测时使用。
+    pub fn set_block_untracked(&mut self, pos: Position, block: BlockID) {
+        self.set_block_inner(pos, block, false);
+    }
+
+    fn set_block_inner(&mut self, pos: Position, block: BlockID, track_dirty: bool) {
         let cp = pos.to_chunk_pos();
         let Some(chunk) = self.chunks.get_mut(&cp) else {
             return;
         };
         if let Some(idx) = pos.local_index() {
+            if chunk.blocks[idx] == block {
+                self.touch_chunk(cp);
+                return;
+            }
             chunk.blocks[idx] = block;
-            self.dirty_chunks.insert(cp);
-            self.persistence.mark_dirty(cp);
+            if track_dirty {
+                self.dirty_chunks.insert(cp);
+                self.persistence.mark_dirty(cp);
+            }
             self.touch_chunk(cp);
         }
     }
@@ -256,6 +271,18 @@ mod tests {
         let drained = world.drain_dirty();
         assert_eq!(drained, vec![cp]);
         assert!(world.dirty_chunks.is_empty());
+    }
+
+    #[test]
+    fn set_block_untracked_does_not_mark_dirty() {
+        let mut world = World::new(0);
+        let cp = ChunkPos::new(0, 0);
+        world.ensure_chunk_generated(cp);
+
+        world.set_block_untracked(Position::new(5, 100, 7), BlockID::STONE);
+        assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
+        assert!(world.dirty_chunks.is_empty());
+        assert_eq!(world.persistence.dirty_len(), 0);
     }
 
     #[test]

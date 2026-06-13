@@ -4,8 +4,9 @@
 > **关联文档**：[`README.md`](../../README.md) · [`modules/server.md`](../modules/server.md) · [`modules/client.md`](../modules/client.md) · [`reference.md`](../reference.md) · [`roadmap.md`](../roadmap.md)
 >
 > **当前状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
-> `PersistenceManager` snapshot/commit/failure、启动 prime、1s 周期 flush、LRU/pinned、配额 UI、
-> `storage_version` 高版本拒绝与大厅删档入口已实现。Worker sync handle 作为可选升级路径保留在 §十二。
+> `PersistenceManager` snapshot/commit/failure、启动 prime、运行时按需 OPFS 覆盖、3s 周期 flush、
+> `pagehide` / 回大厅 best-effort flush、LRU/pinned、配额 UI、`storage_version` 高版本拒绝与大厅删档入口已实现。
+> Worker sync handle 作为可选升级路径保留在 §十二。
 
 ---
 
@@ -15,7 +16,7 @@
 - Remote 不持有权威世界
 - 重连时从 Host 重新拉取快照即可
 
-存档生命周期绑定到 **房间号 + 世界种子**。同一房间号 + 同一种子 → 同一份存档；不同种子 → 不同存档（同房间号下的"另开一个世界"）。
+存档生命周期绑定到 **world key**。当前 UI 创建新存档时使用 `<created_at_s>__<seed>`，因此同一个 seed 也可以创建多份独立世界；大厅选择已有存档时按 key 重新打开。`room_id + seed` 形式仅作为旧版兼容 / 迁移命名保留，不再作为新存档的自动复用规则。
 
 > 背景：本项目评估过 IndexedDB，但在"多人长期房间"（约 10000 dirty chunk）压力下，IDB 在配额、内存常驻、启动加载、退出 flush 四方面都会撞墙，故改为 OPFS。详见下节对比。
 
@@ -44,7 +45,7 @@ OPFS 根目录的内部结构：
 ```
 opfs:/voxweb/
 ├── _meta.json                       # 全局元信息（所有世界的索引，大厅"我的存档"用）
-└── <room_id>__<seed>/               # 一个世界一个目录
+└── <world_key>/                     # 一个世界一个目录，当前为 <created_at_s>__<seed>
     ├── world.json                   # WorldRecord（JSON，便于 DevTools 调试）
     └── chunks/
         ├── <cx>_<cz>.bin            # encode() 输出：palette + RLE + bincode
@@ -164,7 +165,9 @@ pub struct QuotaInfo {
     pub usage: u64,
 }
 
-/// 单 World 的存储句柄。一个 OpfsStorage 实例对应一个 (room_id, seed)。
+/// 单 World 的存储句柄。一个 OpfsStorage 实例对应一个 world_key。
+/// `open(room_id, seed)` 是 trait 兼容入口；当前 OPFS 新世界会生成 `<created_at_s>__<seed>` key，
+/// 已有存档通过 `OpfsStorage::open_by_key(key)` 打开。
 #[async_trait::async_trait(?Send)]
 pub trait WorldStorage {
     async fn open(room_id: &str, seed: u64) -> Result<Self, StorageError>
@@ -245,33 +248,40 @@ async fn start_host(app: &mut App, room_id: String, seed: u64) {
 
 ### 6.2 运行时按需加载
 
-[`crates/server/src/world.rs`](../../crates/server/src/world.rs) 的 `get_or_generate(pos)` 改为三态：
+运行时加载由 client 侧区块加载器与 OPFS 协作，整体是三态：
 
 1. **内存命中** → 返回
 2. **`known_persisted` 不含此 pos** → 走 terrain 生成（最常见快路径）
 3. **`known_persisted` 含此 pos 但内存无** → 发起异步 load，先返回 terrain 生成结果占位；load 完成后用 OPFS 数据**覆盖** server 内对应 chunk 并触发受影响 chunk 重网格化
 
-注意：server crate 本身保持平台无关（无 `web-sys` 依赖）。异步 load 由 client 端协程发起，通过 `futures-channel` mpsc 把 `(pos, decoded_chunk)` 推给 server tick 消费。
+当前实现由 client 侧维护三组状态：
+
+- `known_persisted`：OPFS 中存在文件的 chunk
+- `loaded_persisted_chunks`：本次运行已用 OPFS 数据覆盖过的 chunk
+- `pending_persisted_loads`：已发起但尚未完成的异步读取
+
+Local / Host 每帧更新视距内 chunk 后，会为 `known_persisted - loaded_persisted_chunks - pending_persisted_loads` 发起 `storage.load_chunk(pos)`。读取成功后调用 `server.load_chunk_from_storage(pos, chunk)` 覆盖运行时世界，并重网格化该 chunk 与水平邻居；若该 chunk 已经 dirty / in-flight，则跳过覆盖，避免旧存档覆盖玩家刚刚做的新编辑。
+
+注意：server crate 本身保持平台无关（无 `web-sys` 依赖）。异步 load 由 client 端协程发起，完成后回写到本地权威 `server.world`。
 
 副作用：在极短时间内（异步 load 完成前）玩家可能看到 terrain 生成的"原始版本"。缓解：prime 已覆盖出生点；玩家不可能瞬间走出 prime 半径。
 
 ### 6.3 周期 flush
 
-主循环每 **1 秒** 触发一次（频率较 IDB 旧方案的 30s/5s 更激进，因 OPFS 写入更廉价；目的是缩小关 Tab 丢失窗口到 1 秒以内）：
+主循环每 **3 秒** 触发一次普通自动保存；每次最多编码 / 写入 **4 个 dirty chunk**。退出和手动保存走单独快路径：
 
 ```rust
 fn maybe_flush_persistence(&mut self) {
-    if !self.frame_clock.persistence_due(1_000.0) { return; }
+    if !self.frame_clock.persistence_due(3_000.0) { return; }
     let Some(persistence) = self.server.as_mut().map(|s| &mut s.persistence) else { return; };
     let Some(storage) = self.storage.clone() else { return; };
 
     // snapshot：不删 dirty，仅取出待写
-    let to_flush = persistence.snapshot_dirty(64);
+    let to_flush = persistence.snapshot_dirty(4, tick);
     if to_flush.is_empty() { return; }
 
     // 主线程 encode（每帧最多 4 chunk → 单帧 < 4 ms）
     let encoded: Vec<(ChunkPos, Vec<u8>)> = to_flush.iter()
-        .take(4)
         .filter_map(|pos| {
             let chunk = persistence.world.peek_chunk(*pos)?;
             Some((*pos, voxweb_core::chunk::encode(chunk)))
@@ -285,42 +295,43 @@ fn maybe_flush_persistence(&mut self) {
             Ok(()) => server_handle.commit_flushed(&positions),
             Err(e) => {
                 tracing::error!("flush failed: {e:?}");
-                server_handle.record_flush_failure(&positions);
+                server_handle.record_flush_failure(&positions, tick);
             }
         }
     });
 }
 ```
 
-### 6.4 退出 flush（`pagehide`）
+`OpfsStorage::save_chunks` 写完 chunk 后会 touch `world.json` / `_meta.json` 的 `updated_at_ms`，保证大厅列表排序跟随最近保存时间。
 
-监听 `pagehide`（移动端 Safari 比 `beforeunload` 可靠）：
+### 6.4 退出 flush（`pagehide` / 回大厅）
+
+监听 `pagehide`（移动端 Safari 比 `beforeunload` 可靠），并在所有“返回大厅”入口调用同一条 best-effort flush：
 
 ```rust
-let cb = Closure::wrap(Box::new(move |_: web_sys::Event| {
-    // 尽力 flush；BFCache 命中时实际会 await 完成
-    let storage = ...;
-    let persistence = ...;
+let cb = Closure::wrap(Box::new(move || {
+    // 同步 snapshot + encode；异步 OPFS write / close。
+    flush_dirty_best_effort(&app, "pagehide");
+}) as Box<dyn FnMut()>);
+window.add_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())?;
+
+fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
+    let (storage, encoded) = snapshot_and_encode_all_dirty(app)?;
     wasm_bindgen_futures::spawn_local(async move {
-        let all_dirty = persistence.snapshot_dirty(usize::MAX);
-        let encoded = all_dirty.iter()
-            .filter_map(|pos| persistence.world.peek_chunk(*pos).map(|c| (*pos, encode(c))))
-            .collect();
         let _ = storage.save_chunks(encoded).await;
     });
-}) as Box<dyn FnMut(_)>);
-window.add_event_listener_with_callback("pagehide", cb.as_ref().unchecked_ref())?;
+}
 ```
 
-> **风险**：纯 async 路径无法在 page unload 前保证完成。配合 1 秒周期 flush，预计丢失窗口 < 1 秒编辑。Variant B（Worker + sync handle）可消除此风险，见第十二节。
+> **风险**：纯 async 路径无法在 page unload 前保证完成。配合 3 秒周期 flush、回大厅 flush 和 `pagehide` best-effort，正常路径会保存最近编辑；极端关闭 / 崩溃仍可能丢失最后一小段编辑。Variant B（Worker + sync handle）可进一步降低此风险，见第十二节。
 
 ### 6.5 玩家手动保存
 
 暂停菜单"立即保存"按钮：
 ```rust
 if ui.button("立即保存").clicked() {
-    let all = persistence.snapshot_dirty(usize::MAX);
-    // ... encode + save_chunks，完成后显示 "Save complete" 顶部提示
+    app.save_now_requested = true;
+    // 持久化泵每批最多 16 chunk，连续 drain 到 dirty / in-flight 清空后显示 "Save complete"
 }
 ```
 
@@ -363,9 +374,9 @@ pub struct PersistenceManager {
 
 impl PersistenceManager {
     pub fn mark_dirty(&mut self, pos: ChunkPos);
-    pub fn snapshot_dirty(&mut self, limit: usize) -> Vec<ChunkPos>;   // dirty → in_flight
+    pub fn snapshot_dirty(&mut self, limit: usize, current_tick: u64) -> Vec<ChunkPos>;
     pub fn commit_flushed(&mut self, positions: &[ChunkPos]);           // in_flight 移除
-    pub fn record_flush_failure(&mut self, positions: &[ChunkPos]);     // in_flight → dirty + backoff
+    pub fn record_flush_failure(&mut self, positions: &[ChunkPos], current_tick: u64);
     pub fn should_flush(&self, current_tick: u64) -> bool;
 }
 ```
@@ -444,10 +455,10 @@ match world.storage_version.cmp(&STORAGE_VERSION) {
 ### Variant A：无 Worker，单线程 async（当前实现）
 
 - 序列化在主线程；OPFS 写入走 `createWritable / write / close` 异步 API
-- `pagehide` 内 `spawn_local`，尽力 await；BFCache 路径下浏览器会等待完成
-- 配合 1 秒周期 flush，预计丢失窗口 < 1 秒编辑
+- 普通自动保存每 3 秒 flush 4 个 chunk；手动保存每批 16 个 chunk 连续 drain
+- `pagehide` / 回大厅会同步 snapshot + encode 所有 dirty，再 `spawn_local` 尽力写入；BFCache 路径下浏览器通常会等待完成
 - 代码量：≈ 600 行 Rust，0 行 JS
-- 风险：极端情况下关 Tab 仍可能丢 < 1 秒编辑；万级 chunk 一次性 encode 可能造成单帧卡顿（缓解：每帧最多 4 chunk encode）
+- 风险：极端情况下关 Tab 仍可能丢最后一小段编辑；pagehide 一次性 encode 大量 dirty 时可能造成短暂停顿
 
 ### Variant B：Dedicated Worker + sync handle（可选升级）
 

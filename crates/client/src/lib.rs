@@ -29,7 +29,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use voxweb_core::block::BlockID;
-use voxweb_core::chunk::Position;
+use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
@@ -57,6 +57,11 @@ const MAX_REACH: f32 = 6.0;
 
 /// Ping 间隔（毫秒）。
 const PING_INTERVAL_MS: f64 = 5000.0;
+
+/// 普通自动保存间隔（毫秒）。退出 / 手动保存有单独快路径。
+const AUTO_SAVE_INTERVAL_MS: f64 = 3000.0;
+const AUTO_SAVE_BATCH_CHUNKS: usize = 4;
+const SAVE_NOW_BATCH_CHUNKS: usize = 16;
 
 /// Pong 校时样本权重。Pong 带 RTT 信息，可信度高于裸 PlayerTick。
 const CLOCK_PONG_ALPHA: f64 = 0.2;
@@ -283,6 +288,133 @@ fn push_notification(a: &mut App, message: impl Into<String>) {
     if a.notifications.len() > 8 {
         a.notifications.remove(0);
     }
+}
+
+fn apply_persisted_accounting(
+    game: &mut Game,
+    encoded_sizes: &[(ChunkPos, u64)],
+    refreshed_quota: Option<crate::storage::QuotaInfo>,
+) {
+    for (pos, size) in encoded_sizes.iter().copied() {
+        game.known_persisted.insert(pos);
+        game.loaded_persisted_chunks.insert(pos);
+        let old_size = game.persisted_chunk_sizes.insert(pos, size).unwrap_or(0);
+        if size >= old_size {
+            game.current_world_bytes = game.current_world_bytes.saturating_add(size - old_size);
+        } else {
+            game.current_world_bytes = game.current_world_bytes.saturating_sub(old_size - size);
+        }
+    }
+    if let Some(quota) = refreshed_quota {
+        game.quota = Some(quota);
+    }
+}
+
+fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
+    let maybe_job = {
+        let mut a = app.borrow_mut();
+        let session_id = a.world_session_id;
+        let Some(g) = a.game.as_mut() else {
+            return;
+        };
+        if matches!(g.mode, GameMode::Remote) {
+            return;
+        }
+        let Some(storage) = g.storage.clone() else {
+            return;
+        };
+        let tick = g.server.borrow().world.tick_count;
+        let snapshot_positions = g
+            .server
+            .borrow_mut()
+            .world
+            .persistence
+            .snapshot_dirty(usize::MAX, tick);
+        if snapshot_positions.is_empty() {
+            return;
+        }
+
+        let server = g.server.clone();
+        let mut encoded = Vec::new();
+        let mut encoded_sizes = Vec::new();
+        {
+            let server_ref = server.borrow();
+            for pos in &snapshot_positions {
+                if let Some(chunk) = server_ref.world.chunks.get(pos) {
+                    let bytes = voxweb_core::chunk::encode(chunk);
+                    encoded_sizes.push((*pos, bytes.len() as u64));
+                    encoded.push((*pos, bytes));
+                }
+            }
+        }
+
+        let positions: Vec<_> = encoded.iter().map(|(pos, _)| *pos).collect();
+        let position_set: HashSet<_> = positions.iter().copied().collect();
+        let missing_positions: Vec<_> = snapshot_positions
+            .iter()
+            .copied()
+            .filter(|pos| !position_set.contains(pos))
+            .collect();
+        if !missing_positions.is_empty() {
+            log::warn!(
+                "[storage] {reason}: {} dirty chunks were missing from memory",
+                missing_positions.len()
+            );
+            server
+                .borrow_mut()
+                .world
+                .persistence
+                .commit_flushed(&missing_positions);
+        }
+        if encoded.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "[storage] {reason}: best-effort flush {} chunks",
+            encoded.len()
+        );
+        Some((
+            storage,
+            server,
+            positions,
+            encoded,
+            encoded_sizes,
+            tick,
+            session_id,
+        ))
+    };
+
+    let Some((storage, server, positions, encoded, encoded_sizes, tick, session_id)) = maybe_job
+    else {
+        return;
+    };
+    let app_ref = app.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = storage.save_chunks(encoded).await;
+        let refreshed_quota = if result.is_ok() {
+            storage.quota().await
+        } else {
+            None
+        };
+        let mut s = server.borrow_mut();
+        match result {
+            Ok(()) => {
+                s.world.persistence.commit_flushed(&positions);
+                drop(s);
+                let mut a = app_ref.borrow_mut();
+                if a.world_session_id == session_id
+                    && let Some(g) = a.game.as_mut()
+                {
+                    apply_persisted_accounting(g, &encoded_sizes, refreshed_quota);
+                }
+            }
+            Err(e) => {
+                log::warn!("[storage] {reason} flush failed: {e:?}");
+                s.world.persistence.record_flush_failure(&positions, tick);
+            }
+        }
+    });
 }
 
 // ============================================================
@@ -554,6 +686,17 @@ fn install_event_listeners(
             on_contextmenu.as_ref().unchecked_ref(),
         )?;
         on_contextmenu.forget();
+    }
+
+    // —— 页面离开 / 进入 BFCache 前尽力保存剩余 dirty chunk ——
+    if let Some(window) = web_sys::window() {
+        let app_clone = app.clone();
+        let on_pagehide = Closure::<dyn FnMut()>::new(move || {
+            flush_dirty_best_effort(&app_clone, "pagehide");
+        });
+        window
+            .add_event_listener_with_callback("pagehide", on_pagehide.as_ref().unchecked_ref())?;
+        on_pagehide.forget();
     }
 
     Ok(())
@@ -1184,7 +1327,7 @@ fn start_host(
             if let Some(key) = save_key {
                 attach_storage_for_load(app.clone(), key.to_string(), session_id);
             } else {
-                // Host 模式：使用 room_id + seed 创建存档
+                // Host 新建存档仍由 OPFS 分配 world_key；已有世界通过大厅选中的 key 复用。
                 attach_storage_async(app.clone(), room_id.to_string(), seed, session_id);
             }
         }
@@ -1261,6 +1404,7 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                         }
                     }
                 }
+                let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -1273,6 +1417,8 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.loaded_persisted_chunks = loaded_positions;
+                    g.pending_persisted_loads.clear();
                     g.current_world_bytes = current_world_bytes;
                     g.other_worlds_bytes = other_worlds_bytes;
                     g.persisted_chunk_sizes = chunk_sizes;
@@ -1321,6 +1467,7 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                         }
                     }
                 }
+                let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -1333,6 +1480,8 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.loaded_persisted_chunks = loaded_positions;
+                    g.pending_persisted_loads.clear();
                     g.current_world_bytes = current_world_bytes;
                     g.other_worlds_bytes = other_worlds_bytes;
                     g.persisted_chunk_sizes = chunk_sizes;
@@ -1381,6 +1530,7 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                         }
                     }
                 }
+                let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -1393,6 +1543,8 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
+                    g.loaded_persisted_chunks = loaded_positions;
+                    g.pending_persisted_loads.clear();
                     g.current_world_bytes = current_world_bytes;
                     g.other_worlds_bytes = other_worlds_bytes;
                     g.persisted_chunk_sizes = chunk_sizes;
@@ -1429,6 +1581,116 @@ async fn storage_size_snapshot(
         .sum::<u64>();
     let other_worlds_bytes = total_world_bytes.saturating_sub(current_world_bytes);
     (chunk_sizes, current_world_bytes, other_worlds_bytes)
+}
+
+fn request_visible_persisted_loads(app: &Rc<RefCell<App>>, camera_pos: glam::Vec3) {
+    let maybe_jobs = {
+        let mut a = app.borrow_mut();
+        let session_id = a.world_session_id;
+        let Some(g) = a.game.as_mut() else {
+            return;
+        };
+        if matches!(g.mode, GameMode::Remote) {
+            return;
+        }
+        let Some(storage) = g.storage.clone() else {
+            return;
+        };
+
+        let center = chunk_pos_of(camera_pos);
+        let r = g.chunk_loader.render_distance.max(0);
+        let mut positions = Vec::new();
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let pos = ChunkPos::new(center.x + dx, center.z + dz);
+                if g.known_persisted.contains(&pos)
+                    && !g.loaded_persisted_chunks.contains(&pos)
+                    && g.pending_persisted_loads.insert(pos)
+                {
+                    positions.push(pos);
+                }
+            }
+        }
+        if positions.is_empty() {
+            return;
+        }
+        Some((storage, positions, session_id))
+    };
+
+    let Some((storage, positions, session_id)) = maybe_jobs else {
+        return;
+    };
+    for pos in positions {
+        spawn_persisted_chunk_load(app.clone(), storage.clone(), pos, session_id);
+    }
+}
+
+fn spawn_persisted_chunk_load(
+    app: Rc<RefCell<App>>,
+    storage: OpfsStorage,
+    pos: ChunkPos,
+    session_id: u64,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let loaded = match storage.load_chunk(pos).await {
+            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                Ok(chunk) => Some(Ok(chunk)),
+                Err(e) => {
+                    log::warn!("[storage] decode persisted chunk {pos:?} failed: {e:?}");
+                    Some(Err(()))
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("[storage] load persisted chunk {pos:?} failed: {e:?}");
+                Some(Err(()))
+            }
+        };
+
+        let mut a = app.borrow_mut();
+        if a.world_session_id != session_id {
+            return;
+        }
+        let Some(g) = a.game.as_mut() else {
+            return;
+        };
+        g.pending_persisted_loads.remove(&pos);
+        match loaded {
+            Some(Ok(chunk)) => {
+                let should_apply = {
+                    let server = g.server.borrow();
+                    !server.world.persistence.is_dirty_or_in_flight(pos)
+                };
+                g.loaded_persisted_chunks.insert(pos);
+                if should_apply {
+                    g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                    enqueue_chunk_and_neighbors(&mut g.mesh_jobs, pos, MeshPriority::High);
+                } else {
+                    log::debug!(
+                        "[storage] skip persisted overwrite for dirty/in-flight chunk {pos:?}"
+                    );
+                }
+            }
+            Some(Err(())) => {
+                g.loaded_persisted_chunks.insert(pos);
+            }
+            None => {
+                g.known_persisted.remove(&pos);
+                g.loaded_persisted_chunks.insert(pos);
+            }
+        }
+    });
+}
+
+fn enqueue_chunk_and_neighbors(
+    mesh_jobs: &mut crate::mesh_jobs::MeshJobQueue,
+    pos: ChunkPos,
+    priority: MeshPriority,
+) {
+    mesh_jobs.enqueue(pos, priority);
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        mesh_jobs.enqueue(ChunkPos::new(pos.x + dx, pos.z + dz), priority);
+    }
 }
 
 // ============================================================
@@ -1603,6 +1865,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
     };
 
     if matches!(cancel, Some(ConnectingAction::Cancel)) {
+        flush_dirty_best_effort(app, "return-to-lobby");
         let mut a = app.borrow_mut();
         return_to_lobby(&mut a);
         return Ok(());
@@ -1741,6 +2004,7 @@ fn render_disconnected_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result
     };
 
     if matches!(action, ui::disconnected::DisconnectedAction::BackToLobby) {
+        flush_dirty_best_effort(app, "return-to-lobby");
         let mut a = app.borrow_mut();
         return_to_lobby(&mut a);
         return Ok(());
@@ -2199,6 +2463,7 @@ fn render_game_frame(
                 .update(camera_pos, &mut server_mut, &mut game.mesh_jobs, renderer);
         }
     }
+    request_visible_persisted_loads(app, camera_pos);
 
     // —— 6. mesh_jobs run_until_budget ——
     let mesh_stats = {
@@ -2435,6 +2700,7 @@ fn render_game_frame(
         }
     }
     if pause_exit_to_lobby {
+        flush_dirty_best_effort(app, "return-to-lobby");
         let mut a = app.borrow_mut();
         return_to_lobby(&mut a);
         return Ok(());
@@ -2605,6 +2871,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
     let now = now_ms();
     let maybe_job = {
         let mut a = app.borrow_mut();
+        let session_id = a.world_session_id;
         let Some(g) = a.game.as_mut() else {
             return;
         };
@@ -2616,7 +2883,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             }
             return;
         }
-        if !save_now && now - g.last_persist_ms < 1000.0 {
+        if !save_now && now - g.last_persist_ms < AUTO_SAVE_INTERVAL_MS {
             return;
         }
         if let Some(q) = g.quota {
@@ -2634,25 +2901,35 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             return;
         };
         let tick = g.server.borrow().world.tick_count;
+        let in_flight = g.server.borrow().world.persistence.in_flight_len();
+        if in_flight > 0 {
+            return;
+        }
         if !save_now && !g.server.borrow().world.persistence.should_flush(tick) {
             return;
         }
+        let batch_limit = if save_now {
+            SAVE_NOW_BATCH_CHUNKS
+        } else {
+            AUTO_SAVE_BATCH_CHUNKS
+        };
         let positions = g
             .server
             .borrow_mut()
             .world
             .persistence
-            .snapshot_dirty(if save_now { usize::MAX } else { 4 }, tick);
+            .snapshot_dirty(batch_limit, tick);
         if positions.is_empty() {
             if save_now {
                 let dirty = g.server.borrow().world.persistence.dirty_len();
                 let in_flight = g.server.borrow().world.persistence.in_flight_len();
-                g.save_now_requested = false;
                 if dirty == 0 && in_flight == 0 {
+                    g.save_now_requested = false;
                     push_notification(&mut a, "Save complete");
                 } else if in_flight > 0 {
-                    push_notification(&mut a, "Save already in progress");
+                    // 正在写上一批，完成回调会继续推进 / 提示。
                 } else {
+                    g.save_now_requested = false;
                     push_notification(&mut a, "Save will retry soon");
                 }
             }
@@ -2671,20 +2948,42 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 }
             }
         }
-        g.save_now_requested = false;
+        let encoded_positions: Vec<_> = encoded.iter().map(|(pos, _)| *pos).collect();
+        let encoded_position_set: HashSet<_> = encoded_positions.iter().copied().collect();
+        let missing_positions: Vec<_> = positions
+            .iter()
+            .copied()
+            .filter(|pos| !encoded_position_set.contains(pos))
+            .collect();
+        if !missing_positions.is_empty() {
+            log::warn!(
+                "[storage] {} dirty chunks were missing from memory",
+                missing_positions.len()
+            );
+            server
+                .borrow_mut()
+                .world
+                .persistence
+                .commit_flushed(&missing_positions);
+        }
+        if encoded.is_empty() {
+            return;
+        }
         g.last_persist_ms = now;
         Some((
             storage,
             server,
-            positions,
+            encoded_positions,
             encoded,
             encoded_sizes,
             tick,
             save_now,
+            session_id,
         ))
     };
 
-    let Some((storage, server, positions, encoded, encoded_sizes, tick, save_now)) = maybe_job
+    let Some((storage, server, positions, encoded, encoded_sizes, tick, save_now, session_id)) =
+        maybe_job
     else {
         return;
     };
@@ -2700,24 +2999,20 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         match result {
             Ok(()) => {
                 s.world.persistence.commit_flushed(&positions);
+                let save_now_done = save_now
+                    && s.world.persistence.dirty_len() == 0
+                    && s.world.persistence.in_flight_len() == 0;
                 drop(s);
                 let mut a = app_ref.borrow_mut();
-                if let Some(g) = a.game.as_mut() {
-                    for (pos, size) in encoded_sizes {
-                        let old_size = g.persisted_chunk_sizes.insert(pos, size).unwrap_or(0);
-                        if size >= old_size {
-                            g.current_world_bytes =
-                                g.current_world_bytes.saturating_add(size - old_size);
-                        } else {
-                            g.current_world_bytes =
-                                g.current_world_bytes.saturating_sub(old_size - size);
-                        }
-                    }
-                    if let Some(quota) = refreshed_quota {
-                        g.quota = Some(quota);
+                if a.world_session_id == session_id
+                    && let Some(g) = a.game.as_mut()
+                {
+                    apply_persisted_accounting(g, &encoded_sizes, refreshed_quota);
+                    if save_now_done {
+                        g.save_now_requested = false;
                     }
                 }
-                if save_now && matches!(a.state, AppState::InGame { .. }) {
+                if save_now_done && matches!(a.state, AppState::InGame { .. }) {
                     push_notification(&mut a, "Save complete");
                 }
             }
@@ -2727,6 +3022,11 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 drop(s);
                 if save_now {
                     let mut a = app_ref.borrow_mut();
+                    if a.world_session_id == session_id
+                        && let Some(g) = a.game.as_mut()
+                    {
+                        g.save_now_requested = false;
+                    }
                     if matches!(a.state, AppState::InGame { .. }) {
                         push_notification(&mut a, format!("Save failed: {e:?}"));
                     }
@@ -2769,7 +3069,10 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         // Remote 的 server.world 只是本地世界视图，可以安全乐观修改；
         // Local/Host 与权威 server 共享同一份 world，仍等 BlockUpdate，避免提前改世界干扰校验。
         if game.mode == GameMode::Remote {
-            game.server.borrow_mut().world.set_block(pos, BlockID::AIR);
+            game.server
+                .borrow_mut()
+                .world
+                .set_block_untracked(pos, BlockID::AIR);
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
@@ -2828,7 +3131,10 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
             },
         );
         if game.mode == GameMode::Remote {
-            game.server.borrow_mut().world.set_block(neighbor, block);
+            game.server
+                .borrow_mut()
+                .world
+                .set_block_untracked(neighbor, block);
             for cp in affected_chunks(neighbor) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
@@ -2961,7 +3267,10 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
         ServerMessage::BlockUpdate { pos, block } => {
             // Remote：先写 world，再做 remesh（因为 Remote 的 server 不做本地 handle_message）
             if game.mode == GameMode::Remote {
-                game.server.borrow_mut().world.set_block(pos, block);
+                game.server
+                    .borrow_mut()
+                    .world
+                    .set_block_untracked(pos, block);
             }
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
@@ -2977,12 +3286,14 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     "ActionAck rejected: id={request_id} reason={reason:?} pos={:?}",
                     rolled.pos
                 );
-                game.server
-                    .borrow_mut()
-                    .world
-                    .set_block(rolled.pos, rolled.backup);
-                for cp in affected_chunks(rolled.pos) {
-                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                if game.mode == GameMode::Remote {
+                    game.server
+                        .borrow_mut()
+                        .world
+                        .set_block_untracked(rolled.pos, rolled.backup);
+                    for cp in affected_chunks(rolled.pos) {
+                        game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                    }
                 }
             }
         }
