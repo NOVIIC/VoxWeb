@@ -29,6 +29,7 @@ use crate::passes::player::{PlayerInstance, PlayerPass};
 use crate::passes::selection::{SelectionGlobals, SelectionPass};
 use crate::passes::skybox::{SkyboxGlobals, SkyboxPass};
 use crate::passes::transparent::{TransparentGlobals, TransparentMeshGpu, TransparentPass};
+use crate::texture::TextureAtlas;
 
 /// 深度纹理格式（与 OpaquePass 中的 DepthStencilState 对齐）。
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -41,6 +42,32 @@ pub struct WorldRenderStats {
     pub culled_chunks: usize,
     pub drawn_vertices: u32,
     pub drawn_indices: u32,
+}
+
+/// 一帧内所有视觉 pass 共享的自然光照 / 雾化参数。
+#[derive(Clone, Copy, Debug)]
+pub struct VisualFrame {
+    pub camera_pos: Vec3,
+    pub time_seconds: f32,
+    pub sun_dir: Vec3,
+    pub fog_color: Vec3,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub haze_strength: f32,
+}
+
+impl VisualFrame {
+    pub fn new(camera_pos: Vec3, time_seconds: f32) -> Self {
+        Self {
+            camera_pos,
+            time_seconds,
+            sun_dir: Vec3::new(0.42, 0.82, 0.28).normalize(),
+            fog_color: Vec3::new(0.72, 0.82, 0.86),
+            fog_start: 70.0,
+            fog_end: 210.0,
+            haze_strength: 0.72,
+        }
+    }
 }
 
 /// 顶层渲染器。持有 wgpu 设备、Surface、Pipeline、所有 Chunk 网格 GPU 资源。
@@ -61,6 +88,7 @@ pub struct Renderer {
     transparent_pass: TransparentPass,
     player_pass: PlayerPass,
     selection_pass: SelectionPass,
+    texture_atlas: TextureAtlas,
     chunk_meshes: HashMap<ChunkPos, ChunkMeshGpu>,
     transparent_meshes: HashMap<ChunkPos, TransparentMeshGpu>,
 }
@@ -73,9 +101,20 @@ impl Renderer {
         device::configure_surface(&ctx.surface, &ctx.device, ctx.surface_format, w, h);
 
         let (depth_texture, depth_view) = create_depth(&ctx.device, w, h);
-        let opaque_pass = OpaquePass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
+        let texture_atlas = TextureAtlas::new(&ctx.device, &ctx.queue);
+        let opaque_pass = OpaquePass::new(
+            &ctx.device,
+            ctx.surface_format,
+            DEPTH_FORMAT,
+            &texture_atlas.bind_group_layout,
+        );
         let skybox_pass = SkyboxPass::new(&ctx.device, ctx.surface_format);
-        let transparent_pass = TransparentPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
+        let transparent_pass = TransparentPass::new(
+            &ctx.device,
+            ctx.surface_format,
+            DEPTH_FORMAT,
+            &texture_atlas.bind_group_layout,
+        );
         let player_pass = PlayerPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
         let selection_pass = SelectionPass::new(&ctx.device, ctx.surface_format, DEPTH_FORMAT);
 
@@ -93,6 +132,7 @@ impl Renderer {
             transparent_pass,
             player_pass,
             selection_pass,
+            texture_atlas,
             chunk_meshes: HashMap::new(),
             transparent_meshes: HashMap::new(),
         })
@@ -239,7 +279,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        _clear_color: [f64; 4],
+        visual: VisualFrame,
     ) -> WorldRenderStats {
         let pass_label = "opaque_pass";
         let mut stats = WorldRenderStats {
@@ -308,6 +348,25 @@ impl Renderer {
                     chunk_origin_world.z,
                     0.0,
                 ],
+                camera_pos: [
+                    visual.camera_pos.x,
+                    visual.camera_pos.y,
+                    visual.camera_pos.z,
+                    0.0,
+                ],
+                fog_color: [
+                    visual.fog_color.x,
+                    visual.fog_color.y,
+                    visual.fog_color.z,
+                    0.0,
+                ],
+                fog_params: [
+                    visual.fog_start,
+                    visual.fog_end,
+                    visual.haze_strength,
+                    visual.time_seconds,
+                ],
+                sun_dir: [visual.sun_dir.x, visual.sun_dir.y, visual.sun_dir.z, 0.0],
             };
             // 写到该 chunk 自己的 uniform buffer
             self.queue
@@ -338,6 +397,7 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.opaque_pass.pipeline);
+        pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
         for (_, mesh) in entries {
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -390,6 +450,7 @@ impl Renderer {
                     chunk_origin_world.z,
                     0.0,
                 ],
+                ..GlobalsUniform::default()
             };
             self.queue
                 .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
@@ -424,13 +485,23 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        time_seconds: f32,
+        visual: VisualFrame,
     ) {
         let inv = view_proj.inverse();
-        let sun_dir = Vec3::new(0.35, 0.8, 0.25).normalize();
         let globals = SkyboxGlobals {
             inv_view_proj: inv.to_cols_array_2d(),
-            sun_dir_time: [sun_dir.x, sun_dir.y, sun_dir.z, time_seconds],
+            sun_dir_time: [
+                visual.sun_dir.x,
+                visual.sun_dir.y,
+                visual.sun_dir.z,
+                visual.time_seconds,
+            ],
+            fog_color: [
+                visual.fog_color.x,
+                visual.fog_color.y,
+                visual.fog_color.z,
+                0.0,
+            ],
         };
         self.queue.write_buffer(
             &self.skybox_pass.globals_buffer,
@@ -464,7 +535,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        camera_pos: Vec3,
+        visual: VisualFrame,
     ) {
         if self.transparent_meshes.is_empty() {
             return;
@@ -478,7 +549,7 @@ impl Renderer {
                     128.0,
                     pos.z as f32 * voxweb_core::CHUNK_Z as f32 + 8.0,
                 );
-                (*pos, center.distance_squared(camera_pos))
+                (*pos, center.distance_squared(visual.camera_pos))
             })
             .collect();
         entries.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -500,6 +571,25 @@ impl Renderer {
                     chunk_origin_world.z,
                     0.0,
                 ],
+                camera_pos: [
+                    visual.camera_pos.x,
+                    visual.camera_pos.y,
+                    visual.camera_pos.z,
+                    0.0,
+                ],
+                fog_color: [
+                    visual.fog_color.x,
+                    visual.fog_color.y,
+                    visual.fog_color.z,
+                    0.0,
+                ],
+                fog_params: [
+                    visual.fog_start,
+                    visual.fog_end,
+                    visual.haze_strength,
+                    visual.time_seconds,
+                ],
+                sun_dir: [visual.sun_dir.x, visual.sun_dir.y, visual.sun_dir.z, 0.0],
             };
             self.queue
                 .write_buffer(&mesh.globals_buffer, 0, bytemuck::bytes_of(&globals));
@@ -529,6 +619,7 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.transparent_pass.pipeline);
+        pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
         for (pos, _) in entries {
             let Some(mesh) = self.transparent_meshes.get(&pos) else {
                 continue;

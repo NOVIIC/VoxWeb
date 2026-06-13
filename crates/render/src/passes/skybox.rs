@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 pub struct SkyboxGlobals {
     pub inv_view_proj: [[f32; 4]; 4],
     pub sun_dir_time: [f32; 4],
+    pub fog_color: [f32; 4],
 }
 
 pub struct SkyboxPass {

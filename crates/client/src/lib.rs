@@ -33,7 +33,7 @@ use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
-use voxweb_render::Renderer;
+use voxweb_render::{Renderer, VisualFrame};
 
 use crate::app::{
     AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
@@ -51,6 +51,7 @@ use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
     validate_room_id,
 };
+use crate::ui::theme;
 
 /// 玩家眼睛到目标方块的最大射程（与 server::physics::MAX_REACH 对齐）。
 const MAX_REACH: f32 = 6.0;
@@ -182,6 +183,7 @@ pub async fn start() -> Result<(), JsValue> {
     renderer.resize(cw, ch);
 
     let egui_ctx = egui::Context::default();
+    ui::theme::apply(&egui_ctx);
     let egui_renderer = egui_wgpu::Renderer::new(
         &renderer.device,
         renderer.surface_format,
@@ -2738,8 +2740,9 @@ fn render_game_frame(
         });
 
         // 天空 + 可选 Depth Pre-Pass + 世界 Pass
+        let visual = VisualFrame::new(camera_pos, (now_ms() / 1000.0) as f32);
         a.renderer
-            .render_skybox(&mut encoder, &view, view_proj, (now_ms() / 1000.0) as f32);
+            .render_skybox(&mut encoder, &view, view_proj, visual);
         let depth_start = now_ms();
         let depth_enabled = a
             .game
@@ -2752,9 +2755,9 @@ fn render_game_frame(
         let depth_pass_ms = (now_ms() - depth_start) as f32;
 
         let world_start = now_ms();
-        let world_stats =
-            a.renderer
-                .render_world(&mut encoder, &view, view_proj, [0.55, 0.78, 0.93, 1.0]);
+        let world_stats = a
+            .renderer
+            .render_world(&mut encoder, &view, view_proj, visual);
         let world_pass_ms = (now_ms() - world_start) as f32;
 
         // Phase 5 玩家实体 Pass：从插值器拿远端位置 → instance buffer → 渲染
@@ -2785,7 +2788,7 @@ fn render_game_frame(
 
         let transparent_start = now_ms();
         a.renderer
-            .render_transparent(&mut encoder, &view, view_proj, camera_pos);
+            .render_transparent(&mut encoder, &view, view_proj, visual);
         let transparent_pass_ms = (now_ms() - transparent_start) as f32;
 
         // 选中方块线框（命中时）
@@ -3420,23 +3423,21 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
         egui::Area::new(egui::Id::new("hud_topleft"))
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 12.0))
             .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                    .inner_margin(egui::Margin::symmetric(10, 8))
+                theme::compact_frame()
                     .show(ui, |ui| {
                         ui.colored_label(
-                            egui::Color32::from_rgb(220, 230, 235),
+                            theme::TEXT,
                             format!("FPS  {:>5.1}", data.fps),
                         );
                         ui.colored_label(
-                            egui::Color32::from_rgb(220, 230, 235),
+                            theme::TEXT,
                             format!(
                                 "POS  x {:+8.2}  y {:+8.2}  z {:+8.2}",
                                 data.pos.0, data.pos.1, data.pos.2
                             ),
                         );
                         ui.colored_label(
-                            egui::Color32::from_rgb(180, 190, 200),
+                            theme::MUTED,
                             format!("YAW {:+6.1}°  PITCH {:+5.1}°", data.yaw_deg, data.pitch_deg),
                         );
                         let mode_str = match data.mode {
@@ -3444,7 +3445,7 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             CameraMode::Fly => "Fly",
                         };
                         ui.colored_label(
-                            egui::Color32::from_rgb(180, 200, 180),
+                            theme::SUCCESS,
                             format!(
                                 "MODE {}  {}",
                                 mode_str,
@@ -3452,14 +3453,14 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             ),
                         );
                         ui.colored_label(
-                            egui::Color32::from_rgb(160, 175, 190),
+                            theme::MUTED,
                             format!(
                                 "CHUNKS {}  MESH_Q {}",
                                 data.loaded_chunks, data.mesh_pending
                             ),
                         );
                         ui.colored_label(
-                            egui::Color32::from_rgb(160, 175, 190),
+                            theme::MUTED,
                             format!(
                                 "DEPTH_PRE {}",
                                 if data.depth_prepass_enabled { "ON" } else { "OFF" }
@@ -3474,11 +3475,11 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                                 data.current_world_bytes as f32 / available_for_world as f32
                             };
                             let color = if ratio > 0.95 {
-                                egui::Color32::from_rgb(240, 80, 80)
+                                theme::DANGER
                             } else if ratio > 0.80 {
-                                egui::Color32::from_rgb(230, 190, 80)
+                                theme::WARNING
                             } else {
-                                egui::Color32::from_rgb(160, 200, 170)
+                                theme::SUCCESS
                             };
                             ui.colored_label(
                                 color,
@@ -3491,12 +3492,12 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                         }
                         if let Some(err) = data.storage_error.as_deref() {
                             ui.colored_label(
-                                egui::Color32::from_rgb(240, 120, 120),
+                                theme::DANGER,
                                 format!("SAVE ERR {err}"),
                             );
                         }
                         ui.colored_label(
-                            egui::Color32::from_rgb(160, 175, 190),
+                            theme::MUTED,
                             format!(
                                 "VISIBLE {}  CULLED {}  DRAW_V/I {}/{}",
                                 data.perf.visible_chunks,
@@ -3511,7 +3512,7 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             .map(|v| format!("{v:>5.1}%"))
                             .unwrap_or_else(|| "  -- ".to_string());
                         ui.colored_label(
-                            egui::Color32::from_rgb(170, 200, 210),
+                            theme::ACCENT,
                             format!(
                                 "MESH {:>4.1}ms  jobs {}  v {}→{}  i {}  -{}",
                                 data.perf.mesh_ms,
@@ -3523,7 +3524,7 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             ),
                         );
                         ui.colored_label(
-                            egui::Color32::from_rgb(170, 190, 220),
+                            theme::ACCENT,
                             format!(
                                 "PASS depth {:>4.1}  world {:>4.1}  player {:>4.1}  trans {:>4.1}  sel {:>4.1}  ui {:>4.1} ms",
                                 data.perf.depth_pass_ms,
@@ -3550,13 +3551,13 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
                             format!("  ROOM {}", data.room_id)
                         };
                         ui.colored_label(
-                            egui::Color32::from_rgb(200, 200, 160),
+                            theme::ACCENT_WARM,
                             format!("NET {mode_str}  RTT {rtt_str}{room_str}"),
                         );
                         if data.relayed_peer_count > 0 {
                             // 醒目橙色：表示当前有 peer 走信令 Worker 中继
                             ui.colored_label(
-                                egui::Color32::from_rgb(240, 165, 80),
+                                theme::WARNING,
                                 format!("RELAY {} peer(s) (relaying)", data.relayed_peer_count),
                             );
                         }
@@ -3568,11 +3569,39 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
     egui::Area::new(egui::Id::new("hud_crosshair"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new("+")
-                    .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220))
-                    .size(22.0)
-                    .strong(),
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            let center = rect.center();
+            let stroke = egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgba_unmultiplied(240, 248, 244, 210),
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x - 7.0, center.y),
+                    egui::pos2(center.x - 2.0, center.y),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x + 2.0, center.y),
+                    egui::pos2(center.x + 7.0, center.y),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x, center.y - 7.0),
+                    egui::pos2(center.x, center.y - 2.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(center.x, center.y + 2.0),
+                    egui::pos2(center.x, center.y + 7.0),
+                ],
+                stroke,
             );
         });
 
@@ -3585,16 +3614,14 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
             } else {
                 "Click to enter camera control"
             };
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110))
-                .inner_margin(egui::Margin::symmetric(14, 6))
+            theme::compact_frame()
                 .show(ui, |ui| {
                     // 用 Extend 模式强制按文本自然宽度撑开，避免暂停→返回时上一帧
                     // 残留的小 available_width 让长提示被换行/截断
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(msg)
-                                .color(egui::Color32::from_rgb(230, 235, 240)),
+                                .color(theme::TEXT),
                         )
                         .wrap_mode(egui::TextWrapMode::Extend),
                     );
@@ -3605,47 +3632,65 @@ fn draw_hud(ctx: &egui::Context, data: HudData) {
     egui::Area::new(egui::Id::new("hud_hotbar"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
         .show(ctx, |ui| {
-            egui::Frame::default()
-                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140))
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        for (i, block) in data.hotbar_items.iter().enumerate() {
-                            let selected = i == data.hotbar_selected;
-                            let label = crate::hotbar::block_label(*block);
-                            let txt = format!("{}\n{}", i + 1, label);
-                            let bg = if selected {
-                                egui::Color32::from_rgba_unmultiplied(240, 200, 80, 220)
-                            } else {
-                                egui::Color32::from_rgba_unmultiplied(60, 70, 80, 200)
-                            };
-                            let fg = if selected {
-                                egui::Color32::BLACK
-                            } else {
-                                egui::Color32::from_rgb(230, 235, 240)
-                            };
-                            // 用 allocate_ui_with_layout 显式给每格固定 54×36 的空间，
-                            // 避免在 horizontal 内嵌套 vertical_centered 时取走全部可用宽度
-                            // 导致 9 个格子全部叠在同一位置只显示一个的现象。
-                            egui::Frame::default()
-                                .fill(bg)
-                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(54.0, 36.0),
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            ui.colored_label(
-                                                fg,
-                                                egui::RichText::new(&txt).size(11.0),
-                                            );
-                                        },
-                                    );
-                                });
-                        }
-                    });
+            theme::compact_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, block) in data.hotbar_items.iter().enumerate() {
+                        let selected = i == data.hotbar_selected;
+                        let label = crate::hotbar::block_label(*block);
+                        let bg = if selected {
+                            egui::Color32::from_rgba_unmultiplied(220, 188, 112, 230)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(35, 47, 50, 220)
+                        };
+                        let fg = if selected {
+                            egui::Color32::from_rgb(20, 24, 22)
+                        } else {
+                            theme::TEXT
+                        };
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(58.0, 42.0), egui::Sense::hover());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, egui::CornerRadius::same(5), bg);
+                        painter.rect_stroke(
+                            rect,
+                            egui::CornerRadius::same(5),
+                            egui::Stroke::new(
+                                if selected { 2.0 } else { 1.0 },
+                                if selected {
+                                    theme::ACCENT_WARM
+                                } else {
+                                    theme::BORDER
+                                },
+                            ),
+                            egui::StrokeKind::Inside,
+                        );
+                        let swatch = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(7.0, 7.0),
+                            egui::vec2(14.0, 14.0),
+                        );
+                        painter.rect_filled(
+                            swatch,
+                            egui::CornerRadius::same(3),
+                            theme::block_swatch(*block),
+                        );
+                        painter.text(
+                            egui::pos2(rect.center().x + 4.0, rect.min.y + 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(12.0),
+                            fg,
+                        );
+                        painter.text(
+                            egui::pos2(rect.center().x, rect.max.y - 11.0),
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(10.0),
+                            fg,
+                        );
+                    }
                 });
+            });
         });
 }
 
@@ -3658,18 +3703,10 @@ fn draw_toast_notifications(ctx: &egui::Context, messages: &[String]) {
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 for msg in messages {
-                    egui::Frame::default()
-                        .fill(egui::Color32::from_rgba_unmultiplied(40, 20, 20, 200))
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(16, 8))
-                        .show(ui, |ui| {
-                            ui.set_max_width(420.0);
-                            ui.label(
-                                egui::RichText::new(msg)
-                                    .color(egui::Color32::from_rgb(240, 140, 120))
-                                    .size(14.0),
-                            );
-                        });
+                    theme::toast_frame().show(ui, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.label(egui::RichText::new(msg).color(theme::DANGER).size(14.0));
+                    });
                     ui.add_space(4.0);
                 }
             });

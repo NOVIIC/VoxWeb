@@ -14,8 +14,8 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 - **世界与交互**：Perlin 地形、动态 chunk 加载/卸载、玩家 AABB、Walk/Fly、跳跃、DDA 射线、挖放、hotbar、选中方块线框
 - **多人同步**：Local-Only / Host / Remote 三角色；Hello/Welcome 握手；ChunkSnapshot 分片；ChunkRequest；PlayerInput / PlayerTick；BlockUpdate；ActionAck；PeerJoined / PeerLeft
 - **网络兜底**：WebRTC 双 DataChannel 为主；ICE 失败或协商超时时，Host 可把指定 peer 对升级为 Cloudflare Worker WebSocket 字节中继
-- **UI**：大厅、连接进度、HUD、玩家列表、聊天、系统消息、名牌、暂停菜单、设置持久化、断线页面
-- **渲染**：WebGPU 多 Pass 主路径，程序化天空、Depth Pre-Pass、实体方块、玩家实体、透明方块、选中线框、egui UI
+- **UI**：大厅、连接进度、HUD、玩家列表、聊天、系统消息、名牌、暂停菜单、设置持久化、断线页面；统一 egui 主题和固定尺寸 HUD 控件
+- **渲染**：WebGPU 多 Pass 主路径，程序化天空、程序化方块纹理图集、自然距离雾、轻量 tone mapping、Depth Pre-Pass、实体方块、玩家实体、透明方块、选中线框、egui UI
 - **网格化与性能**：跨区块面剔除、贪婪网格化、AO、u32 顶点压缩、index buffer、视锥剔除、mesh 分帧预算和 HUD 统计
 - **持久化**：OPFS 存档、palette+RLE chunk 编码、周期 flush、手动保存、删档、配额 UI、LRU chunk cache、`storage_version` 校验和迁移框架
 
@@ -28,10 +28,10 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 - **单机**：进入大厅，启动单机世界，走路/跳跃/Fly 切换正常；地形持续加载，区块边界无漏面；挖放后 mesh 立即刷新
 - **双人同步**：一个 Tab 创建房间，另一个 Tab 加入；Remote 能收到初始地形和玩家列表；任一玩家挖方块，另一端立即看到变化
 - **移动预测**：Host 和 Remote 互相看到平滑移动；高 RTT 下本地玩家不会明显被旧快照拉回
-- **聊天与 UI**：聊天、系统消息、玩家名牌、暂停设置、断线返回大厅均可用；设置写入 localStorage
+- **聊天与 UI**：聊天、系统消息、玩家名牌、暂停设置、断线返回大厅均可用；大厅/连接/HUD/聊天/暂停视觉风格统一；设置写入 localStorage
 - **存档**：同一 room/seed 重进后保留已修改方块；手动保存和删档按钮行为正确；配额用量显示合理
 - **中继兜底**：模拟 WebRTC 直连失败时，指定 peer 对升级到 Worker 字节中继，HUD 显示中继状态，其它直连 peer 不受影响
-- **渲染检查**：天空、太阳、透明水/玻璃、选中线框和 UI 同时可见；Depth Pre-Pass 开关不改变画面正确性
+- **渲染检查**：天空、太阳、自然雾化、程序化方块材质、透明水/玻璃、选中线框和 UI 同时可见；Depth Pre-Pass 开关不改变画面正确性
 
 ---
 
@@ -50,7 +50,7 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 
 - **存档稳定性**：Dedicated Worker + sync handle；导入/导出存档文件；更细的存档损坏修复 UI
 - **网络增强**：TURN 凭据下发；TURN 与 Worker 字节中继的选择策略；更完整的重连流程
-- **渲染增强**：distance fog、tone mapping、Bloom、背面剔除收益验证、GPU timestamp query
+- **渲染增强**：Bloom、SSAO、阴影/光照传播、背面剔除收益验证、GPU timestamp query、外部美术贴图资源管线
 - **玩法增强**：群系、光照传播、声音、录制/回放、主机迁移
 - **触屏支持**：虚拟摇杆、触屏跳跃/挖/放按钮、移动端 UI 缩放策略
 

@@ -10,6 +10,7 @@
 //!   属于开发调优字段，也不在用户菜单中暴露。
 
 use crate::app::AppSettings;
+use crate::ui::theme;
 
 /// 暂停菜单返回的动作。
 ///
@@ -40,7 +41,9 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .resizable(false)
         .collapsible(false)
+        .frame(theme::panel_frame())
         .show(ctx, |ui| {
+            ui.set_width(360.0);
             // FOV：30°–110°，超广角到长焦的常用范围。
             ui.add(egui::Slider::new(&mut settings.fov_degrees, 30.0..=110.0).text("FOV (°)"));
 
@@ -83,13 +86,13 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             // 这里只返回 Action，由调用方在同一帧的事件处理路径中调用
             // canvas.request_pointer_lock()。
             ui.horizontal(|ui| {
-                if ui.button("Save Now").clicked() {
+                if ui.add(theme::secondary_button("Save Now")).clicked() {
                     action = PauseAction::SaveNow;
                 }
-                if ui.button("Resume").clicked() {
+                if ui.add(theme::primary_button("Resume")).clicked() {
                     action = PauseAction::Resume;
                 }
-                if ui.button("Exit to Lobby").clicked() {
+                if ui.add(theme::danger_button("Exit to Lobby")).clicked() {
                     action = PauseAction::ExitToLobby;
                 }
             });

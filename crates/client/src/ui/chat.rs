@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 
 use crate::chat::{ChatHistory, ChatKind};
+use crate::ui::theme;
 
 /// 聊天 UI 只按单行展示消息：自动换行由 Label 配置禁止，显式 CR/LF 也在显示层折成空格。
 fn single_line_text(text: &str) -> Cow<'_, str> {
@@ -49,77 +50,75 @@ pub fn draw_chat_window(ctx: &egui::Context, history: &mut ChatHistory) -> ChatU
         .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(20.0, -20.0))
         .movable(false)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style())
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.set_min_width(400.0);
+            theme::panel_frame().show(ui, |ui| {
+                ui.set_min_width(400.0);
 
-                    // —— 历史滚动区 ——
-                    egui::ScrollArea::vertical()
-                        .max_height(200.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for msg in history.recent(50) {
-                                // 一条聊天消息固定占一行；正文用 Extend 禁止自动换行，
-                                // 避免玩家名和消息内容在宽度边界附近被拆到两行。
-                                ui.horizontal(|ui| match &msg.kind {
-                                    ChatKind::System => {
-                                        let content = single_line_text(&msg.content);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!("[System] {content}"))
-                                                    .color(egui::Color32::from_rgb(160, 170, 180)),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Extend),
-                                        );
-                                    }
-                                    ChatKind::User { from_name, .. } => {
-                                        let from_name = single_line_text(from_name);
-                                        let content = single_line_text(&msg.content);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!("{from_name}: "))
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(220, 230, 240)),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Extend),
-                                        );
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(content.as_ref())
-                                                    .color(egui::Color32::from_rgb(230, 235, 240)),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Extend),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-
-                    ui.separator();
-
-                    // —— 单行输入框 ——
-                    // 256 字符限制由服务端兜底；客户端不强制截断，让用户能看到自己输入的全部内容。
-                    let resp = ui.text_edit_singleline(&mut history.input_buffer);
-                    resp.request_focus();
-
-                    // Submit: Enter pressed. input_buffer already contains the typed text.
-                    let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-
-                    if enter {
-                        let content = std::mem::take(&mut history.input_buffer);
-                        if content.trim().is_empty() {
-                            // 空消息：丢弃并取消（外层关闭聊天框）。
-                            action = ChatUiAction::Cancel;
-                        } else {
-                            action = ChatUiAction::Submit(content);
+                // —— 历史滚动区 ——
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for msg in history.recent(50) {
+                            // 一条聊天消息固定占一行；正文用 Extend 禁止自动换行，
+                            // 避免玩家名和消息内容在宽度边界附近被拆到两行。
+                            ui.horizontal(|ui| match &msg.kind {
+                                ChatKind::System => {
+                                    let content = single_line_text(&msg.content);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("[System] {content}"))
+                                                .color(theme::MUTED),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                }
+                                ChatKind::User { from_name, .. } => {
+                                    let from_name = single_line_text(from_name);
+                                    let content = single_line_text(&msg.content);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{from_name}: "))
+                                                .strong()
+                                                .color(theme::ACCENT_WARM),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(content.as_ref())
+                                                .color(theme::TEXT),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                }
+                            });
                         }
-                    } else if esc {
-                        history.input_buffer.clear();
+                    });
+
+                ui.separator();
+
+                // —— 单行输入框 ——
+                // 256 字符限制由服务端兜底；客户端不强制截断，让用户能看到自己输入的全部内容。
+                let resp = ui.text_edit_singleline(&mut history.input_buffer);
+                resp.request_focus();
+
+                // Submit: Enter pressed. input_buffer already contains the typed text.
+                let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+                if enter {
+                    let content = std::mem::take(&mut history.input_buffer);
+                    if content.trim().is_empty() {
+                        // 空消息：丢弃并取消（外层关闭聊天框）。
                         action = ChatUiAction::Cancel;
+                    } else {
+                        action = ChatUiAction::Submit(content);
                     }
-                });
+                } else if esc {
+                    history.input_buffer.clear();
+                    action = ChatUiAction::Cancel;
+                }
+            });
         });
 
     action
@@ -144,50 +143,52 @@ pub fn draw_recent_overlay(ctx: &egui::Context, history: &ChatHistory, now_ms: f
         .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(20.0, -240.0))
         .interactable(false)
         .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for msg in recent {
-                // 剩余存活时间（ms）。最后 1500ms 内线性淡出，更早时保持 alpha=1。
-                let remaining = msg.received_at_ms + 5000.0 - now_ms;
-                let alpha = ((remaining / 1500.0).clamp(0.0, 1.0) * 255.0) as u8;
+            theme::compact_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for msg in recent {
+                    // 剩余存活时间（ms）。最后 1500ms 内线性淡出，更早时保持 alpha=1。
+                    let remaining = msg.received_at_ms + 5000.0 - now_ms;
+                    let alpha = ((remaining / 1500.0).clamp(0.0, 1.0) * 255.0) as u8;
 
-                match &msg.kind {
-                    ChatKind::System => {
-                        // 系统消息：淡灰色。
-                        let color = egui::Color32::from_rgba_unmultiplied(170, 180, 195, alpha);
-                        let content = single_line_text(&msg.content);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("[System] {content}")).color(color),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                        );
-                    }
-                    ChatKind::User { from_name, .. } => {
-                        // 用户消息：发送者加粗稍亮 + 内容白底。
-                        let from_name = single_line_text(from_name);
-                        let content = single_line_text(&msg.content);
-                        let name_color =
-                            egui::Color32::from_rgba_unmultiplied(235, 215, 130, alpha);
-                        let body_color =
-                            egui::Color32::from_rgba_unmultiplied(240, 240, 240, alpha);
-                        ui.horizontal(|ui| {
+                    match &msg.kind {
+                        ChatKind::System => {
+                            // 系统消息：淡灰色。
+                            let color = egui::Color32::from_rgba_unmultiplied(160, 176, 176, alpha);
+                            let content = single_line_text(&msg.content);
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(format!("{from_name}: "))
-                                        .strong()
-                                        .color(name_color),
+                                    egui::RichText::new(format!("[System] {content}")).color(color),
                                 )
                                 .wrap_mode(egui::TextWrapMode::Extend),
                             );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(content.as_ref()).color(body_color),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        });
+                        }
+                        ChatKind::User { from_name, .. } => {
+                            // 用户消息：发送者加粗稍亮 + 内容白底。
+                            let from_name = single_line_text(from_name);
+                            let content = single_line_text(&msg.content);
+                            let name_color =
+                                egui::Color32::from_rgba_unmultiplied(220, 184, 96, alpha);
+                            let body_color =
+                                egui::Color32::from_rgba_unmultiplied(226, 234, 229, alpha);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{from_name}: "))
+                                            .strong()
+                                            .color(name_color),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(content.as_ref()).color(body_color),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            });
+                        }
                     }
                 }
-            }
+            });
         });
 }

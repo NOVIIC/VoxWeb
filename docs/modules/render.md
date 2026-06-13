@@ -115,13 +115,13 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 ## 五、`texture.rs` — 纹理图集
 
 **设计**：
-- 单张大图（如 256×256，每格 16×16 → 16×16 = 256 个纹理槽，足够当前方块表）
+- 单张 `Rgba8UnormSrgb` 图集：当前为 128×128、每格 32×32、4×4 槽位
 - 每方块的纹理由 `BlockProperties.texture_index: u8` 指定槽位
-- WGSL 中 UV 计算：`uv = (texture_index_to_grid(idx) + face_local_uv) / atlas_size`
+- WGSL 中按 face + world position 生成可平铺 UV；fragment 内 `fract(raw_uv)` 后映射到图集 tile 内侧 30×30 像素，避开边界采样串色
 
 **纹理来源**：
-- 当前：项目内嵌（`include_bytes!` 加载，编译进 wasm）
-- 可选增强：远程加载（fetch + Image bitmap）
+- 当前：启动时由 Rust 程序化生成，覆盖 stone/grass/dirt/sand/wood/leaves/water/glass；不依赖图片文件或解码库
+- 可选增强：后续可替换为提交的美术贴图或远程加载（fetch + Image bitmap）
 
 **Mipmap**：当前不开（避免远处纹理颜色混叠产生彩虹），用 `MagFilter::Nearest` + `MinFilter::Nearest` 保持像素风。
 
@@ -201,7 +201,7 @@ graph.add_pass(Box::new(UiPass::new(...)));            // egui-wgpu 容器
 ### 7.2 `passes/opaque.rs` — Opaque Pass
 
 **目的**：渲染所有不透明方块。
-**输入**：可见 Chunk 网格 + 纹理图集 + 相机 UB
+**输入**：可见 Chunk 网格 + 程序化纹理图集 + `VisualFrame`（相机位置、时间、雾色、太阳方向）
 **输出**：写入 color + depth（`Less`，`store`）
 **Pipeline 设置**：
 - 深度比较：`Less`（如果有 Depth Pre-Pass，可改 `Equal` 进一步省 fragment work）
@@ -211,12 +211,14 @@ graph.add_pass(Box::new(UiPass::new(...)));            // egui-wgpu 容器
 
 **Draw 调用顺序**：先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
+**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。
+
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 
 **目的**：填充背景天空（程序化天空，支持太阳方向 + 颜色梯度）。
 **绘制方式**：
 - 全屏三角形（覆盖整个 viewport）
-- 片段着色器根据 ray direction 计算颜色（线性 azimuth-elevation 渐变）
+- 片段着色器根据 ray direction 计算柔和自然天空：地平线 haze、太阳核心、太阳辉光与雾色混合
 - 深度比较：`LessEqual`，深度写入：`false`（保证天空不挡其它东西，但被前景挡住）
 
 **程序化天空算法**：
@@ -239,6 +241,7 @@ fn sky_color(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 - 深度比较：`Less`，**深度写入：false**
 - Draw 顺序：按距离从远到近排序（保证混合顺序）
 - 网格独立：透明方块不参与贪婪网格化的合并（不同方块属性不能合并）；用单独的 mesh buffer
+- shader 采样同一程序化图集；水有轻微时间偏移和 shimmer，玻璃保留浅色高光线，并参与距离雾混合
 
 **简化策略**：当前透明方块不超过 2 种（水 + 玻璃），不实现"Order-Independent Transparency"等高级技术。
 
@@ -254,7 +257,27 @@ fn sky_color(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 
 ---
 
-## 八、相机 Uniform Buffer
+## 八、视觉帧与 Uniform Buffer
+
+客户端每帧构造 `VisualFrame`，传给 Skybox / Opaque / Transparent Pass：
+
+```rust
+pub struct VisualFrame {
+    pub camera_pos: Vec3,
+    pub time_seconds: f32,
+    pub sun_dir: Vec3,
+    pub fog_color: Vec3,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub haze_strength: f32,
+}
+```
+
+Opaque / Transparent 的每 chunk uniform 在 `view_proj + chunk_origin` 外，还写入 `camera_pos`、`fog_color`、`fog_params` 和 `sun_dir`；Depth Pre-Pass 只静态使用矩阵与 chunk origin。
+
+历史设计中的集中式相机 UB 仍可作为后续 Render Graph 化的方向，但当前主路径按 chunk 持有 uniform，避免同一 submit 中多次写同一个 buffer 导致 origin 被最后一次覆盖。
+
+### 旧版相机 Uniform 参考
 
 ```rust
 #[repr(C)]
@@ -268,7 +291,7 @@ pub struct CameraUniform {
 }
 ```
 
-每帧由 client 层调用 `Renderer::update_camera(&CameraUniform)`，写入 GPU buffer，绑定到所有 Pass 的 group(0)。
+旧版设计是每帧由 client 层调用 `Renderer::update_camera(&CameraUniform)`，写入共享 GPU buffer。当前主路径改为 `VisualFrame + 每 chunk uniform`。
 
 ---
 
@@ -304,10 +327,18 @@ impl Renderer {
     /// 取得本帧 surface texture（失败时自动重配 Surface）
     pub fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture>;
 
-    /// 渲染世界（OpaquePass）：清屏 + 视锥剔除 + 单 render pass 内 draw_indexed
+    /// 渲染世界（OpaquePass）：视锥剔除 + 单 render pass 内 draw_indexed
     pub fn render_world(&mut self, encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView, view_proj: Mat4, clear_color: [f64; 4])
+        color_view: &wgpu::TextureView, view_proj: Mat4, visual: VisualFrame)
         -> WorldRenderStats;
+
+    /// 程序化天空
+    pub fn render_skybox(&mut self, encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView, view_proj: Mat4, visual: VisualFrame);
+
+    /// 半透明方块，按 chunk 距离远到近绘制
+    pub fn render_transparent(&mut self, encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView, view_proj: Mat4, visual: VisualFrame);
 
     /// 渲染选中方块线框（在 render_world 之后调用）
     pub fn render_selection(&mut self, encoder: &mut wgpu::CommandEncoder,
@@ -329,6 +360,7 @@ impl Renderer {
 | 资源 | 创建时机 | 销毁时机 |
 |---|---|---|
 | `Surface` / `Device` / `Queue` | `Renderer::new` 一次 | Tab 关闭 |
+| 程序化 `TextureAtlas` | `Renderer::new` 一次 | Tab 关闭 |
 | `depth_texture` | 启动 + 每次 resize | 重建时 |
 | `chunk_mesh_gpu` | `upload_chunk_mesh` | `drop_chunk_mesh`（玩家走远）/ `clear_world_cache`（退出或切换世界）/ chunk 修改时（重建） |
 | Pass pipelines | 各 Pass `new` 一次 | 程序退出 |

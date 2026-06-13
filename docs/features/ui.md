@@ -9,11 +9,13 @@
 
 - **框架**：`egui` + `egui-wgpu`（即时渲染 GUI）
 - **集成**：`egui-winit` 处理窗口事件；UI Pass 在 Render Graph 末尾叠加
+- **主题**：`client::ui::theme` 在启动时统一设置 egui 全局 style，并提供半透明面板、主/次/危险按钮、toast、材质色块等局部 helper
 - **设计原则**：
   - 大厅在游戏外的"顶层 UI"（占满 viewport）；其余在游戏内的叠加层
   - HUD 为常驻只读悬浮（`interactable(false)`），避免拦截鼠标
   - 暂停菜单 / 聊天 / 大厅是"模态"层，会接管输入
   - 远端玩家名牌是 3D 内的 billboard，**特殊处理**（深度感知、屏幕空间投影）
+  - 覆盖层统一使用自然柔和的深色半透明面板、低对比边框和固定尺寸控件，避免状态变化导致布局跳动
 
 ---
 
@@ -266,7 +268,7 @@ pub fn draw_player_list(ctx: &egui::Context, entries: &[PlayerListEntry]) {
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
         .interactable(false)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            theme::compact_frame().show(ui, |ui| {
                 ui.label(format!("在线玩家 ({})", entries.len()));
                 ui.separator();
                 for entry in entries {
@@ -291,9 +293,8 @@ pub fn draw_crosshair(ctx: &egui::Context) {
     let center = screen.center();
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "crosshair".into()));
     let len = 8.0;
-    let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-    painter.line_segment([center - egui::vec2(len, 0.0), center + egui::vec2(len, 0.0)], stroke);
-    painter.line_segment([center - egui::vec2(0.0, len), center + egui::vec2(0.0, len)], stroke);
+    let stroke = egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(240, 248, 244, 210));
+    // 当前实现画 4 段短线，中间留 4px 空隙，避免遮挡目标方块中心。
 }
 ```
 
@@ -307,28 +308,19 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 ### 屏幕底部中央：Hotbar（9 格）
 
-横向 9 格，每格 54×36，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格上行显示槽位号 1-9，下行显示方块标签（`STONE` / `DIRT` / ...）；选中格金色高亮（240, 200, 80, 220），文字反色为黑；非选中格深灰底（60, 70, 80, 200）+ 浅色文字。
+横向 9 格，每格 58×42，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格左上显示材质色块，中部显示槽位号 1-9，底部显示方块标签（`STONE` / `DIRT` / ...）；选中格使用暖金底 + 2px 描边，非选中格使用深色半透明底 + 1px 低对比边框。
 
 ```rust
 egui::Area::new(egui::Id::new("hud_hotbar"))
     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
     .show(ctx, |ui| {
-        egui::Frame::default().fill(BG_HALF_ALPHA).inner_margin(8).show(ui, |ui| {
+        theme::compact_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (i, block) in hotbar_items.iter().enumerate() {
                     let selected = i == hotbar_selected;
-                    egui::Frame::default().fill(cell_bg(selected)).show(ui, |ui| {
-                        // ⚠️ 必须用 allocate_ui_with_layout 显式分配尺寸，
-                        // 不能用 set_min_size + vertical_centered（vertical_centered
-                        // 会取走 horizontal 父级的全部剩余宽度，9 格全叠成 1 格）
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(54.0, 36.0),
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| { ui.colored_label(cell_fg(selected),
-                                       format!("{}\n{}", i + 1, block_label(*block))); },
-                        );
-                    });
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(58.0, 42.0), egui::Sense::hover());
+                    // painter 固定绘制背景、描边、材质 swatch、槽位号和标签
                 }
             });
         });
@@ -371,6 +363,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .resizable(false)
         .collapsible(false)
+        .frame(theme::panel_frame())
         .show(ctx, |ui| {
             ui.add(egui::Slider::new(&mut app.settings.fov_degrees, 30.0..=110.0).text("FOV"));
             ui.add(egui::Slider::new(&mut app.settings.mouse_sensitivity, 0.1..=5.0).text("灵敏度"));
@@ -395,13 +388,13 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
             ui.add_space(20.0);
             ui.horizontal(|ui| {
-                if ui.button("立即保存").clicked() {
+                if ui.add(theme::secondary_button("Save Now")).clicked() {
                     app.save_now();
                 }
-                if ui.button("继续游戏").clicked() {
+                if ui.add(theme::primary_button("Resume")).clicked() {
                     app.resume_game();
                 }
-                if ui.button("退出到大厅").clicked() {
+                if ui.add(theme::danger_button("Exit to Lobby")).clicked() {
                     app.disconnect_and_return_to_lobby();
                 }
             });

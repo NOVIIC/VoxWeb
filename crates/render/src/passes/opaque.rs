@@ -12,13 +12,21 @@ use voxweb_core::Aabb;
 
 use crate::vertex::{PackedVertex, vertex_buffer_layout};
 
-/// 每帧上传的全局 uniform：view-projection 矩阵 + 当前绘制 chunk 的 origin。
+/// 每个 chunk draw call 上传的 uniform。
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Default)]
 pub struct GlobalsUniform {
     pub view_proj: [[f32; 4]; 4],
     /// xyz = chunk_origin (世界坐标，单位：方块)，w = 0
     pub chunk_origin: [f32; 4],
+    /// xyz = camera position，w = 0
+    pub camera_pos: [f32; 4],
+    /// xyz = fog color，w = 0
+    pub fog_color: [f32; 4],
+    /// x = fog_start, y = fog_end, z = haze strength, w = time seconds
+    pub fog_params: [f32; 4],
+    /// xyz = normalized sun direction，w = 0
+    pub sun_dir: [f32; 4],
 }
 
 /// 一个 Chunk 的 GPU 网格资源：顶点缓冲 + 顶点计数 + 该 chunk 专属的 globals uniform。
@@ -47,6 +55,7 @@ impl OpaquePass {
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        atlas_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         // —— bind group layout（pipeline 创建需要，但 globals buffer 由每个 ChunkMeshGpu 自带）——
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -72,7 +81,7 @@ impl OpaquePass {
         // —— pipeline layout ——
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("opaque.layout"),
-            bind_group_layouts: &[Some(&globals_layout)],
+            bind_group_layouts: &[Some(&globals_layout), Some(atlas_layout)],
             immediate_size: 0,
         });
 
