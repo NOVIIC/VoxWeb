@@ -471,6 +471,7 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.opaque_pass.depth_pipeline);
+        pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
         for (_, mesh) in entries {
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
