@@ -62,7 +62,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     if tex == 4u {
         let shimmer = 0.04 * sin((in.raw_uv.x + in.raw_uv.y) * 5.2 + g.fog_params.w * 1.4);
-        color = color + vec3<f32>(0.02, 0.045, 0.055) + shimmer;
+        color = color + vec3<f32>(0.02, 0.045, 0.055) + vec3<f32>(shimmer);
         alpha = alpha + shimmer * 0.25;
     } else if tex == 5u {
         color = mix(color, vec3<f32>(0.92, 0.98, 1.0), 0.18);
