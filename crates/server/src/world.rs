@@ -124,12 +124,45 @@ impl World {
     /// Phase 5：取出当前 dirty chunk 列表并清空集合。
     /// Phase 5 暂无调用方；Phase 8 持久化层每秒 flush 一次。
     pub fn drain_dirty(&mut self) -> Vec<ChunkPos> {
-        let drained: Vec<_> = self.dirty_chunks.drain().collect();
-        if drained.is_empty() {
-            self.persistence.take_dirty()
-        } else {
-            drained
+        let mut seen = HashSet::new();
+        let mut drained = Vec::new();
+        for pos in self.dirty_chunks.drain() {
+            if seen.insert(pos) {
+                drained.push(pos);
+            }
         }
+        for pos in self.persistence.take_dirty() {
+            if seen.insert(pos) {
+                drained.push(pos);
+            }
+        }
+        drained
+    }
+
+    /// 将 dirty 移入 in-flight，并同步旧 dirty 集合。
+    pub fn snapshot_dirty(&mut self, limit: usize, current_tick: u64) -> Vec<ChunkPos> {
+        let positions = self.persistence.snapshot_dirty(limit, current_tick);
+        for pos in &positions {
+            self.dirty_chunks.remove(pos);
+        }
+        positions
+    }
+
+    /// 持久化写入成功后同时清理新旧 dirty 状态。
+    pub fn commit_flushed(&mut self, positions: &[ChunkPos]) {
+        for pos in positions {
+            self.dirty_chunks.remove(pos);
+        }
+        self.persistence.commit_flushed(positions);
+    }
+
+    /// 持久化写入失败后同时恢复新旧 dirty 状态。
+    pub fn record_flush_failure(&mut self, positions: &[ChunkPos], current_tick: u64) {
+        for pos in positions {
+            self.dirty_chunks.insert(*pos);
+        }
+        self.persistence
+            .record_flush_failure(positions, current_tick);
     }
 
     /// 推进 tick 计数（Phase 5 起会驱动玩家广播等）。
@@ -271,6 +304,37 @@ mod tests {
         let drained = world.drain_dirty();
         assert_eq!(drained, vec![cp]);
         assert!(world.dirty_chunks.is_empty());
+        assert_eq!(world.persistence.dirty_len(), 0);
+    }
+
+    #[test]
+    fn commit_flushed_clears_legacy_dirty_set() {
+        let mut world = World::new(0);
+        let cp = ChunkPos::new(0, 0);
+        world.ensure_chunk_generated(cp);
+        world.set_block(Position::new(5, 100, 7), BlockID::STONE);
+
+        let snap = world.snapshot_dirty(8, 60);
+        assert_eq!(snap, vec![cp]);
+        assert!(!world.dirty_chunks.contains(&cp));
+
+        world.commit_flushed(&snap);
+        assert!(!world.dirty_chunks.contains(&cp));
+        assert!(world.drain_dirty().is_empty());
+    }
+
+    #[test]
+    fn record_flush_failure_restores_legacy_dirty_set() {
+        let mut world = World::new(0);
+        let cp = ChunkPos::new(0, 0);
+        world.ensure_chunk_generated(cp);
+        world.set_block(Position::new(5, 100, 7), BlockID::STONE);
+
+        let snap = world.snapshot_dirty(8, 60);
+        world.record_flush_failure(&snap, 60);
+
+        assert!(world.dirty_chunks.contains(&cp));
+        assert!(world.persistence.dirty_len() > 0);
     }
 
     #[test]

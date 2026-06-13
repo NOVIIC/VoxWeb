@@ -41,7 +41,13 @@ pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, bincode::error::EncodeEr
 pub fn decode<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
 ) -> Result<T, bincode::error::DecodeError> {
-    let (msg, _len) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
+    let (msg, len) = bincode::serde::decode_from_slice(bytes, bincode_config())?;
+    if len != bytes.len() {
+        return Err(bincode::error::DecodeError::OtherString(format!(
+            "trailing bytes after message: consumed {len}, total {}",
+            bytes.len()
+        )));
+    }
     Ok(msg)
 }
 
@@ -333,6 +339,14 @@ mod tests {
     fn protocol_version_is_six() {
         // Phase 8 Host 视距上限同步为 v6；任何破坏性变更应同步更新此测试与版本号。
         assert_eq!(PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let msg = ClientMessage::Ping { client_time_ms: 1 };
+        let mut bytes = encode(&msg).expect("encode failed");
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(decode::<ClientMessage>(&bytes).is_err());
     }
 
     #[test]
