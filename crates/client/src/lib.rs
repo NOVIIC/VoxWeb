@@ -324,12 +324,7 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
             return;
         };
         let tick = g.server.borrow().world.tick_count;
-        let snapshot_positions = g
-            .server
-            .borrow_mut()
-            .world
-            .persistence
-            .snapshot_dirty(usize::MAX, tick);
+        let snapshot_positions = g.server.borrow_mut().world.snapshot_dirty(usize::MAX, tick);
         if snapshot_positions.is_empty() {
             return;
         }
@@ -360,11 +355,7 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
                 "[storage] {reason}: {} dirty chunks were missing from memory",
                 missing_positions.len()
             );
-            server
-                .borrow_mut()
-                .world
-                .persistence
-                .commit_flushed(&missing_positions);
+            server.borrow_mut().world.commit_flushed(&missing_positions);
         }
         if encoded.is_empty() {
             return;
@@ -400,7 +391,7 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
         let mut s = server.borrow_mut();
         match result {
             Ok(()) => {
-                s.world.persistence.commit_flushed(&positions);
+                s.world.commit_flushed(&positions);
                 drop(s);
                 let mut a = app_ref.borrow_mut();
                 if a.world_session_id == session_id
@@ -411,7 +402,7 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
             }
             Err(e) => {
                 log::warn!("[storage] {reason} flush failed: {e:?}");
-                s.world.persistence.record_flush_failure(&positions, tick);
+                s.world.record_flush_failure(&positions, tick);
             }
         }
     });
@@ -2917,7 +2908,6 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             .server
             .borrow_mut()
             .world
-            .persistence
             .snapshot_dirty(batch_limit, tick);
         if positions.is_empty() {
             if save_now {
@@ -2960,11 +2950,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 "[storage] {} dirty chunks were missing from memory",
                 missing_positions.len()
             );
-            server
-                .borrow_mut()
-                .world
-                .persistence
-                .commit_flushed(&missing_positions);
+            server.borrow_mut().world.commit_flushed(&missing_positions);
         }
         if encoded.is_empty() {
             return;
@@ -2998,7 +2984,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         let mut s = server.borrow_mut();
         match result {
             Ok(()) => {
-                s.world.persistence.commit_flushed(&positions);
+                s.world.commit_flushed(&positions);
                 let save_now_done = save_now
                     && s.world.persistence.dirty_len() == 0
                     && s.world.persistence.in_flight_len() == 0;
@@ -3018,7 +3004,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             }
             Err(e) => {
                 log::warn!("[storage] save failed: {e:?}");
-                s.world.persistence.record_flush_failure(&positions, tick);
+                s.world.record_flush_failure(&positions, tick);
                 drop(s);
                 if save_now {
                     let mut a = app_ref.borrow_mut();

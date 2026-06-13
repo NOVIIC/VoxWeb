@@ -78,7 +78,7 @@ impl ChunkAssembler {
         // 若 frag_total 在一次组装中变了（如 Host 重启中继发了不同编码版本的快照），
         // 则清空旧进度重新开始  — 这是极罕见的边缘情况但处理成本极低。
         if entry.frag_total != frag_total {
-            *entry = PartialAssemble::new(frag_total);
+            *entry = PartialAssemble::new(frag_total.max(1));
         }
 
         // 写入该片；重复摄入同一 index 的片（重传）直接覆盖
@@ -177,5 +177,14 @@ mod tests {
         a.ingest(pos, 0, 2, b"X".to_vec());
         // frag_index 999 >= frag_total 2 → 丢弃
         assert!(a.ingest(pos, 999, 2, b"Y".to_vec()).is_none());
+    }
+
+    #[test]
+    fn zero_frag_total_does_not_create_empty_slot_vec() {
+        let mut a = ChunkAssembler::new();
+        let pos = ChunkPos::new(0, 0);
+        let full = a.ingest(pos, 0, 0, b"X".to_vec());
+        assert_eq!(full, Some(b"X".to_vec()));
+        assert!(a.is_empty());
     }
 }

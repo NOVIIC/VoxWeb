@@ -236,9 +236,11 @@ fn expand_compressed(compressed: &CompressedChunk) -> Result<Vec<BlockID>, Decod
             .palette
             .get(*pi as usize)
             .ok_or(DecodeError::InvalidPaletteIndex(*pi))?;
-        for _ in 0..*run_len {
-            blocks.push(*block);
+        let next_len = blocks.len().saturating_add(*run_len as usize);
+        if next_len > CHUNK_SIZE {
+            return Err(DecodeError::LengthMismatch(next_len));
         }
+        blocks.extend(std::iter::repeat_n(*block, *run_len as usize));
     }
 
     if blocks.len() != CHUNK_SIZE {
@@ -402,6 +404,19 @@ mod tests {
     #[test]
     fn decode_corrupt_bytes() {
         assert!(decode_chunk(b"garbage data not valid").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_overlong_run_before_expanding() {
+        let compressed = CompressedChunk {
+            palette: vec![BlockID::AIR],
+            runs: vec![(0, CHUNK_SIZE as u32 + 1)],
+        };
+        let bytes = crate::protocol::encode(&compressed).unwrap();
+        assert_eq!(
+            decode_chunk(&bytes),
+            Err(format!("{:?}", DecodeError::LengthMismatch(CHUNK_SIZE + 1)))
+        );
     }
 
     #[test]
