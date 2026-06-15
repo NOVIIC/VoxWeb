@@ -100,7 +100,7 @@ pub async fn start() -> Result<(), JsValue> {
 ```
 
 **事件路由**（`events::install_event_listeners`）：
-- `click` on canvas → 仅在 InGame 时 `canvas.request_pointer_lock()`
+- `click` on canvas → 活跃 InGame 时 `canvas.request_pointer_lock()`；暂停菜单展开时，若点击位置不在 egui 区域内，则关闭暂停菜单并立即请求指针锁
 - `pointerlockchange` on document → 写回 `input.pointer_locked`
 - `keydown` / `keyup` on document → InGame 时映射到 `InputState`；Lobby 时不消费（让 egui 处理文本输入）
 - `mousemove` on document：指针锁时累积相机 dx/dy；否则上报 `egui::Event::PointerMoved`（让 Lobby 按钮能接收 hover）
@@ -626,7 +626,7 @@ Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次�
 
 ### InGame → EscMenu
 - ESC 键按下 → `paused = true`，释放指针锁
-- 再按 ESC 或点击"返回游戏" → `paused = false`，请求指针锁
+- 再按 ESC、点击"返回游戏"或点击暂停菜单外的游戏空白区域 → `paused = false`，请求指针锁
 
 ### InGame → ChatOpen
 - T 键按下 → `chat_open = true`，输入路由到 chat input buffer

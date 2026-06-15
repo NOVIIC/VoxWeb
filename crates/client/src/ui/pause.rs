@@ -30,6 +30,8 @@ pub enum PauseAction {
 
 /// 绘制居中模态暂停菜单。
 ///
+/// 点击菜单外的游戏空白区域等同于点击 Resume：调用方会关闭暂停层并重新请求指针锁。
+///
 /// 返回本帧的用户动作；同时 `settings` 中受 UI 控制的字段可能已被原地修改，
 /// 调用方需在动作处理完毕后（或每帧）调用 [`crate::app::Game::apply_settings`]
 /// 把新设置同步到 camera / interp / chunk_loader 等运行时组件。
@@ -98,7 +100,21 @@ pub fn draw_pause_menu(ctx: &egui::Context, settings: &mut AppSettings) -> Pause
             });
         });
 
+    if action == PauseAction::None && clicked_empty_game_area(ctx) {
+        action = PauseAction::Resume;
+    }
+
     action
+}
+
+fn clicked_empty_game_area(ctx: &egui::Context) -> bool {
+    let primary_clicked = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
+    let pointer_over_egui = ctx.is_pointer_over_egui();
+    empty_click_should_resume(primary_clicked, pointer_over_egui)
+}
+
+fn empty_click_should_resume(primary_clicked: bool, pointer_over_egui: bool) -> bool {
+    primary_clicked && !pointer_over_egui
 }
 
 #[cfg(test)]
@@ -112,5 +128,12 @@ mod tests {
         assert_eq!(PauseAction::None, PauseAction::None);
         assert_ne!(PauseAction::Resume, PauseAction::ExitToLobby);
         assert_ne!(PauseAction::None, PauseAction::Resume);
+    }
+
+    #[test]
+    fn empty_click_resume_predicate_only_accepts_primary_blank_clicks() {
+        assert!(empty_click_should_resume(true, false));
+        assert!(!empty_click_should_resume(false, false));
+        assert!(!empty_click_should_resume(true, true));
     }
 }
