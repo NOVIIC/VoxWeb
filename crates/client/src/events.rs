@@ -7,6 +7,7 @@ use web_sys::HtmlCanvasElement;
 
 use crate::app::AppState;
 use crate::input::InputState;
+use crate::settings_storage;
 
 use super::{App, flush_dirty_best_effort, now_ms};
 
@@ -17,19 +18,35 @@ pub(super) fn install_event_listeners(
     egui_events: Rc<RefCell<Vec<egui::Event>>>,
     app: Rc<RefCell<App>>,
 ) -> Result<(), JsValue> {
-    // —— 点击 canvas → 请求指针锁（仅在 InGame 且无暂停/聊天叠加层时）——
+    // —— 点击 canvas → 请求指针锁（游戏态）或从暂停菜单外的空白区域恢复 ——
     {
         let canvas_clone = canvas.clone();
         let app_clone = app.clone();
         let on_click = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::MouseEvent| {
-            if matches!(
-                app_clone.borrow().state,
+            let mut a = app_clone.borrow_mut();
+            match a.state {
                 AppState::InGame {
                     paused: false,
-                    chat_open: false
+                    chat_open: false,
+                } => {
+                    canvas_clone.request_pointer_lock();
                 }
-            ) {
-                canvas_clone.request_pointer_lock();
+                AppState::InGame {
+                    paused: true,
+                    chat_open: false,
+                } if !a.egui_ctx.is_pointer_over_egui() => {
+                    if let Some(g) = a.game.as_ref() {
+                        settings_storage::save(&g.settings);
+                    }
+                    a.state = AppState::InGame {
+                        paused: false,
+                        chat_open: false,
+                    };
+                    a.request_pointer_lock_next = false;
+                    a.input.borrow_mut().clear_held();
+                    canvas_clone.request_pointer_lock();
+                }
+                _ => {}
             }
         });
         canvas.add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())?;

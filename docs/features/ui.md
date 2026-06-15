@@ -401,9 +401,10 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 }
 ```
 
-`resume_game` 必须重新发起 `request_pointer_lock`（在按钮的点击 closure 内同步发起）。
+`resume_game` 必须重新发起 `request_pointer_lock`（在按钮或菜单外空白点击的用户手势内同步发起）。
 
 当前函数签名为 `draw_pause_menu(ctx, &mut AppSettings) -> PauseAction`，模块只 mutate `AppSettings`，调用方根据返回的 [`PauseAction::{None, Resume, SaveNow, ExitToLobby}`](../../crates/client/src/ui/pause.rs) 决定关闭叠加层 / 立即保存 / 切回大厅 / 重新请求指针锁。
+当暂停菜单展开时，菜单外的游戏空白区域左键点击也返回 `PauseAction::Resume`；点击菜单、下拉框或其它 egui 区域仍按原控件逻辑处理。
 
 设置在 `Resume` / `ExitToLobby` 时通过 [`settings_storage::save`](../../crates/client/src/settings_storage.rs) 写入 localStorage（键 `voxweb.settings.v1`，JSON 编码 + schema 版本头）。下次进入大厅时由 `settings_storage::load()` 读回，失败回退 `AppSettings::default()`。
 
@@ -547,7 +548,7 @@ pub fn draw_nameplates(app: &App, ctx: &egui::Context) {
 
 ### 触发时机
 - 进入 InGame：在用户点击大厅按钮时同步调用 `canvas.request_pointer_lock()`（必须在用户手势内）
-- 关闭暂停菜单：再次请求
+- 关闭暂停菜单：再次请求；可通过 Resume 按钮、再次按 ESC、或点击菜单外游戏空白区域触发
 - 关闭聊天：再次请求
 
 ### 浏览器事件
