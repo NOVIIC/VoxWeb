@@ -25,7 +25,6 @@
 
 ```rust
 pub enum AppState {
-    Loading,
     Lobby,
     Connecting,
     /// 游戏进行中（可叠加暂停 / 聊天两个子状态）
@@ -219,7 +218,7 @@ Local 模式跳过网络步骤，仅显示区块预载那一步。
 
 ---
 
-## 五、`ui/hud.rs` — 平视显示
+## 五、`client/src/hud.rs` — 平视显示
 
 **位置**：屏幕 4 个角各一个 `egui::Area`，全部 `interactable(false)`。
 

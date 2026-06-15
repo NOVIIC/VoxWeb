@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-/// 与 opaque GlobalsUniform 同结构，复用方便 future RenderGraph 整合。
+/// 与 opaque GlobalsUniform 同布局前缀，便于 shader 侧保持相同矩阵输入。
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Default)]
 pub struct SelectionGlobals {

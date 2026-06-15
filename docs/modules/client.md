@@ -29,7 +29,9 @@
 - `physics.rs` / `raycast.rs` / `hotbar.rs` 负责本地移动、DDA 命中和挖放输入
 - `prediction.rs` / `interp.rs` / `chunk_assembler.rs` 负责预测协调、远端插值和快照分片组装
 - `storage.rs` 负责 OPFS 世界列表、chunk 读写、配额查询和删除存档
-- `ui/` 下的模块按 AppState 绘制大厅、连接进度、HUD、暂停菜单、聊天、玩家列表、名牌和断线页面
+- `browser.rs` / `events.rs` 负责浏览器时间、URL/query、canvas 尺寸和 DOM 事件转输入/egui 事件
+- `hud.rs` 绘制游戏内 HUD、准星、hotbar、通知，并承载上一帧性能统计数据
+- `ui/` 下的模块按 AppState 绘制大厅、连接进度、暂停菜单、聊天、玩家列表、名牌和断线页面
 
 ---
 
@@ -37,7 +39,10 @@
 
 ```
 crates/client/src/
-├── lib.rs              wasm 入口 + 主循环 + HUD 绘制 + 事件监听
+├── lib.rs              wasm 入口 + 主循环编排
+├── browser.rs          浏览器时间、URL/query、canvas 尺寸和随机种子工具
+├── events.rs           DOM 事件监听 + 键鼠事件转 InputState / egui::Event
+├── hud.rs              游戏内 HUD、hotbar、通知和性能统计
 ├── app.rs              AppState 状态机 + App / Game 主结构
 ├── camera.rs           第一人称相机
 ├── input.rs            键盘/鼠标输入管理
@@ -53,18 +58,16 @@ crates/client/src/
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
     ├── lobby.rs        大厅 + Connecting UI（单机/Host/Remote 入口 + 连接进度）
-    ├── hud.rs          HUD 绘制函数（供 lib.rs 调用）
     ├── pause.rs        暂停菜单
     ├── chat.rs         聊天框 + 消息历史
-    ├── players.rs      玩家名牌（3D billboard）+ 玩家列表 widget
-    └── ui_state.rs     UI 状态哈希（防止重复渲染判断）
+    └── players.rs      玩家名牌（3D billboard）+ 玩家列表 widget
 ```
 
 ---
 
 ## 三、`lib.rs` — wasm 入口
 
-入口直接通过浏览器原生 API（`add_event_listener_with_callback`）注册事件，不引入 `winit` 事件循环。`#[wasm_bindgen(start)]` 异步函数完成 Renderer + egui 初始化后挂上 RAF 闭包链。
+入口不引入 `winit` 事件循环。`#[wasm_bindgen(start)]` 异步函数完成 Renderer + egui 初始化后，通过 `events::install_event_listeners` 注册浏览器事件，再挂上 RAF 闭包链。
 
 ```rust
 #[wasm_bindgen(start)]
@@ -96,7 +99,7 @@ pub async fn start() -> Result<(), JsValue> {
 }
 ```
 
-**事件路由**（`install_event_listeners`）：
+**事件路由**（`events::install_event_listeners`）：
 - `click` on canvas → 仅在 InGame 时 `canvas.request_pointer_lock()`
 - `pointerlockchange` on document → 写回 `input.pointer_locked`
 - `keydown` / `keyup` on document → InGame 时映射到 `InputState`；Lobby 时不消费（让 egui 处理文本输入）
@@ -113,7 +116,6 @@ pub async fn start() -> Result<(), JsValue> {
 
 ```rust
 pub enum AppState {
-    Loading,                                      // 初始占位，实际未使用
     Lobby,                                        // 大厅
     Connecting,                                   // 网络协商 + 区块预载
     InGame { paused: bool, chat_open: bool },     // 游戏中（可叠加暂停 / 聊天）
@@ -386,7 +388,7 @@ impl Camera {
 
 ### 6.2 `input.rs`
 
-`InputState` 是扁平事件缓存：每帧累加按键 / 鼠标事件，按"持续"vs"边沿"两类语义存储；帧末 `reset_delta()` 清掉所有边沿，保留持续按下状态。WASM 侧浏览器事件经 `lib.rs::map_key`（`KeyboardEvent.code` → `winit::keyboard::KeyCode`）路由到 `on_key_down/up`。
+`InputState` 是扁平事件缓存：每帧累加按键 / 鼠标事件，按"持续"vs"边沿"两类语义存储；帧末 `reset_delta()` 清掉所有边沿，保留持续按下状态。WASM 侧浏览器事件经 `events.rs::map_key`（`KeyboardEvent.code` → `winit::keyboard::KeyCode`）路由到 `on_key_down/up`。
 
 ```rust
 pub struct InputState {
@@ -568,10 +570,11 @@ pub struct OpfsStorage {
 
 详见 [`features/ui.md`](../features/ui.md)。模块划分：
 - `ui::lobby` — 大厅
-- `ui::hud` — HUD（坐标、玩家列表、聊天叠层、准星）
 - `ui::pause` — ESC 菜单
 - `ui::chat` — 聊天框（输入与历史）
 - `ui::players` — 远端玩家名牌（特殊：在 3D 空间渲染，需要 `egui::Painter` + 投影计算）
+
+游戏内 HUD 位于顶层 `hud.rs`，因为它需要直接消费 `FramePerfStats`、hotbar、存档配额、渲染统计等主循环快照。
 
 `ui::mod::draw(app)` 按 `AppState` 路由：
 
@@ -639,14 +642,12 @@ Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次�
 
 ```rust
 pub struct AppSettings {
-    pub display_name: String,
-    pub mouse_sensitivity: f32,         // 0.1..=5.0
     pub fov_degrees: f32,               // 30..=110
-    pub render_distance_chunks: u32,    // 2..=10
-    pub vsync: bool,                    // 浏览器侧 RAF 自动 vsync，此项仅作占位
-    pub depth_prepass: bool,
-    pub interp_delay_ms: f32,
+    pub mouse_sensitivity: f32,         // 运行时乘以 BASE_SENSITIVITY_RAD_PER_PIXEL
+    pub render_distance: u32,           // 2/4/6/8/10
+    pub interp_delay_ms: f32,           // 50/100/150
     pub show_stats: bool,
+    pub depth_prepass_enabled: bool,
 }
 ```
 
@@ -685,6 +686,6 @@ pub struct AppSettings {
 - 多窗口（浏览器 Tab 即窗口）
 - 全屏 API（v2，按 F11 触发 `requestFullscreen`）
 - 控制器/手柄输入（gamepad API；v2）
-- 帧率限制 throttle（依赖浏览器 RAF；提供 `vsync` 占位但不实装）
+- 帧率限制 throttle（当前依赖浏览器 RAF）
 - 不同语言切换（仅中文）
 - 启动画面（splash） — 直接显示大厅

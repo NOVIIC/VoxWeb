@@ -22,6 +22,7 @@
 - `NetEndpoint::Host` 持有本地 Local 通道、多个 Remote Peer、信令客户端和房间状态
 - `NetEndpoint::Remote` 持有到 Host 的 PeerConnection、信令客户端和房间状态
 - `signaling.rs` 管 WebSocket 信令；`peer.rs` 管 WebRTC PeerConnection；`room.rs` 管房间状态；`transport.rs` 管可靠/不可靠通道选择和序列化
+- `relay.rs` 管 Host outbox 路由纯函数和 Worker 字节中继本地令牌桶限流
 
 ---
 
@@ -33,6 +34,7 @@ crates/net/src/
 ├── signaling.rs        WebSocket 信令客户端
 ├── peer.rs             RtcPeerConnection 包装 + DataChannel 双通道
 ├── room.rs             房间会话状态机
+├── relay.rs            outbox 路由计划 + 中继限流
 └── transport.rs        通道选择策略 + 消息序列化辅助
 ```
 
