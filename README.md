@@ -108,4 +108,4 @@ docs/
 3. **文档冲突**：以本 README 决策表为准；其余冲突时 `docs/architecture.md` > `docs/modules/*` > `docs/features/*` / `docs/networking/*` > 其它
 4. **代码注释**：复杂图形学、网络和持久化逻辑使用中文注释帮助学习；架构说明放文档，不塞进注释
 5. **API 变化**：WGPU、web-sys、Cloudflare Workers 等 API 可能变化，涉及新版 API 时查阅最新官方文档
-6. **代码检查**：完成源代码编辑后必须通过 `cargo fmt` 和 `cargo clippy --all-targets`；仅改 Markdown 时运行文档引用检查即可
+6. **代码检查**：完成源代码编辑后必须通过 `cargo fmt` 和 `cargo clippy --target wasm32-unknown-unknown --all-targets`；仅改 Markdown 时运行文档引用检查即可
