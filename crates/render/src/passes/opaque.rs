@@ -1,7 +1,7 @@
 //! 不透明方块 Pass：渲染实体方块。
 //!
 //! Phase 1：单 Pass 渲染管线，从 `chunk.wgsl` 加载 vs/fs。
-//! 不参与 `RenderGraph` 调度（Phase 8 再接入），调用者直接持有并在主循环里 draw。
+//! 调用者直接持有并在主循环里按固定 pass 顺序 draw。
 
 use std::num::NonZeroU64;
 

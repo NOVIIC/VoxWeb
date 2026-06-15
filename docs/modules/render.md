@@ -27,7 +27,7 @@
 crates/render/src/
 ├── lib.rs              Renderer 入口 + 公开 API
 ├── device.rs           Surface/Device 与 canvas 绑定
-├── graph.rs            Render Graph 调度框架（trait，当前未接入渲染路径）
+├── frustum.rs          视锥体平面抽取 + AABB 裁剪
 ├── passes/
 │   ├── mod.rs
 │   ├── opaque.rs       实体方块 Pass
@@ -127,61 +127,11 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 
 ---
 
-## 六、`graph.rs` — Render Graph
+## 六、Pass 调度方式
 
-### 设计目标
-- **声明式**：每个 Pass 声明输入资源（贴图/UB）+ 输出资源（render target）
-- **依赖排序**：自动按依赖关系排序 Pass
-- **资源复用**：同一 frame 内的中间贴图（如 SSAO 输出）可共享
-- **当前实现**：主路径使用固定顺序（Skybox → Depth Pre-Pass → Opaque → Player → Transparent → Selection → UI）；`RenderGraph` trait 保留为扩展点
+当前主路径使用显式固定顺序调用：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI。
 
-### Trait
-
-```rust
-pub trait RenderPass {
-    fn name(&self) -> &'static str;
-
-    /// 每帧调用，编码 GPU 命令
-    fn execute(&mut self, ctx: &mut PassContext);
-}
-
-pub struct PassContext<'a> {
-    pub device: &'a wgpu::Device,
-    pub queue: &'a wgpu::Queue,
-    pub encoder: &'a mut wgpu::CommandEncoder,
-    pub surface_view: &'a wgpu::TextureView,
-    pub depth_view: &'a wgpu::TextureView,
-    pub camera_bind_group: &'a wgpu::BindGroup,
-    pub frame_data: &'a FrameData, // 玩家位置、时间、待渲染 chunk 列表等
-}
-```
-
-### 调度
-
-```rust
-pub struct RenderGraph {
-    passes: Vec<Box<dyn RenderPass>>,
-}
-
-impl RenderGraph {
-    pub fn new() -> Self;
-    pub fn add_pass(&mut self, pass: Box<dyn RenderPass>);
-    pub fn execute(&mut self, ctx: &mut PassContext);
-}
-```
-
-调度模式：单 `CommandEncoder`，所有 Pass 共享，最后一次 `queue.submit()`。
-
-### 默认 Pass 组合
-
-```rust
-let mut graph = RenderGraph::new();
-graph.add_pass(Box::new(DepthPrePass::new(...)));      // 可通过 settings 关闭
-graph.add_pass(Box::new(OpaquePass::new(...)));
-graph.add_pass(Box::new(SkyboxPass::new(...)));
-graph.add_pass(Box::new(TransparentPass::new(...)));
-graph.add_pass(Box::new(UiPass::new(...)));            // egui-wgpu 容器
-```
+项目不保留未接入的 Render Graph 框架；如果后续真的需要声明式依赖排序或中间贴图复用，再按当时的 Pass 数据流重新引入，避免提前维护抽象层。
 
 ---
 
@@ -248,7 +198,7 @@ fn sky_color(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 ### 7.5 `passes/ui.rs` — UI Pass
 
 **目的**：把 egui 渲染输出叠到画面上。
-**实现**：直接复用 `egui-wgpu` 的 `Renderer`，把它包装为 `RenderPass`。
+**实现**：client 层直接持有 `egui-wgpu` 的 `Renderer`，在世界 / 选择框 pass 之后继续编码 UI。
 **关键参数**：
 - `LoadOp::Load`（不清屏，叠加到已有画面）
 - 深度测试：禁用（UI 不参与 3D 深度）
@@ -351,7 +301,7 @@ impl Renderer {
 }
 ```
 
-> Renderer 已接入固定顺序多 Pass：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI（UI 仍由 client 持有 egui-wgpu renderer 编码）。透明方块拥有独立 mesh buffer，并按 chunk 中心到相机距离远到近绘制。`RenderGraph` trait 继续作为扩展点保留，当前主路径使用显式方法调用以减少 egui 生命周期改动。Pass 耗时仍是 CPU 编码耗时，不是 GPU timestamp query。
+> Renderer 已接入固定顺序多 Pass：Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI（UI 仍由 client 持有 egui-wgpu renderer 编码）。透明方块拥有独立 mesh buffer，并按 chunk 中心到相机距离远到近绘制。Pass 耗时仍是 CPU 编码耗时，不是 GPU timestamp query。
 
 ---
 

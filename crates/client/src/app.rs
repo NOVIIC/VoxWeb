@@ -49,10 +49,8 @@ pub struct PreloadState {
 /// 让 HUD 与名牌可以无视暂停/聊天叠加层始终绘制，且暂停与聊天可并存。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AppState {
-    /// 初始加载阶段（等待 wasm + 资源初始化和 WebGPU 检测）
-    #[default]
-    Loading,
     /// 大厅：选择单机 / 创建 / 加入
+    #[default]
     Lobby,
     /// 正在连接信令服务（Phase 4 起使用）
     Connecting,
@@ -583,7 +581,6 @@ mod tests {
             }
             .is_in_game()
         );
-        assert!(!AppState::Loading.is_in_game());
         assert!(!AppState::Lobby.is_in_game());
         assert!(!AppState::Connecting.is_in_game());
         assert!(!AppState::Disconnected.is_in_game());
@@ -601,8 +598,8 @@ mod tests {
     }
 
     #[test]
-    fn appstate_default_is_loading() {
-        assert_eq!(AppState::default(), AppState::Loading);
+    fn appstate_default_is_lobby() {
+        assert_eq!(AppState::default(), AppState::Lobby);
     }
 
     #[test]

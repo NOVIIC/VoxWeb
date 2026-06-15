@@ -161,7 +161,7 @@ VoxWeb/
 │   │   └── src/
 │   │       ├── lib.rs          # Renderer + 公开 API
 │   │       ├── device.rs       # Surface + Device 与 canvas 绑定
-│   │       ├── graph.rs        # Render Graph 调度框架（trait，主路径仍是固定顺序调用）
+│   │       ├── frustum.rs      # 视锥体平面抽取 + AABB 裁剪
 │   │       ├── passes/
 │   │       │   ├── mod.rs
 │   │       │   ├── opaque.rs   # 实体方块 Pass
@@ -181,7 +181,8 @@ VoxWeb/
 │   │       ├── world.rs        # World + 玩家表 + tick
 │   │       ├── terrain.rs      # Perlin 地形
 │   │       ├── physics.rs      # 物理仲裁
-│   │       └── persistence.rs  # PersistenceManager + dirty snapshot/commit/retry
+│   │       ├── persistence.rs  # PersistenceManager + dirty snapshot/commit/retry
+│   │       └── handle_message_tests.rs # Server 消息处理单元测试
 │   ├── net/                    # P2P 网络层
 │   │   ├── Cargo.toml
 │   │   └── src/
@@ -189,11 +190,15 @@ VoxWeb/
 │   │       ├── signaling.rs    # WebSocket 信令客户端
 │   │       ├── peer.rs         # WebRTC PeerConnection 包装
 │   │       ├── room.rs         # 房间会话状态机
+│   │       ├── relay.rs        # outbox 路由计划 + Worker 中继限流
 │   │       └── transport.rs    # 通道分配（reliable/unreliable）
 │   └── client/                 # 入口（cdylib for wasm）
 │       ├── Cargo.toml
 │       └── src/
-│           ├── lib.rs          # #[wasm_bindgen(start)] + 主循环 + HUD 绘制
+│           ├── lib.rs          # #[wasm_bindgen(start)] + 主循环编排
+│           ├── browser.rs      # 浏览器时间、URL/query、canvas 尺寸
+│           ├── events.rs       # DOM 事件监听 + 输入/egui 事件转发
+│           ├── hud.rs          # 游戏内 HUD、hotbar、通知和性能统计
 │           ├── app.rs          # AppState 状态机 + Game 主结构
 │           ├── camera.rs       # 第一人称相机
 │           ├── input.rs        # 键盘/鼠标输入
@@ -207,11 +212,9 @@ VoxWeb/
 │           ├── ui/
 │           │   ├── mod.rs
 │           │   ├── lobby.rs    # 大厅 + Connecting UI
-│           │   ├── hud.rs      # HUD 绘制函数
 │           │   ├── pause.rs    # 暂停菜单
 │           │   ├── chat.rs     # 聊天
-│           │   ├── players.rs  # 玩家列表/名牌
-│           │   └── ui_state.rs # UI 状态哈希（防止重复渲染判断）
+│           │   └── players.rs  # 玩家列表/名牌
 │           └── storage.rs      # OPFS 异步包装
 └── signaling/                  # 独立部署（TS 项目）
     ├── wrangler.toml

@@ -43,7 +43,8 @@ crates/server/src/
 ├── world.rs            ChunkStore + EntityTable + Tick
 ├── terrain.rs          Perlin 地形生成
 ├── physics.rs          物理仲裁（位置合法性、挖放校验）
-└── persistence.rs      PersistenceManager + LRU 卸载（具体存储读写在 client::storage）
+├── persistence.rs      PersistenceManager + LRU 卸载（具体存储读写在 client::storage）
+└── handle_message_tests.rs  Server 消息处理单元测试
 ```
 
 ---
