@@ -2,462 +2,806 @@
 
 > **状态**：设计讨论阶段，尚未实现
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
-> **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/client.md`](modules/client.md)
+> **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
 ---
 
-## 一、核心思想
+## 一、方案定义
 
-传统 MC 架构将世界拆分为**方块**（储存在 Chunk 稠密数组中）和**实体**（自由物理的玩家/怪物/掉落物），这是 2009 年 Java 性能妥协的历史遗迹，不是自然规律。
+本设计描述 VoxWeb 的下一版世界模型：把当前“`Chunk` 里存 `BlockID`、所有方块都是完整 1m 立方体”的世界，升级为一个仍然易玩的浏览器体素沙盒，但底层用材质语义表达方块、沙土、坍塌、掉落物和未来流体。
 
-本设计的核心洞察：**方块和实体不是两种东西，而是同一种东西的两种存在状态。** 世界的唯一原子是——**材质采样点**。
+新方案的核心不是“把所有东西都交给 Marching Cubes”，而是：
 
-| 概念 | 传统 MC | 统一体素 |
+> 世界的权威状态统一为 **MaterialField + FreeObject + MaterialRegistry**；
+> 不同材质按自己的规则进入 blocky、smooth、granular、rigid、future fluid 等表现和模拟路径。
+
+换句话说，统一发生在**世界数据、材质生命周期和网络/存档语义**上；渲染、碰撞、颗粒、硬体和未来流体仍然可以使用不同求解器。玩家体验仍然接近简单沙盒：选材质、挖、放、建造；拟真只体现在材质反馈更自然，而不是让玩家管理工程结构。
+
+### 1.1 第一版目标
+
+第一版要落地的体验和系统边界：
+
+1. **简单沙盒手感**：保留创造模式快捷栏，材料无限，不显示库存数量；玩家只做选材质、挖掘、放置。
+2. **硬材料仍像方块**：石头、木头、玻璃、未来石砖保持清晰方块视觉，建筑只有整个连通块完全浮空时才坍塌。
+3. **软材料立刻模拟**：泥土、草、沙子放置后立刻进入局部松弛，自动找坡、滑落或堆积。
+4. **静态世界和动态物体同源**：失稳的局部材质从 `MaterialField` 提取为 `FreeObject`，静止后再投影回场。
+5. **世界底部是基岩**：最低层使用不可破坏、无物理、不进物品栏的基岩托底。
+6. **水先不做真实流体**：当前水只作为静态透明占位或简化水块；真实流体 solver 留到固体和颗粒闭环稳定之后。
+7. **Host 权威**：多人中挖放、坍塌、提取、投影仍由 Host / Local-Only 权威推进，Remote 只预测和纠偏。
+
+### 1.2 明确不做
+
+这些不是第一版内容：
+
+- 不做玩家区域锁定、结构冻结或权限式保护工具。
+- 不做生存采集、堆叠数量、背包质量守恒闭环。
+- 不强制所有材质使用同一个提面算法。
+- 不用渲染 mesh 作为唯一碰撞真相。
+- 不让水参与传播、侵蚀、湿润或高频网络同步。
+
+### 1.3 核心取舍
+
+| 问题 | 绝对统一版本 | 本设计采用 |
 |---|---|---|
-| 地形方块 | 特殊数据结构 | 静态材质采样点（恰好能用网格压缩存储） |
-| 掉落方块 | 特殊实体类型 | 同一种材质采样点，状态从静态变为动态 |
-| 掉落物 | 特殊实体类型 | 同一种材质采样点，规模缩小 |
-| 玩家碰撞 | 硬编码 | 同一种材质采样点，状态为运动学 |
-| 斜坡/半砖 | 新方块类型 | 密度渐变自然产生 |
-| 坍塌 | 不存在或硬编码 | 材质物理的必然结果 |
+| 世界原子 | 所有东西都是同一种 GridPoint | 权威状态统一为 MaterialCell / FreeObject |
+| 渲染 | 全部 Marching Cubes / Surface Nets | 按材质选择 blocky / smooth / fluid extractor |
+| 碰撞 | 全部密度对密度 | broadphase + gameplay proxy + density/hull narrowphase |
+| 玩家 | 也是材质采样点集合 | 玩家保留角色控制器，读写统一世界查询 |
+| 水 | 和固体同一种物理 | 第一版静态占位；未来独立流体求解器仍写入统一材质场 |
+| 玩家建筑 | 额外操作绕过物理 | 由材质属性、放置规则和局部稳定性边界保证简单手感 |
+
+### 1.4 三层模型
+
+```
+权威世界层：
+  MaterialField / FreeObject / MaterialRegistry
+
+模拟层：
+  hard solid stability
+  granular relaxation
+  rigid FreeObject motion
+  future fluid solver
+  player controller query
+
+表现与查询层：
+  blocky extractor for hard materials
+  surface nets / marching cubes for soft materials
+  transparent renderer / future fluid renderer
+  collision proxies and ray queries
+```
+
+### 1.5 必须保持的约束
+
+1. **场内质量守恒**：坍塌、投影、沉积不能凭空复制或吞掉材质；第一版创造模式把玩家快捷栏视为外部无限源/汇，不追踪库存数量。
+2. **Host 权威**：多人场景下权威世界只在 Host / Local-Only 推进，Remote 只预测和协调。
+3. **材质决定默认行为**：玩家选择材质，不直接选择笔刷；kernel、休止角、凝聚力来自材质属性。
+4. **求解器可以分层**：统一语义不等于统一算法。不同材质可以路由到不同求解器。
+5. **代理结构合法**：AABB、碰撞 hull、SDF、空间哈希、LOD 都是实现细节，不破坏统一设计。
 
 ---
 
-## 二、基本单位：材质采样点
+## 二、当前代码结构观察
 
-### 2.1 定义
+本节只记录当前仓库的结构事实，用来校准方案边界；它不是迁移计划。
 
-```
-材质采样点 (GridPoint) {
-    位置:   (x: i32, y: i32, z: i32)    // 整数格点
-    材质:   MaterialID                    // 石头、沙、土、水、空气…
-    密度:   u8                            // 0 = 纯空气，255 = 全实心
-}
-```
+| crate / 模块 | 当前职责 | 对统一体素方案的自然归属 |
+|---|---|---|
+| `core::block` | `BlockID` + 编译期 `BlockProperties` | 扩展为 `MaterialID` / `MaterialProperties` / `MaterialRegistry` |
+| `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标、palette+RLE | 扩展为 `FieldChunk`、列存储、field snapshot 编码 |
+| `core::protocol` | bincode 消息、ChunkSnapshot、BlockUpdate | 扩展为 field snapshot、operation delta、FreeObject 状态 |
+| `server::world` | `HashMap<ChunkPos, Chunk>`、地形、dirty、LRU | 持有权威 MaterialField、FreeObject 和模拟队列 |
+| `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验 | 权威操作仲裁、质量守恒、kernel 应用、稳定性触发 |
+| `render::chunk_mesh` | 方块贪婪网格化、透明方块网格 | 变成 extractor 集合：blocky / smooth / fluid / object mesh |
+| `client::physics` | 玩家 AABB 分轴碰撞、本地预测 | 保留角色控制器，查询统一世界碰撞代理 |
+| `client::raycast` | DDA 命中 solid 方块 | 硬材质 DDA + 平滑材质 field ray query |
+| `client::mesh_jobs` | 分帧 chunk mesh 任务队列 | 继续承载各 extractor 的分帧预算 |
+| `client::storage` | OPFS chunk 读写 | 存储 FieldChunk、FreeObject、schema 版本 |
+| `net` | WebRTC / WS 中继字节通道 | 仍只负责传输，不理解世界语义 |
 
-世界就是三维网格上的一个材质密度场。方块、斜坡、实体——全由密度场导出：
-
-| 密度分布 | 导出的形状 |
-|---|---|
-| 255 / 0 / 0 / 0 … 二值阶梯 | 完美方块平面 |
-| 255 → 200 → 100 → 0 渐变 | 平滑斜坡 |
-| 孤立的局部高密度区 | 碎石堆、矿团 |
-| 脱离网格的自由变换采样点 | 掉落物、坍塌碎片 |
-
-**不存在"方块形状"和"实体形状"的区分——形状是密度场的等值面。**
-
-### 2.2 单元格与等值面
-
-8 个相邻格点围成一个单元格。8 个顶点的密度值经由 Marching Cubes（或 Surface Nets）提取出单元格内的等值面。表面既是视觉 mesh，也是碰撞几何。
+这个结构支持“统一世界层在 `core`/`server`，表现层在 `render`，编排和预测在 `client`”的分层方式。方案需要重写数据模型，但不需要打破 crate 的所有权边界。
 
 ---
 
-## 三、存储：Span Column Store
+## 三、基本单位：材质单元
 
-### 3.1 为什么需要新存储
+### 3.1 为什么不用“一个格点就是一个方块”
 
-传统 Chunk 稠密数组每个 Chunk 存 65536 个 BlockID。现实中大部分世界是连续同质层（基岩 4 层 + 石头 60 层 + 空气 190 层），稠密存储浪费严重。
+原始设想里的“一个 GridPoint 密度 255 生成一个方块”在 Marching Cubes 语义下不成立。Marching Cubes 读取的是单元格 8 个角点的标量值；只有一个角点高密度时，通常只会生成角落小面，不会得到完整 1×1×1 方块。
 
-### 3.2 Span Column 结构
+因此权威世界不要把“提面算法的采样点”当作库存和物理的唯一原子。更准确的划分是：
+
+| 概念 | 用途 | 是否权威 |
+|---|---|---|
+| `MaterialCell` | 世界中一个体素单元内的材质质量 | 是 |
+| vertex/corner sample | smooth extractor 输入，由 cell 场过滤或采样得到 | 否 |
+| mesh vertex | GPU 表现数据 | 否 |
+| collision proxy | 物理加速结构 | 否 |
+
+### 3.2 MaterialCell
 
 ```rust
-pub struct Column {
-    spans: Vec<Span>,  // 按 y_start 升序，无重叠
+struct MaterialCell {
+    occupancy: u8,              // 0 = 空，255 = 满
+    primary: MaterialID,         // occupancy = 0 时忽略
+    secondary: Option<MixSlot>,  // 可选，用于少量混合或过渡
+    flags: CellFlags,            // generated / dirty / stable hint 等
 }
 
-pub struct Span {
-    pub y_start: u8,
-    pub length: u8,
-    pub material: MaterialID,
-    pub density: u8,    // 此 span 的统一密度（可进一步压缩为逐层变化）
+struct MixSlot {
+    material: MaterialID,
+    occupancy: u8,
 }
 ```
 
+规则：
+
+- `occupancy = 0` 表示空气；空气不是需要保存的材质。
+- `primary + secondary` 的总占用不得超过 255。
+- 多材质只允许少量局部混合。复杂反应应产生新材质，而不是无限增加通道。
+- 硬方块的“完整一格”是 `MaterialCell { occupancy: 255, primary: stone }`，由 blocky extractor 表现为立方体。
+- 平滑材质通过 kernel 和 extractor 转成连续表面，不要求每个 cell 都画成立方体。
+
+### 3.3 Cell、格点、单元格
+
 ```
-一个 (x,z) 列:
+整数坐标 (x, y, z) 表示一个 cell 的最小角或逻辑地址。
 
-  y=0..4    { 石头, 密度 255 }   ← 基岩，1 个 Span 覆盖 4 层
-  y=5..64   { 石头, 密度 255 }   ← 岩层，1 个 Span 覆盖 60 层
-  y=65..65  { 土, 密度 220 }     ← 斜坡底
-  y=66..66  { 土, 密度 100 }     ← 斜坡中
-  y=67..67  { 土, 密度 30 }      ← 斜坡顶
-  y=68..255 空气（不存 Span）
+硬材质：
+  cell occupied -> blocky extractor 输出 1m 立方体面
+
+软材质：
+  cell occupancy -> 过滤成 corner samples
+  corner samples -> Surface Nets / Marching Cubes 输出平滑表面
 ```
 
-### 3.3 对比
-
-| | Chunk 稠密数组 | Span Column Store |
-|---|---|---|
-| 一列地下石头+地表草 | 256 × 2 = 512 字节 | 2-3 spans × 4 = 8-12 字节 |
-| 一个 Chunk | 128KB | ~2KB（简单地形） |
-| 玩家复杂建筑 | 128KB | 最差 ~128KB（退化为稠密） |
-| 操作方式 | 坐标乘加偏移 | 二分查找 span |
-
-**简单地形极致压缩，复杂区域自动退化，无需二选一。地形生成出来就是压缩态的。**
+这使得“石砖仍是方块”和“沙堆可以平滑”同时成立，而不需要让 Marching Cubes 独自承担所有形状。
 
 ---
 
-## 四、材质属性
+## 四、存储：Column Store + Dense 退化
 
-### 4.1 定义
+### 4.1 目标
 
-每种材质自带物理行为，不需要硬编码"沙会塌""石头不会"——是材质自己的参数决定了行为。
+存储层要服务两种完全不同的区域：
+
+- 自然地形：大量连续同质层，适合 span 压缩。
+- 玩家建筑：局部高熵编辑，适合 dense 或小块页缓存。
+
+因此建议把 Span Column Store 定义为**逻辑格式**，并允许高熵区域自动退化。
+
+### 4.2 结构
+
+```rust
+struct FieldChunk {
+    columns: [Column; 16 * 16],
+    free_object_refs: Vec<ObjectID>, // 可选：本 chunk 活跃动态物体索引
+}
+
+enum Column {
+    Spans(Vec<Span>),
+    Dense(Box<[MaterialCell; 256]>),
+}
+
+struct Span {
+    y_start: u16,
+    length: u16,
+    cell: MaterialCell,
+}
+```
+
+### 4.3 运行时查询
+
+Span 适合存档和网络快照，但不一定适合每次物理查询。实现可以保留这些缓存：
+
+- 最近活跃 chunk 的 dense column cache。
+- extractor 需要的 corner sample cache。
+- collision proxy cache。
+- dirty column / dirty region，而不是整 chunk dirty。
+
+关键是外部 API 查询的是 `MaterialField`，不关心内部当前是 span 还是 dense。
+
+---
+
+## 五、材质属性
+
+### 5.1 定义
 
 ```rust
 struct MaterialProperties {
     // 视觉
-    texture_index: u8,
-    
-    // 放置
-    kernel: PlacementKernel,    // 放置时的核函数
-    
+    visual_class: VisualClass,
+    texture_index: u16,
+
+    // 放置与挖掘
+    placement_kernel: PlacementKernel,
+    break_kernel: BreakKernel,
+    placement_unit_mass: u16,
+    hardness: f32,
+    appears_in_hotbar: bool,
+    breakable: bool,
+
     // 物理
-    angle_of_repose: u8,        // 最大休止角（度），90 = 完全不流动
-    cohesion: Cohesion,         // 凝聚力
-    support_required: bool,     // 是否需要下方支撑
-    
-    // 交互
-    hardness: f32,              // 挖掘时间
-    tool_multiplier: f32,       // 工具效率倍率
+    mechanics: MechanicsClass,
+    angle_of_repose: f32,
+    cohesion: f32,
+    compressive_strength: f32,
+    shear_strength: f32,
+    density_kg_m3: f32,
+    restitution: f32,
+    friction: f32,
+    stability: StabilityPolicy,
 }
 
-enum Cohesion {
-    None,       // 无自由物体形态，直接格点间密度传播（水）
-    Low,        // 自由物体碰撞即散（沙）
-    Medium,     // 轻微碰撞碎裂（土）
-    High,       // 保持整体，极端冲击才碎（石头）
-    Max,        // 永不碎裂（石砖）
+enum VisualClass {
+    HardBlocky,
+    SmoothGranular,
+    Fluid,
+    Foliage,
 }
 
-struct PlacementKernel {
-    radius: u8,           // 影响半径（格点数）
-    decay: DecayCurve,    // 密度衰减曲线
+enum MechanicsClass {
+    StaticSolid,
+    Granular,
+    RigidBreakable,
+    Fluid,
+    Decorative,
 }
 
-enum DecayCurve {
-    Sharp,      // 半径 1，密度 255，无衰减 → 方块
-    Linear,     // 线性衰减 → 锥形
-    Smooth,     // 平滑衰减 → 缓坡
-    Irregular,  // 不规则衰减 → 自然碎石感
+enum StabilityPolicy {
+    NoPhysics,
+    FloatingOnly,
+    ImmediateRelaxation,
+    FutureFluid,
 }
 ```
 
-### 4.2 材质示例
+### 5.2 第一版物质清单
 
-| 材质 | 核函数 | 休止角 | 凝聚力 | 支撑 | 说明 |
+当前游戏快捷栏有 9 格，其中 1-8 是现有物质，第 9 格当前重复石头；目标设计中第 9 格改为石砖。石砖目前在代码中还不存在，需要后续新增 BlockID、纹理和 hotbar 显示。
+
+| hotbar | 物质 | 当前状态 | 视觉 | 物理策略 | 第一版行为 |
 |---|---|---|---|---|---|
-| 石头 | Sharp, 半径1 | 90° | High | 是 | 怎么写就怎么保持，直角平面 |
-| 石砖 | Sharp, 半径1 | 90° | Max | 是 | 同石头但永不碎裂 |
-| 土 | Sharp, 半径2 | 60° | Medium | 是 | 略不平整，陡坡缓慢沉降 |
-| 沙 | Smooth, 半径3 | 30° | Low | 是 | 自动成坡，碰撞散开 |
-| 砾石 | Irregular, 半径2 | 40° | Low | 是 | 碎石堆，不规则棱角 |
-| 木头 | Sharp, 半径1×1×2 | 90° | High | 是 | 柱段，依面方向自动横/竖放 |
-| 水 | 薄层, 半径1 | 0° | None | 否 | 流到最低，填满容器 |
-| 雪 | Smooth, 半径2 | 15° | None | 否 | 薄层覆盖表面 |
+| 1 | 石头 | 已存在 | HardBlocky | FloatingOnly / RigidBreakable later | 硬质通用材料；玩家建筑只有整个连通块完全浮空时才坍塌，后续可让大岩块强冲击碎裂 |
+| 2 | 泥土 | 已存在 | SmoothGranular | ImmediateRelaxation | 中等凝聚软材料；放置后立刻局部松弛，形成粗糙土坡或土堆，不适合保持垂直薄墙 |
+| 3 | 草 | 已存在 | SmoothGranular + surface layer | ImmediateRelaxation | 作为泥土表层/地表材料；主体按泥土物理处理，草面只影响外观和地表识别 |
+| 4 | 沙子 | 已存在 | SmoothGranular | ImmediateRelaxation | 低凝聚颗粒；放置后立刻按休止角滑落和堆积，不能稳定形成直墙 |
+| 5 | 木头 | 已存在 | HardBlocky | FloatingOnly | 建筑硬材质；可做梁、柱、地板，只有完全浮空的连通块才进入坍塌/掉落流程 |
+| 6 | 树叶 | 已存在 | Foliage | Decorative | 轻质装饰材料；不作为主要承重支撑，直接破坏即可移除，第一版不做枯萎或传播 |
+| 7 | 玻璃 | 已存在 | HardBlocky / Transparent | FloatingOnly | 透明建筑硬材质；可稳定建造，完全浮空才坍塌，破坏时可直接消失或后续扩展为碎片 |
+| 8 | 水 | 已存在 | Transparent placeholder | NoPhysics | 第一版不做真实流体；保留为静态透明占位/简化水块，不传播、不侵蚀、不参与 FreeObject |
+| 9 | 石砖 | 目标新增，当前不存在 | HardBlocky | FloatingOnly | 主要建筑块；比石头更偏人造稳定材料，只有完全浮空才坍塌，不参与自然地形生成 |
+| - | 基岩 | 目标新增世界材料 | HardBlocky | NoPhysics | 世界最底层材料；无法破坏、无物理模拟、不出现在物品栏，不参与掉落或坍塌 |
 
-### 4.3 核函数的含义
+### 5.3 世界底层
 
-核函数不是玩家选择的——是材质的天然属性。玩家选沙就是沙核，选石就是石核。
+世界最底层应生成基岩，而不是石头。基岩是世界边界材料：
 
-```
-石头核:  只写 1 个格点，密度 255
-         [255]                               → 二值平面 → 方块视觉
+- 位于最低 y 层，用作稳定基底和防止玩家挖穿世界的硬边界。
+- `breakable = false`，玩家无法挖掘，也不会作为挖掘结果进入创造模式快捷栏。
+- `appears_in_hotbar = false`，不出现在物品栏和默认快捷栏。
+- `stability = NoPhysics`，不进入支撑图、颗粒松弛、FreeObject 提取或投影流程。
 
-沙核:    写 3×3×3 区域，中心高密度、径向平滑衰减
-         中心: 200 / 邻面: 140 / 邻边: 80 / 邻角: 30
-                                             → 渐变曲面 → 自然沙丘视觉
-```
+### 5.4 材质路由
 
-不同材质的核函数叠加到同一个密度场中，Marching Cubes 统一提取 mesh。石砖城墙笔直方块 + 墙内沙地自然缓坡——同一套渲染，核函数不同。
-
----
-
-## 五、静态 ↔ 动态：统一的转换机制
-
-### 5.1 不存在两种类型
-
-静态世界的格点上的采样点，和自由物体里的采样点，是**完全一样的数据**。区别只在：前者焊在格点上，后者有一个独立的变换矩阵。
-
-```rust
-/// 自由物体——脱离网格的材质采样点集合
-struct FreeObject {
-    id:              ObjectID,
-    transform:       Transform,          // 局部空间 → 世界空间
-    samples:         Vec<Sample>,
-    
-    // 物理状态
-    velocity:         Vec3,
-    angular_velocity: Vec3,
-    mass:            f32,
-}
-
-struct Sample {
-    local_pos:  Vec3,      // 在 FreeObject 局部空间中的位置
-    material:   MaterialID,
-    density:    u8,
-}
-```
-
-### 5.2 三种转换
-
-整个生命周期由三个统一操作定义：
+材质属性不只是参数表，也决定模拟和表现的路由：
 
 ```
-1. 提取 (Static → Dynamic)
-   触发: 支撑失败 / 玩家挖掘 / 爆炸
-   操作: 从格点移除密度 → 打包为 FreeObject
-   
-2. 动态过程
-   全部 FreeObject 受重力、碰撞、旋转
-   凝聚力决定保持整体还是碎裂
-   
-3. 投影 (Dynamic → Static)
-   触发: FreeObject 速度 < 阈值（静止）
-   操作: 采样点变换到世界空间 → 密度写入最近格点 → 销毁 FreeObject
+MaterialProperties
+  -> placement kernel
+  -> stability solver
+  -> relaxation solver
+  -> mesh extractor
+  -> collision proxy builder
+  -> creative palette rule
+  -> optional survival stacking rule later
 ```
 
-### 5.3 同一套物理
-
-静态物体和动态物体的碰撞检测完全统一——**密度场查询**：
-
-```
-物理子步:
-  1. 将 FreeObject 的采样点变换到世界空间
-  2. 遍历每个采样点，查询该位置是否与静态密度场重叠
-  3. 查询是否与其他 FreeObject 的采样点重叠
-  4. 求解穿透约束、摩擦力、恢复系数
-  5. 更新速度/角速度/位置
-```
-
-没有 AABB、OBB、方块碰撞、实体碰撞的区别。只有密度对密度的接触判断。
-
-### 5.4 凝聚力决定动态行为
-
-| 材质 | 凝聚力 | 自由物体形态 | 回到静态后 |
-|---|---|---|---|
-| 石砖 | Max | 完整 1×1×1 方块，刚性运动 | 落地 → 整体投影 → 一块石砖 |
-| 石头 | High | 略不规则多面体，整体运动 | 落地 → 微旋转投影 → 略倾斜的岩块 |
-| 土 | Medium | 松散土块，碰撞即碎 | 碎裂 → 碎片各自投影 → 自然土堆 |
-| 沙 | Low | 沙团，几乎立即散开 | 分散投影 → 密度在多点写入 → 自然沙坡 |
-| 水 | None | 无自由物体，直接密度场传播 | — |
-
-### 5.5 场景示例
-
-**石头坍塌**：
-```
-悬崖上的石头被挖掉支撑 →
-  下方格点密度将至 0 →
-  上方 4 个石头格点检测到失去支撑 →
-  提取密度打包为一个 FreeObject { cohesion: High } →
-  整体下落、与崖壁碰撞弹跳（不碎）→
-  静止 → 投影到格点 →
-  因为轻微旋转，写入的密度分布略有不规则 →
-  MC 提取出一个微倾斜、部分嵌入地面的石块表面
-```
-
-**沙柱坍塌**：
-```
-沙柱底部被挖 →
-  上方沙格点失去支撑 →
-  提取为 FreeObject { cohesion: Low } →
-  下落中空气阻力已导致变形 →
-  第一次碰撞: 冲击 >> 凝聚力 → FreeObject 碎裂 →
-  多个小沙团各自下落/滑落 →
-  各自投影分散写入格点 →
-  密度场自动再平衡到 30° 休止角
-```
+这比“所有材质只改几个数字，算法完全一样”更实际，也更容易调出好手感。
 
 ---
 
 ## 六、编辑：材质天然单位
 
-### 6.1 设计原则
+### 6.1 玩家交互
 
-**不是玩家选笔刷画画。是每种材质天生有自己的粒度。玩家只管选材质、挖/放——形状是材质自己的事。**
-
-### 6.2 玩家操作
+玩家交互仍保持简单：
 
 ```
-滚轮: 选择材质（和 MC 物品栏完全一样）
-左键: 挖掘（取一个单位的材质进背包）
-右键: 放置（从背包放一个单位的材质到世界）
+滚轮 / 快捷栏: 选择材质
+左键: 挖掘一个材质单位
+右键: 放置一个材质单位
 ```
 
-和 MC 一模一样的交互。无笔刷、无衰减曲线、无额外 UI。
+玩家不直接选择笔刷半径和衰减曲线，也不管理额外的物理约束。材质自己决定 kernel 和稳定性边界。
 
-### 6.3 操作效果由材质决定
+### 6.2 放置
 
-```
-石砖:  放 → 1 格点密度 255，整齐方块
-       挖 → 1 格点 255 → 0，整齐缺口，背包多一块石砖
+第一版保持创造模式体验：快捷栏材料无限，不显示数量，不做采集-库存闭环。一次右键操作从外部材料源写入一个 `placement_unit_mass`；kernel 只负责决定目标区域的质量分布：
 
-沙:    放 → 3×3×3 核写入，小沙堆
-       连续多撮 → 沙堆自然成坡
-       挖 → 吸附周围沙密度取走，平滑凹坑，背包多一撮沙
-
-土:    放 → 2×2 核写入，略不规则土块
-       堆叠 → 在方块感和自然感之间
-       挖 → 2×2 范围取走，微不平整的坑
+```rust
+struct KernelWrite {
+    offset: IVec3,
+    material: MaterialID,
+    mass: u16,
+}
 ```
 
-### 6.4 锁定
+放置必须满足局部写入规则：
 
-默认情况下，所有非固体材质（休止角 < 90°）放置后会根据物理自动调整。沙子堆墙会塌，泥土堆柱会沉降。
+1. 先模拟 kernel 写入，计算容量和冲突。
+2. 若能完全写入，则直接提交；创造模式不扣库存。
+3. 若局部满格，可尝试有限次邻近扩散。
+4. 若仍有剩余，操作要么整体拒绝，要么只扣除实际写入量；规则必须固定，不能隐式吞掉剩余质量。
 
-玩家如果想保持非固体的形状（比如沙雕），可以**锁定**：
+建议第一版使用**整体拒绝**，后续再支持“写入部分并返还剩余”。
 
-```
-锁定操作:  选择区域 → 按锁定键
-效果:      区域内格点不受材质物理更新（跳过休止角再平衡）
-视觉:      锁定区域有弱边框提示
-解锁:      再次锁定键取消
-```
+### 6.3 挖掘
 
-石头不需要锁（90° 休止角永不违反）。沙子造墙必须锁——这让"沙雕"成为一个有意义的主动选择，而非 bug。
+挖掘是放置的反操作：
+
+- `break_kernel` 从命中位置附近取走质量。
+- 优先取命中材质；混合 cell 中按 dominant material 或命中表面材质取。
+- 第一版取走的质量进入创造模式外部汇，不增加玩家库存数量。
+- 若取走后 cell 总质量为 0，清空 material。
+- 挖掘会触发局部稳定性检查、mesh dirty 和 persistence dirty。
+
+### 6.4 多材质叠加
+
+同一 cell 发生不同材质写入时，采用固定优先级：
+
+1. 同材质累加，占用不超过 255。
+2. 有空 secondary slot 时写入 secondary。
+3. 若两个材质定义了反应规则，生成新材质。
+4. 若无法混合且目标为硬材质，放置拒绝。
+5. 若无法混合且目标为软材质，可触发挤出/滑落，把多余质量写到邻近 cell。
+
+这样能避免“无限材质通道”导致存储和提面都失控。
 
 ---
 
-## 七、结构完整性
+## 七、静态与动态
 
-### 7.1 支撑规则
+### 7.1 FreeObject
+
+静态世界和动态物体共享材质语义，但不共享完全相同的运行时结构。
+
+```rust
+struct FreeObject {
+    id: ObjectID,
+    transform: Transform,
+    velocity: Vec3,
+    angular_velocity: Vec3,
+    samples: Vec<ObjectSample>,
+    material_summary: MaterialSummary,
+    mass: f32,
+    collision_proxy: CollisionProxy,
+    state: FreeObjectState,
+}
+
+struct ObjectSample {
+    local_pos: Vec3,
+    material: MaterialID,
+    mass: u8,
+}
+
+enum CollisionProxy {
+    Aabb(Aabb),
+    ConvexHull { vertices: Vec<Vec3> },
+    SampleCloud,
+}
+```
+
+FreeObject 的 `samples` 保留材质质量，`collision_proxy` 服务运行时性能。代理结构不是新实体类型，而是动态材质团的加速表示。
+
+### 7.2 提取：Static -> Dynamic
+
+触发条件：
+
+- 支撑失败。
+- 爆炸或强冲击。
+- 玩家挖掘导致连通块失稳。
+- 求解器判断某个局部区域应进入动态过程。
+
+提取流程：
+
+1. 找到受影响区域的连通 component。
+2. 根据材质凝聚力、质量、最大对象体积决定打包粒度。
+3. 从 MaterialField 移除对应质量。
+4. 生成一个或多个 FreeObject。
+5. 标记相关 chunk / column / mesh / collision proxy dirty。
+
+提取必须有上限：
+
+- 超大山体不能一次变成百万 sample 刚体。
+- 超过阈值的 component 可分块、分层，或走局部崩落近似。
+- 远离玩家的细节可以直接求解成静态沉积，不必创建可见 FreeObject。
+
+### 7.3 动态过程
+
+动态物体使用分层物理：
 
 ```
-非零密度的格点，其下方四个角格点中
-至少一个密度 > 128，
-否则该格点"失去支撑"。
+broadphase:
+  AABB / spatial hash / chunk bins
+
+narrowphase:
+  hard object: hull vs field / hull vs hull
+  granular object: sample cloud vs field
+  future fluid: 不走 FreeObject，交给 fluid solver
+
+resolution:
+  impulse / friction / damping / fragmentation
 ```
 
-### 7.2 支撑失败 → 坍塌
+凝聚力控制碎裂：
+
+| 凝聚力 | 动态行为 |
+|---|---|
+| 极高 | 保持整体刚体，只有强冲击碎裂 |
+| 高 | 整体运动，边缘可能掉碎片 |
+| 中 | 碰撞后分裂成若干团 |
+| 低 | 快速散成颗粒沉积 |
+| 无 | 不生成 FreeObject，直接在场中传播 |
+
+### 7.4 投影：Dynamic -> Static
+
+FreeObject 静止后不能简单“写入最近格点”，否则会产生穿插、质量丢失和体积漂移。投影必须是一个明确算法：
+
+1. 根据 transform 把 sample 转到世界空间。
+2. 使用 splatting 权重分配到附近 cell。
+3. 检查每个目标 cell 的剩余容量。
+4. 与硬材质冲突时优先反弹、滑落或寻找邻近空位，不直接覆盖。
+5. 写入后对局部区域运行松弛和稳定性检查。
+6. 若仍有无法容纳的质量，保留为小 FreeObject 或拒绝静止。
+
+投影完成后，FreeObject 才能销毁。
+
+---
+
+## 八、结构完整性
+
+### 8.1 不使用单点支撑规则作为正式模型
+
+“下方四个角点至少一个 density > 128”可以作为原型启发，但正式模型不能只看有/无支撑。否则会出现细柱撑巨石、边缘抖动、斜向悬挂等问题。
+
+### 8.2 支撑图
+
+稳定性求解以局部支撑图为核心：
+
+```rust
+struct SupportEdge {
+    from: CellPos,
+    to: CellPos,
+    normal_force_capacity: f32,
+    shear_force_capacity: f32,
+}
+
+struct StabilityComponent {
+    cells: Vec<CellPos>,
+    total_mass: f32,
+    center_of_mass: Vec3,
+    support_edges: Vec<SupportEdge>,
+}
+```
+
+求解关注：
+
+- 连通区域是否连接到稳定基底。
+- 支撑面积和承重能力是否足够。
+- 重心投影是否落在可承受支撑区域内。
+- 悬挑长度是否超过材质限制。
+- shear force 是否超过材质抗剪。
+
+第一版先对硬建筑材质使用 `FloatingOnly` 简化策略：
+
+- 石头、石砖、木头、玻璃等硬建筑材质不做承重细算；墙、地板、台阶、小跨度悬挑默认保持稳定。
+- 只有一个硬材质连通块与基岩、地面或其它稳定硬材质完全断开时，才进入坍塌/掉落流程。
+- 完全浮空检测可以先用局部 BFS 判断 component 是否接触稳定基底；后续再把大型自然岩体升级为更细的支撑图。
+- 基岩永远视为稳定基底，且不进入 component 提取。
+
+### 8.3 滞后与增量
+
+稳定性必须避免每 tick 全世界扫描：
+
+- 编辑、爆炸、投影和未来流体侵蚀只把附近 region 入队。
+- 通过 BFS / flood fill 找局部 component。
+- 使用两个阈值：`collapse_threshold` 和 `settle_threshold`，避免临界状态反复坍塌/静止。
+- `ImmediateRelaxation` 软材质在放置后立刻进入局部松弛；预算不足时分帧推进，但玩家看到的第一反馈必须是材质正在自然找坡。
+
+### 8.4 坍塌结果
+
+支撑失败不等于消失：
 
 ```
-支撑失败 ≠ 消失
-
-支撑失败 = 静态 → 动态:
-  1. 提取失撑格点的密度
-  2. 打包为 FreeObject
-  3. 进入动态物理
-  4. 落地后投影回静态网格
-
-递归: 一个格点移除后，其上方的格点可能同时失去支撑，
-      一并提取，共同打包或分别打包
+支撑失败
+  -> component 分类
+  -> 硬材质生成 FreeObject
+  -> 软材质进入 granular relaxation 或小 FreeObject
+  -> 未来流体交给 fluid solver
+  -> 投影 / 沉积回 MaterialField
 ```
 
 ---
 
-## 八、视觉
+## 九、视觉与碰撞
 
-### 8.1 统一管线
+### 9.1 多 extractor，而不是单一 Marching Cubes
 
-静态世界和自由物体共享同一套等值面提取：
-
-```
-密度场 (静态格点 + 自由物体变换后的采样点) →
-  Marching Cubes / Surface Nets →
-  等值面 Mesh →
-  GPU 渲染
-```
-
-### 8.2 场景中的共存
-
-| 场景 | 输入 | 输出 Mesh |
+| 材质视觉类 | Extractor | 说明 |
 |---|---|---|
-| 石砖城墙 | 二值密度 255/0 | 完美平面 |
-| 墙内沙地 | 渐变密度 | 平滑沙面 |
-| 坍塌中的岩块 | FreeObject 变换采样点 | 自由旋转的多面体 |
-| 三者的交界 | 密度场连续过渡 | 自然衔接 |
+| HardBlocky | blocky greedy / face meshing | 保留笔直方块、锐边、低成本 |
+| SmoothGranular | Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
+| RigidBreakable FreeObject | local mesh cache + transform | 动态岩块、碎块 |
+| Fluid | future fluid surface extractor + transparent pass | 水面、透明排序、波动；第一版水只做静态透明占位 |
+| Mixed boundary | priority / blend / seam resolver | 处理硬软交界 |
 
-不存在"方块 mesh"和"实体 mesh"的分叉。同一个 MC 管线处理一切。
+统一的是 extractor 输出的 mesh 接口，而不是 extractor 算法。
 
-### 8.3 与 Greedy Meshing 的关系
+### 9.2 硬软交界
 
-当前 VoxWeb 使用 Greedy Meshing 生成 Chunk mesh。过渡到密度场后，静态世界改用 Marching Cubes 生成 mesh。自由物体使用 Marching Cubes 在它们自己的局部空间中生成 mesh，通过 transform 矩阵渲染。
+硬材质和软材质交界需要专门规则：
 
-Greedy Meshing 的优化思想（合并同材质面）在密度场中不再直接适用，但可以通过 LOD 和 Surface Nets 的分级简化实现类似效果。
+- 硬材质表面优先保留锐边。
+- 软材质可以贴合硬表面，但不能侵入满格硬 cell。
+- 交界处法线、AO、纹理选择由 dominant material 和接触面决定。
+- 如果 Surface Nets 与 blocky mesh 产生缝隙，使用 seam resolver 或让软表面采样硬材质占用作为边界条件。
+
+### 9.3 碰撞查询
+
+碰撞不直接使用渲染 mesh 作为唯一真相。推荐查询层：
+
+| 查询 | 策略 |
+|---|---|
+| 玩家移动 | AABB / capsule vs collision field |
+| 硬方块命中 | DDA |
+| 平滑材质命中 | field raymarch / SDF approximation |
+| FreeObject 碰撞 | broadphase AABB + hull/sample narrowphase |
+| 稳定性 | cell graph / support graph |
+
+这样既保留玩法稳定性，也不牺牲统一世界语义。
 
 ---
 
-## 九、数据流总览
+## 十、简单沙盒边界
+
+更拟真的材质系统不应把玩家操作变成工程模拟器。玩家可见规则：
+
+- 玩家只通过材质选择、挖掘、放置影响世界。
+- 不提供额外的结构保护工具。
+- 硬建筑材质默认可用于可靠建造；只有整个连通块完全浮空时才坍塌。
+- 沙、土等软材质放置后立刻进入物理模拟并自动找坡，但沉降应局部、可预期、节制，避免玩家每次放置都被迫修补。
+- 第一版保持创造模式体验：快捷栏材料无限，不显示堆叠数量。
+- 水第一版不做真实流体，只作为静态透明占位或简化水块。
+- 如果某种形状在拟真规则下确实无法成立，反馈应来自材质本身，例如滑落、散开、碎裂，而不是要求玩家切换额外模式。
+
+实现含义：
+
+- 稳定性参数应区分自然地形、建筑硬材质和颗粒材质。
+- 建筑类 `StaticSolid` 使用 `FloatingOnly`：不进入低强度坍塌队列，只响应直接破坏、爆炸或完全浮空事件。
+- 软材质的松弛可以有位移上限、频率上限和玩家附近预算，保证结果立刻开始但不过度打扰建造。
+- 多人场景仍由 Host 仲裁挖放和物理事件，不引入额外权限/归属语义。
+
+---
+
+## 十一、流体
+
+第一版**不实现真实流体**。当前水只作为静态透明占位或简化水块存在：
+
+- 不在格子间传播。
+- 不侵蚀沙、土，也不触发湿润、泥化或流沙。
+- 不参与 FreeObject 生命周期。
+- 不进入高频网络同步；按普通静态材质或透明方块同步即可。
+
+未来如果升级水系统，再引入独立 solver：
+
+```rust
+struct FluidCell {
+    material: MaterialID,
+    volume: u8,
+    velocity: Vec3Quantized,
+}
+```
+
+未来规则：
+
+- 固体 occupancy 提供边界。
+- fluid volume 在邻近 cell 间传播并守恒。
+- 表面由 fluid extractor 生成。
+- 水与沙/土的交互通过材质规则触发：侵蚀、湿润、泥化或流沙等。
+- 多人同步优先传 Host 的流体 delta 或低频 region snapshot，避免逐 cell 高频广播。
+
+---
+
+## 十二、网络与确定性
+
+统一体素方案必须从一开始定义同步语义。推荐同步“操作和权威结果”，而不是让每个客户端独立跑完整物理后期待一致。
+
+### 12.1 消息类别
+
+| 类别 | 用途 |
+|---|---|
+| FieldSnapshot | 新玩家加入、纠偏、区域加载 |
+| FieldDelta | 小范围 cell / column 变化 |
+| ApplyKernel | 玩家放置 / 挖掘的权威操作 |
+| StabilityEvent | 坍塌、提取、沉积等权威事件 |
+| FreeObjectSpawn | 创建动态材质团 |
+| FreeObjectState | 低频权威状态、位置、速度、旋转 |
+| FreeObjectProject | 动态物体投影回静态场 |
+
+### 12.2 量化
+
+网络状态应避免裸 `f32` 成为长期权威数据：
+
+- cell mass 使用 `u8` / `u16`。
+- transform 使用定点或量化浮点。
+- 速度和角速度使用有限精度。
+- FreeObject sample 局部坐标可用小整数或半精度量化。
+- 每个 FieldChunk / region 可以带 hash，用于纠偏。
+
+### 12.3 预测
+
+Remote 可以预测：
+
+- 本地放置/挖掘的视觉结果。
+- 小 FreeObject 的插值运动。
+- 颗粒松弛的临时表现。
+
+Remote 不应权威决定：
+
+- 质量是否成功写入。
+- 支撑是否失败。
+- FreeObject 是否碎裂。
+- 投影后最终 cell 分布。
+
+这些都由 Host 返回 ack / delta / snapshot 协调。
+
+---
+
+## 十三、持久化
+
+持久化需要保存的不再只是 chunk 方块数组：
+
+```rust
+struct WorldRecord {
+    storage_version: u32,
+    material_registry_version: u32,
+    seed: u64,
+    active_free_objects: Vec<ObjectRecord>,
+}
+
+struct FieldChunkRecord {
+    pos: ChunkPos,
+    columns: Vec<ColumnRecord>,
+    dirty_revision: u64,
+}
+```
+
+需要明确：
+
+- `MaterialID` 的稳定编号和迁移规则。
+- FieldChunk 编码版本。
+- FreeObject 是否必须立即落盘，还是可在保存时强制投影。
+- 未来流体 cell 是否保存完整状态，还是从 volume 重新求解 velocity。
+- 存档加载后是否需要重新运行稳定性检查。
+
+---
+
+## 十四、数据流总览
 
 ```
-                      ┌──────────────────────┐
-                      │     材质密度场        │
-                      │  (Span Column Store)  │
-                      └──────────┬───────────┘
+                    ┌──────────────────────────┐
+                    │      MaterialField       │
+                    │ cells / columns / objects│
+                    └────────────┬─────────────┘
                                  │
-                  ┌──────────────┼──────────────┐
-                  ▼              ▼              ▼
-             视觉管线         物理查询      结构检查
-          (Marching Cubes)   (碰撞检测)     (支撑性)
-                  │              │              │
-                  ▼              ▼              ▼
-             等值面 Mesh     密度场查询      坍塌生成
-                  │         (静态+所有        FreeObject
-                  │          FreeObject)        │
-                  ▼              │              ▼
-             ┌─────────┐        ▼          ┌─────────┐
-             │   渲染   │  ┌──────────┐    │ 动态物理 │
-             │   GPU   │  │ FreeObject│    │  ┌─────┐ │
-             └─────────┘  │  碰撞响应 │    │  │重力 │ │
-                          │  受力和   │    │  │碰撞 │ │
-                          │  运动更新 │    │  │旋转 │ │
-                          └─────┬────┘    │  └──┬──┘ │
-                                │         └─────┼───┘
-                                │               │
-                                ▼               ▼
-                          速度 < 阈值      FreeObject
-                              │            死亡/合并
-                              ▼               │
-                         密度投影回格点 ←──────┘
-                         (Dynamic → Static)
+          ┌──────────────────────┼──────────────────────┐
+          ▼                      ▼                      ▼
+   simulation jobs         query/proxy cache        mesh jobs
+ stability / granular    collision / raycast     blocky / smooth
+ future fluid / proj       support graph       future fluid / object
+          │                      │                      │
+          ▼                      ▼                      ▼
+    FreeObject spawn       gameplay physics          GPU meshes
+          │
+          ▼
+   dynamic simulation
+          │
+          ▼
+   projection / sediment
+          │
+          ▼
+    MaterialField delta
 ```
 
 ---
 
-## 十、对称性总结
+## 十五、与传统 MC 架构的关系
 
-```
-                   自然                    玩家
-
-直角悬崖 / 石壁   ✓（石材质，休止角 90°）  ✓（石头 + 硬核 → 方块视觉）
-平滑斜坡           ✓（沙休止角 30°）       ✓（沙核 + 堆叠 → 坡视觉）
-坍塌               ✓（沙柱自毁）           ✓（玩家沙柱同样坍塌，除非锁定）
-沙雕               ✗（自然不存在）         ✓ 可做但必须锁定
-碎石堆             ✓（山体坍塌）           ✓（土核堆叠 → 自然碎石感）
-
-大自然能做什么，玩家就能做什么。
-大自然不能做的，玩家可以做但必须主动锁定。
-```
-
----
-
-## 十一、与当前实现的差距
-
-| 方面 | 当前 | 目标 |
+| 维度 | 传统 MC | 统一体素方案 |
 |---|---|---|
-| 基本单位 | BlockID（方块）+ PlayerEntity（实体）两种 | 统一的材质采样点 |
-| 存储 | Chunk 稠密数组 (HashMap<ChunkPos, Chunk>) | Span Column Store |
-| 方块类型 | 9 种，全为 1³ 方块 | 材质 + 核函数 + 休止角 + 凝聚力 |
-| 碰撞 | 两套（AABB 扫掠查方块 + 实体碰撞） | 统一密度场查询 |
-| 视觉 | Greedy Meshing（方块）+ 实例化（玩家） | 统一 Marching Cubes |
-| 编辑 | 离散格点放置/挖掘 | 材质天然单位放置/挖掘 |
-| 坍塌 | 无 | 支撑检测 + 自由物体生成 |
-| 物理 | 客户端移动物理 + 服务端动作验证 | 统一物理（客户端预测 + 服务端权威） |
-| 自由物体 | 无（仅玩家掉落） | 完整的 FreeObject 生命周期 |
+| 地形 | BlockID dense chunk | MaterialField / FieldChunk |
+| 方块 | 固定 1×1×1 cube | hard material 的一种 visual/class |
+| 沙/雪/土 | 特殊方块或 hardcoded 更新 | granular material solver |
+| 掉落方块 | Entity | FreeObject，一段材质场脱离静态网格 |
+| 玩家 | Entity + AABB | 角色控制器，查询统一世界 |
+| 水 | 特殊流体方块 | 第一版静态透明占位；未来 fluid solver 写入统一场 |
+| 斜坡 | 特殊方块形状 | soft material extractor 结果 |
+| 存档 | block array | field chunks + objects + solver state |
+| 网络 | block update / entity state | field delta / operation / object state |
 
 ---
 
-## 十二、待解决的设计问题
+## 十六、原型路线
 
-1. **Marching Cubes 在 WASM 的性能**：等值面提取比 Greedy Meshing 计算量大，需要分帧 + 缓存策略。需要原型验证。
+先验证模型，不要一开始追求完整世界替换。
 
-2. **密度场碰撞查询的开销**：每个物理子步遍历采样点查询密度场，比当前 AABB 扫掠贵。需要空间划分加速。
+1. **Cell 语义原型**
+   - 定义 `MaterialCell`、mass、threshold、kernel。
+   - 验证硬材质 cell 能稳定表现为方块。
+   - 验证软材质 cell 能提取平滑表面。
 
-3. **网络同步**：传输密度场数据比传输离散 BlockID 体积大，需要量化（密度 u8）+ 增量压缩方案。
+2. **单 chunk extractor 原型**
+   - blocky extractor 和 Surface Nets / Marching Cubes 并存。
+   - 测量 CPU 时间、mesh 大小、边界缝。
+   - 重点测试硬软交界。
 
-4. **多核叠加**：玩家在同一个格点反复放置不同材质时，密度如何叠加？材质如何混合？
+3. **创造模式编辑**
+   - 放置 kernel、挖掘 kernel、外部无限材料源/汇。
+   - 明确 overflow、混合和拒绝规则。
 
-5. **流体（水）的密度传播**：水在格点间的流动算法，以及水与固体材质的交界处理。
+4. **颗粒松弛**
+   - 沙/土放置后立刻按休止角局部再平衡。
+   - 只处理小范围 dirty region。
+   - 加滞后阈值避免抖动。
 
-6. **自由物体合并**：两个沙团相撞是否合并为一个更大的 FreeObject？合并的规则和阈值。
+5. **FreeObject 生命周期**
+   - 小石块或沙团从静态提取。
+   - 简化刚体运动。
+   - 静止后 splat 投影回场。
 
-7. **玩家背包**：一撮沙、一块石砖在背包中如何表示和堆叠？传统的"64 个方块一组"是否仍然适用？
+6. **结构完整性**
+   - 局部 support graph。
+   - component 提取。
+   - 崩塌事件可重复、可同步。
+
+7. **多人同步语义**
+   - 操作 ack、field delta、region snapshot。
+   - Host 仲裁坍塌、提取和投影。
+   - Remote 预测和回滚。
+
+8. **流体**
+   - 第一版不做真实流体，只保留静态透明占位。
+   - 在固体/颗粒闭环稳定后再加入流体 solver。
+
+---
+
+## 十七、待解决问题
+
+1. **MaterialCell 的通道数量**：`primary + secondary` 是否足够？是否需要 per-cell small palette？
+2. **硬软交界提面**：blocky mesh 与 smooth mesh 如何无缝连接？
+3. **支撑图成本**：局部 component 分析在大建筑或大山体上如何限流？
+4. **投影质量守恒**：FreeObject 静止后无法完全写入时如何处理？
+5. **混合材质规则**：未来沙 + 水、土 + 水、岩石 + 矿物如何表达？
+6. **存档版本**：MaterialID 变化后旧世界如何迁移？
+7. **网络纠偏**：FieldDelta 丢失或乱序时如何用 region hash 修复？
+8. **性能预算**：单线程 WASM 下 extractor、稳定性、颗粒松弛如何分帧？
+
+---
+
+## 十八、总结
+
+统一体素方案的价值在于：玩家、地形、坍塌、沙土、水和掉落物都围绕同一套材质语义互动。真正可落地的版本应当坚持：
+
+```
+统一权威语义；
+分层模拟求解；
+多 extractor 表现；
+质量守恒；
+Host 权威；
+创造模式材料源/汇；
+基岩托底；
+水第一版静态占位；
+简单沙盒手感优先。
+```
+
+这保留了“方块和实体是材质状态变化”的设计美感，同时避免把渲染、碰撞、流体和玩家手感都塞进一个过度理想化的算法里。
