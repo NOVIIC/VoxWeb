@@ -267,6 +267,55 @@ fn handle_message_break_enqueues_ack_one_and_field_delta_all() {
 }
 
 #[test]
+fn handle_message_break_broadcasts_free_object_projection_for_floating_hard_block() {
+    let (mut server, eid) = prepare_world();
+    let support = Position::new(3, 64, 3);
+    let lower_support = Position::new(3, 63, 3);
+    let floating = Position::new(3, 65, 3);
+    server
+        .world
+        .set_block(lower_support, voxweb_core::BlockID::STONE);
+    server
+        .world
+        .set_block(floating, voxweb_core::BlockID::STONE);
+
+    server.handle_message(
+        eid,
+        ClientMessage::Break {
+            pos: support,
+            request_id: 43,
+            input_tick: 6,
+            player_position: Vec3::new(3.5, 65.0, 3.5),
+        },
+    );
+
+    assert_eq!(server.world.get_block(floating), voxweb_core::BlockID::AIR);
+    assert_eq!(server.world.get_block(support), voxweb_core::BlockID::STONE);
+    assert_eq!(server.world.free_objects.len(), 1);
+
+    let projection = find_outbox(&server, |m| {
+        matches!(
+            (&m.recipient, &m.message),
+            (
+                Recipient::All,
+                ServerMessage::FreeObjectProject {
+                    object_id: 1,
+                    deltas,
+                }
+            ) if deltas.iter().any(|(pos, cell)| {
+                *pos == floating && cell.to_block_id() == voxweb_core::BlockID::AIR
+            }) && deltas.iter().any(|(pos, cell)| {
+                *pos == support && cell.to_block_id() == voxweb_core::BlockID::STONE
+            })
+        )
+    });
+    assert!(
+        projection.is_some(),
+        "missing FreeObjectProject with projection deltas"
+    );
+}
+
+#[test]
 fn handle_message_break_out_of_range_only_ack_no_field_delta() {
     let (mut server, eid) = prepare_world();
     server.handle_message(

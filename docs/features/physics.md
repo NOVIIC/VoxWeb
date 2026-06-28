@@ -358,6 +358,8 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 `ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote。
 
+`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就记录一个 `FreeObject`，整体下落到最近支撑面，并立即投影回 `MaterialField`。当前不做可见刚体飞行、碰撞反弹或碎裂，结果通过可靠通道上的 `FreeObjectProject` 同步。
+
 ### 8.1 视觉反馈
 
 每渲染帧：

@@ -27,6 +27,7 @@
 
 - `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
 - `World::field_chunks` 同步维护 `FieldChunk` MaterialField 镜像；当前渲染/碰撞仍从 `chunks` 适配读取，网络快照直接发送 FieldChunk
+- `World::free_objects` 记录第一版 FreeObject 生命周期结果：小型 `FloatingOnly` 连通块会被提取、整体下落并投影回静态场
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
 - `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`relax_after_edit` 对 `ImmediateRelaxation` 材质做局部下落/滑落
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
@@ -58,7 +59,8 @@ crates/server/src/
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
-    pub field_chunks: HashMap<ChunkPos, FieldChunk>, // MaterialField 兼容镜像
+    pub field_chunks: HashMap<ChunkPos, FieldChunk>, // MaterialField 镜像
+    pub free_objects: HashMap<ObjectID, FreeObject>, // 已提取/投影的材质团记录
     pub terrain: TerrainGenerator,           // Perlin 高度图
     pub tick_count: u64,                     // tick 累加器；驱动玩家广播
     pub dirty_chunks: HashSet<ChunkPos>,     // 需要持久化的 chunk
@@ -285,7 +287,7 @@ pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet:
 
 玩家位置由 `Server::players: HashMap<u32, Vec3>` 提供（Hello 插入初始 spawn，PlayerInput 60Hz 更新）。`validate_break/place` 的签名接受显式 `player_feet` 参数（而非 entity_id），便于测试时直接注入位置。
 
-### 局部颗粒松弛
+### 局部颗粒松弛与硬材质浮空
 
 ```rust
 pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
@@ -295,9 +297,18 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, B
     // 4) 单次挖放受 RELAXATION_MOVE_BUDGET / RELAXATION_VISIT_BUDGET 限流
     // 5) 返回每个 cell 的权威 FieldDelta 序列
 }
+
+pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectProjection> {
+    // 1) 从 origin 及其上方/四邻域收集 FloatingOnly 候选
+    // 2) BFS 找小型硬材质连通块；超过预算视为大型地形/建筑并保持静态
+    // 3) 若连通块没有接触任何稳定 solid 支撑，记录 FreeObject
+    // 4) 整体下落到最近支撑面并投影回 Field/Chunk
+    // 5) 返回每个 FreeObject 的旧位置 AIR + 新位置材质投影 delta
+}
 ```
 
 当前这是 `BlockID` dense chunk 上的过渡原型，不做质量拆分和多材质混合；它保证 Host / Local-Only 立即给玩家软材质反馈，并通过 `FieldDelta` 同步结果。
+硬材质第一版同样是整格过渡实现：不会模拟可见刚体飞行，而是在同一权威步骤完成提取、下落、投影，并通过 `FreeObjectProject` 广播投影结果。
 
 ---
 
@@ -346,10 +357,12 @@ match msg {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
                 let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                let projections = physics::resolve_floating_after_edit(&mut self.world, pos);
                 self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::EMPTY }));
                 for (pos, block) in relaxed {
                     self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::from_block_id(block) }));
                 }
+                self.enqueue_free_object_projections(projections);
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
             }
             Err(reason) => {
@@ -359,7 +372,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠；成功后 set_block + relax_after_edit + 多条 FieldDelta */
+        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠；成功后 set_block + relax_after_edit + FieldDelta，并用 FreeObjectProject 广播硬材质投影 */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));

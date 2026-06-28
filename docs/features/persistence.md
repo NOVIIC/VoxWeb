@@ -89,6 +89,7 @@ opfs:/voxweb/
 ## 四、FieldChunk 存储格式
 
 > OPFS 磁盘存储与网络 `FieldSnapshot` 均使用 `FieldChunk` 编码。运行时仍维护 dense `Chunk` 作为当前渲染/碰撞适配视图。
+> 当前 `FloatingOnly` 硬材质 FreeObject 会在同一权威步骤投影回 `FieldChunk`，因此 OPFS 只保存投影后的静态场；后续引入跨帧 active FreeObject 后再扩展 `world.json` / object record。
 
 `FieldChunk` 是统一体素方案的存档底座：每个 chunk 由 16×16 个 column 组成，column 可以是 span 压缩，也可以在高熵编辑后退化为 dense cell 列。
 

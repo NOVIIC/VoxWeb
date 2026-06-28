@@ -29,6 +29,7 @@ crates/core/
     ├── block.rs        BlockID/MaterialID 过渡层 + 硬编码材质属性表
     ├── chunk.rs        Chunk + Position + ChunkPos
     ├── field.rs        FieldChunk + Column + Span 原型
+    ├── object.rs       FreeObject + ObjectSample + CollisionProxy
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
 ```
 
@@ -100,6 +101,24 @@ pub struct MaterialCell {
 ```
 
 当前运行时 chunk 仍保存 `Vec<BlockID>` 作为渲染/碰撞适配视图；`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta` 和后续 FreeObject 迁移。
+
+### `object.rs` — FreeObject
+
+```rust
+pub struct FreeObject {
+    pub id: ObjectID,
+    pub transform: Transform,
+    pub velocity: Vec3,
+    pub angular_velocity: Vec3,
+    pub samples: Vec<ObjectSample>,
+    pub material_summary: MaterialSummary,
+    pub mass: f32,
+    pub collision_proxy: CollisionProxy,
+    pub state: FreeObjectState,
+}
+```
+
+第一版 FreeObject 用于记录硬材质浮空连通块的“提取 → 下落 → 投影”生命周期结果。当前服务器会立即把小型 `FloatingOnly` 连通块投影回静态场，并用 `ServerMessage::FreeObjectProject { object_id, deltas }` 广播投影 delta；后续可把 `FreeObjectState::Dynamic` 接到可见刚体飞行和网络状态。
 
 ### `field.rs` — FieldChunk 原型
 
@@ -327,8 +346,9 @@ pub mod protocol;
 
 pub use block::{BlockID, BlockProperties, MaterialCell, MaterialID, properties};
 pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
-pub use field::{Column, FieldChunk, ObjectID, Span};
+pub use field::{Column, FieldChunk, Span};
 pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
+pub use object::{CollisionProxy, FreeObject, FreeObjectState, ObjectID, ObjectSample};
 pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};
 ```
 

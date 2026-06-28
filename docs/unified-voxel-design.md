@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：原型部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell` 原型、`FieldChunk`/`Column`/`Span` 存储原型、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁，以及 `ImmediateRelaxation` 软材质局部下落/滑落；FreeObject 生命周期和真实流体尚未实现。
+> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，以及 `FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影；真实流体和可见刚体飞行尚未实现。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -88,10 +88,11 @@
 |---|---|---|
 | `core::block` | `BlockID` + 编译期 `BlockProperties`；已新增 `MaterialID`/`MaterialProperties` 过渡别名、`MaterialCell` 原型和 `MaterialRegistry` 查询入口 | 后续迁移为独立 `MaterialRegistry` 与 FieldChunk schema |
 | `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标 | 继续作为当前渲染/碰撞适配格式，网络和存档已由 FieldChunk 承担 |
-| `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护；OPFS 和网络快照均使用 FieldChunk 编码 | 后续扩展 column delta、FreeObject refs 和 region hash |
+| `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护；OPFS 和网络快照均使用 FieldChunk 编码 | 后续扩展 column delta、active FreeObject refs 和 region hash |
+| `core::object` | `FreeObject`、`ObjectSample`、`MaterialSummary`、`CollisionProxy` 与 `FreeObjectState` | 后续接入可见刚体飞行、网络状态和持久化 active object |
 | `core::protocol` | bincode 消息、FieldRequest、FieldSnapshot、FieldDelta、BlockID 操作请求 | 扩展为 ApplyKernel、FreeObject 状态和投影事件 |
-| `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为网络/存档主格式，并持有 FreeObject 和模拟队列 |
-| `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 材质局部下落/滑落原型 | 权威操作仲裁、质量守恒、kernel 应用、稳定性触发 |
+| `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、`free_objects` 投影记录、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为运行时主格式，并持有 active FreeObject 模拟队列 |
+| `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 软材质局部下落/滑落和 `FloatingOnly` 小硬材质连通块即时提取/投影 | 后续扩展质量守恒 kernel、可见刚体运动和更细支撑图 |
 | `render::chunk_mesh` | 方块贪婪网格化、透明方块网格 | 变成 extractor 集合：blocky / smooth / fluid / object mesh |
 | `client::physics` | 玩家 AABB 分轴碰撞、本地预测 | 保留角色控制器，查询统一世界碰撞代理 |
 | `client::raycast` | DDA 命中 solid 方块 | 硬材质 DDA + 平滑材质 field ray query |
@@ -627,7 +628,7 @@ struct FluidCell {
 | StabilityEvent | 坍塌、提取、沉积等权威事件 |
 | FreeObjectSpawn | 创建动态材质团 |
 | FreeObjectState | 低频权威状态、位置、速度、旋转 |
-| FreeObjectProject | 动态物体投影回静态场 |
+| FreeObjectProject | 动态物体投影回静态场；第一版已用于硬材质小连通块即时投影同步 |
 
 ### 12.2 量化
 
@@ -751,14 +752,15 @@ struct FieldChunkRecord {
    - 明确 overflow、混合和拒绝规则。
 
 4. **颗粒松弛**
-   - 已有 BlockID 兼容原型：沙/土/草放置或被挖空下方支撑后，会在 Host / Local-Only 权威侧按小预算局部下落或向斜下滑落。
+   - 已有 BlockID 过渡原型：沙/土/草放置或被挖空下方支撑后，会在 Host / Local-Only 权威侧按小预算局部下落或向斜下滑落。
    - 当前通过多条 `FieldDelta` 同步结果；后续加 column delta / region hash 纠偏。
    - 后续加滞后阈值和更真实的休止角模型避免抖动。
 
 5. **FreeObject 生命周期**
-   - 小石块或沙团从静态提取。
-   - 简化刚体运动。
-   - 静止后 splat 投影回场。
+   - 已有第一版：小型 `FloatingOnly` 硬材质连通块失去支撑后，从静态场提取为 `FreeObject` 记录，整体下落到最近支撑面，并在同一权威步骤投影回 `MaterialField`。
+   - 投影结果通过 `FreeObjectProject { object_id, deltas }` 广播；客户端直接应用 delta 并重网格化受影响 chunk。
+   - 尚未实现可见刚体飞行、碰撞反弹、碎裂和低频 FreeObject 网络状态。
+   - 后续把即时投影替换为分帧动态过程。
 
 6. **结构完整性**
    - 局部 support graph。
@@ -766,7 +768,7 @@ struct FieldChunkRecord {
    - 崩塌事件可重复、可同步。
 
 7. **多人同步语义**
-   - 操作 ack、field delta、region snapshot。
+   - 已有操作 ack、FieldSnapshot、FieldDelta 和 FreeObjectProject。
    - Host 仲裁坍塌、提取和投影。
    - Remote 预测和回滚。
 
@@ -781,7 +783,7 @@ struct FieldChunkRecord {
 1. **MaterialCell 的通道数量**：`primary + secondary` 是否足够？是否需要 per-cell small palette？
 2. **硬软交界提面**：blocky mesh 与 smooth mesh 如何无缝连接？
 3. **支撑图成本**：局部 component 分析在大建筑或大山体上如何限流？
-4. **投影质量守恒**：FreeObject 静止后无法完全写入时如何处理？
+4. **投影质量守恒**：当前硬材质即时投影只处理整格且目标可容纳的下落；后续 FreeObject 静止后无法完全写入时如何处理？
 5. **混合材质规则**：未来沙 + 水、土 + 水、岩石 + 矿物如何表达？
 6. **存档版本**：MaterialID 变化后旧世界如何迁移？
 7. **网络纠偏**：FieldDelta 丢失或乱序时如何用 region hash 修复？

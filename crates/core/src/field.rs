@@ -1,15 +1,14 @@
 //! MaterialField 原型存储结构。
 //!
-//! 当前运行时仍以 [`crate::chunk::Chunk`] 作为网络/渲染兼容格式；本模块提供
-//! `FieldChunk` / `Column` / `Span`，作为后续 FieldSnapshot、OPFS schema 和
-//! 颗粒/FreeObject 质量守恒迁移的核心数据结构。
+//! 当前运行时仍以 [`crate::chunk::Chunk`] 作为渲染/碰撞适配视图；本模块提供
+//! `FieldChunk` / `Column` / `Span`，作为 FieldSnapshot、OPFS schema 和
+//! 颗粒/FreeObject 质量守恒的核心数据结构。
 
 use serde::{Deserialize, Serialize};
 
 use crate::block::{BlockID, MaterialCell};
 use crate::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, DecodeError, STORAGE_VERSION};
-
-pub type ObjectID = u64;
+use crate::object::ObjectID;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct FieldChunk {

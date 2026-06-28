@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use voxweb_core::block::{BlockID, MaterialCell};
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 use voxweb_core::field::FieldChunk;
+use voxweb_core::object::{FreeObject, ObjectID};
 
 use crate::persistence::PersistenceManager;
 use crate::terrain::TerrainGenerator;
@@ -20,8 +21,10 @@ pub const DEFAULT_CHUNK_CACHE_CAPACITY: usize = 4096;
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
-    /// MaterialField 兼容镜像。当前网络/渲染仍使用 `chunks`，但权威写入会同步维护这里。
+    /// MaterialField 镜像。当前渲染/碰撞仍使用 `chunks` 适配视图，但权威写入会同步维护这里。
     pub field_chunks: HashMap<ChunkPos, FieldChunk>,
+    /// 从静态场提取并投影过的材质团。第一版只记录生命周期结果，渲染仍靠投影后的 FieldDelta。
+    pub free_objects: HashMap<ObjectID, FreeObject>,
     pub terrain: TerrainGenerator,
     /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
     pub tick_count: u64,
@@ -34,6 +37,7 @@ pub struct World {
     lru_order: VecDeque<ChunkPos>,
     pinned_chunks: HashSet<ChunkPos>,
     chunk_cache_capacity: usize,
+    next_object_id: ObjectID,
 }
 
 impl World {
@@ -42,6 +46,7 @@ impl World {
             seed,
             chunks: HashMap::new(),
             field_chunks: HashMap::new(),
+            free_objects: HashMap::new(),
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
             dirty_chunks: HashSet::new(),
@@ -49,6 +54,7 @@ impl World {
             lru_order: VecDeque::new(),
             pinned_chunks: HashSet::new(),
             chunk_cache_capacity: DEFAULT_CHUNK_CACHE_CAPACITY,
+            next_object_id: 1,
         }
     }
 
@@ -194,6 +200,26 @@ impl World {
         self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
         self.evict_if_needed();
+    }
+
+    pub fn record_projected_free_object(
+        &mut self,
+        cells: &[(Position, BlockID)],
+        final_offset_y: i32,
+    ) -> Option<ObjectID> {
+        let id = self.next_object_id;
+        self.next_object_id = if self.next_object_id == ObjectID::MAX {
+            1
+        } else {
+            self.next_object_id + 1
+        };
+        let materials = cells
+            .iter()
+            .map(|(pos, block)| (*pos, *block))
+            .collect::<Vec<_>>();
+        let object = FreeObject::projected_from_cells(id, &materials, final_offset_y)?;
+        self.free_objects.insert(id, object);
+        Some(id)
     }
 
     pub fn set_chunk_cache_capacity(&mut self, capacity: usize) {

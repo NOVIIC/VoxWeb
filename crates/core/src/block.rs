@@ -1,4 +1,4 @@
-//! 方块/材质定义：BlockID 兼容层 + MaterialProperties 属性表。
+//! 方块/材质定义：BlockID 过渡层 + MaterialProperties 属性表。
 
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct BlockID(pub u16);
 
 /// 第一版统一体素方案中，MaterialID 暂时复用现有 BlockID 编号。
-/// 这样网络协议、OPFS chunk 编码和渲染路径可以平滑迁移。
+/// 这样网络协议、OPFS chunk 编码和渲染路径可以分阶段迁移。
 pub type MaterialID = BlockID;
 
 impl BlockID {
@@ -199,7 +199,7 @@ pub struct BlockProperties {
 /// 统一体素文档中的 MaterialProperties 名称。当前与 BlockProperties 同源。
 pub type MaterialProperties = BlockProperties;
 
-/// 编译期 MaterialRegistry 兼容入口。
+/// 编译期 MaterialRegistry 过渡入口。
 pub struct MaterialRegistry;
 
 impl MaterialRegistry {

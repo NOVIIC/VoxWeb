@@ -2788,6 +2788,20 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
         }
+        ServerMessage::FreeObjectProject { deltas, .. } => {
+            for (pos, cell) in deltas {
+                let block = cell.to_block_id();
+                if game.mode == GameMode::Remote {
+                    game.server
+                        .borrow_mut()
+                        .world
+                        .set_block_untracked(pos, block);
+                }
+                for cp in affected_chunks(pos) {
+                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                }
+            }
+        }
         ServerMessage::ActionAck {
             request_id,
             accepted,

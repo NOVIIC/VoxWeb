@@ -1,7 +1,7 @@
 //! 通道分配与消息序列化辅助。
 //!
 //! 两条 DataChannel：
-//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、FieldRequest/FieldSnapshot、FieldDelta、ActionAck、Chat、PeerJoined/Left
+//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、FieldRequest/FieldSnapshot、FieldDelta、FreeObjectProject、ActionAck、Chat、PeerJoined/Left
 //! - `unreliable` (unordered + 0 retransmits): PlayerInput、PlayerTick、Ping/Pong
 //!
 //! 选择依据见 docs/networking/protocol.md §三 通道列。
@@ -37,6 +37,7 @@ pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
         | ServerMessage::HostSettings { .. }
         | ServerMessage::FieldSnapshot { .. }
         | ServerMessage::FieldDelta { .. }
+        | ServerMessage::FreeObjectProject { .. }
         | ServerMessage::ActionAck { .. }
         | ServerMessage::PeerJoined { .. }
         | ServerMessage::PeerLeft { .. }

@@ -336,6 +336,7 @@ impl Server {
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -346,6 +347,7 @@ impl Server {
                     );
                     self.enqueue_field_delta(pos, voxweb_core::BlockID::AIR);
                     self.enqueue_field_deltas(relaxed);
+                    self.enqueue_free_object_projections(collapsed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -370,6 +372,7 @@ impl Server {
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -380,6 +383,7 @@ impl Server {
                     );
                     self.enqueue_field_delta(pos, block);
                     self.enqueue_field_deltas(relaxed);
+                    self.enqueue_free_object_projections(collapsed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -605,6 +609,22 @@ impl Server {
     ) {
         for (pos, block) in updates {
             self.enqueue_field_delta(pos, block);
+        }
+    }
+
+    fn enqueue_free_object_projections(&mut self, projections: Vec<physics::FreeObjectProjection>) {
+        for projection in projections {
+            self.enqueue(
+                Recipient::All,
+                ServerMessage::FreeObjectProject {
+                    object_id: projection.object_id,
+                    deltas: projection
+                        .deltas
+                        .into_iter()
+                        .map(|(pos, block)| (pos, MaterialCell::from_block_id(block)))
+                        .collect(),
+                },
+            );
         }
     }
 

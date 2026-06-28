@@ -3,7 +3,7 @@
 //! Phase 3：检查射程（≤ MAX_REACH）、目标方块状态、放置位置不与玩家 AABB 重叠。
 //! Phase 5 引入完整玩家表后，多人挖放的范围/重叠校验复用同一套函数。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use glam::Vec3;
 
@@ -20,6 +20,14 @@ pub const MAX_REACH: f32 = 6.0;
 const RELAXATION_MOVE_BUDGET: usize = 64;
 /// 单次挖放后最多检查多少个候选 cell，限制局部松弛范围。
 const RELAXATION_VISIT_BUDGET: usize = 256;
+/// 单次稳定性检查最多提取多少个硬材质 cell。超过后视为大型地形/建筑，保持静态。
+const FLOATING_COMPONENT_CELL_LIMIT: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreeObjectProjection {
+    pub object_id: voxweb_core::ObjectID,
+    pub deltas: Vec<(Position, BlockID)>,
+}
 
 /// 验证一次挖掘操作。
 /// `player_feet` 是玩家脚底世界坐标；眼睛位置 = `player_feet + Y * PLAYER_EYE_OFFSET`。
@@ -81,7 +89,7 @@ fn distance_to_block_center(player_feet: Vec3, pos: Position) -> f32 {
 
 /// 挖放后立即运行一小段局部颗粒松弛。
 ///
-/// 当前仍基于 `BlockID` dense chunk 做兼容实现：`ImmediateRelaxation` 材质会优先竖直下落，
+/// 当前仍基于 `BlockID` dense chunk 做过渡实现：`ImmediateRelaxation` 材质会优先竖直下落，
 /// 受阻后尝试向斜下方滑落。返回值是需要广播给客户端的权威 `FieldDelta` 序列。
 pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
     let mut updates = Vec::new();
@@ -111,6 +119,156 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, B
     }
 
     updates
+}
+
+/// 第一版硬材质稳定性：`FloatingOnly` 连通块如果完全没有接触任何稳定材质，
+/// 就作为一个 FreeObject 提取、下落到最近支撑面，并立即投影回静态场。
+pub fn resolve_floating_after_edit(
+    world: &mut World,
+    origin: Position,
+) -> Vec<FreeObjectProjection> {
+    let mut projections = Vec::new();
+    let mut checked = HashSet::new();
+
+    for candidate in floating_candidates(origin) {
+        if checked.contains(&candidate) || !chunk_loaded(world, candidate) {
+            continue;
+        }
+        let block = world.get_block(candidate);
+        if properties(block).stability != StabilityPolicy::FloatingOnly {
+            continue;
+        }
+        let Some(component) = collect_floating_component(world, candidate, &mut checked) else {
+            continue;
+        };
+        if component_is_supported(world, &component) {
+            continue;
+        }
+
+        let component_positions = component
+            .iter()
+            .map(|(pos, _)| *pos)
+            .collect::<HashSet<_>>();
+        let fall = projected_fall_distance(world, &component, &component_positions);
+        if fall <= 0 {
+            continue;
+        }
+
+        let Some(object_id) = world.record_projected_free_object(&component, -fall) else {
+            continue;
+        };
+        let mut deltas = Vec::with_capacity(component.len() * 2);
+        for (pos, _) in &component {
+            world.set_block(*pos, BlockID::AIR);
+            deltas.push((*pos, BlockID::AIR));
+        }
+        for (pos, block) in &component {
+            let target = Position::new(pos.x, pos.y - fall, pos.z);
+            world.set_block(target, *block);
+            deltas.push((target, *block));
+        }
+        projections.push(FreeObjectProjection { object_id, deltas });
+    }
+
+    projections
+}
+
+fn floating_candidates(origin: Position) -> [Position; 11] {
+    [
+        origin,
+        Position::new(origin.x, origin.y + 1, origin.z),
+        Position::new(origin.x, origin.y - 1, origin.z),
+        Position::new(origin.x + 1, origin.y, origin.z),
+        Position::new(origin.x - 1, origin.y, origin.z),
+        Position::new(origin.x, origin.y, origin.z + 1),
+        Position::new(origin.x, origin.y, origin.z - 1),
+        Position::new(origin.x + 1, origin.y + 1, origin.z),
+        Position::new(origin.x - 1, origin.y + 1, origin.z),
+        Position::new(origin.x, origin.y + 1, origin.z + 1),
+        Position::new(origin.x, origin.y + 1, origin.z - 1),
+    ]
+}
+
+fn collect_floating_component(
+    world: &World,
+    start: Position,
+    checked: &mut HashSet<Position>,
+) -> Option<Vec<(Position, BlockID)>> {
+    let mut component = Vec::new();
+    let mut queue = VecDeque::from([start]);
+
+    while let Some(pos) = queue.pop_front() {
+        if !checked.insert(pos) {
+            continue;
+        }
+        if !chunk_loaded(world, pos) {
+            continue;
+        }
+        let block = world.get_block(pos);
+        if properties(block).stability != StabilityPolicy::FloatingOnly {
+            continue;
+        }
+        component.push((pos, block));
+        if component.len() > FLOATING_COMPONENT_CELL_LIMIT {
+            return None;
+        }
+        for neighbor in six_neighbors(pos) {
+            if !checked.contains(&neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+
+    Some(component)
+}
+
+fn component_is_supported(world: &World, component: &[(Position, BlockID)]) -> bool {
+    let positions = component
+        .iter()
+        .map(|(pos, _)| *pos)
+        .collect::<HashSet<_>>();
+    component.iter().any(|(pos, _)| {
+        six_neighbors(*pos).into_iter().any(|neighbor| {
+            if positions.contains(&neighbor) || neighbor.y < 0 || neighbor.y >= CHUNK_Y as i32 {
+                return false;
+            }
+            let block = world.get_block(neighbor);
+            block != BlockID::AIR && properties(block).solid
+        })
+    })
+}
+
+fn projected_fall_distance(
+    world: &World,
+    component: &[(Position, BlockID)],
+    component_positions: &HashSet<Position>,
+) -> i32 {
+    let mut distance = 0;
+    'fall: loop {
+        let next = distance + 1;
+        for (pos, _) in component {
+            let target = Position::new(pos.x, pos.y - next, pos.z);
+            if target.y <= 0 || !chunk_loaded(world, target) {
+                break 'fall;
+            }
+            if !component_positions.contains(&target) && world.get_block(target) != BlockID::AIR {
+                break 'fall;
+            }
+        }
+        distance = next;
+    }
+    distance
+}
+
+fn six_neighbors(pos: Position) -> [Position; 6] {
+    [
+        Position::new(pos.x + 1, pos.y, pos.z),
+        Position::new(pos.x - 1, pos.y, pos.z),
+        Position::new(pos.x, pos.y + 1, pos.z),
+        Position::new(pos.x, pos.y - 1, pos.z),
+        Position::new(pos.x, pos.y, pos.z + 1),
+        Position::new(pos.x, pos.y, pos.z - 1),
+    ]
 }
 
 fn enqueue_relaxation_region(queue: &mut VecDeque<Position>, origin: Position) {
@@ -414,5 +572,92 @@ mod tests {
 
         assert_eq!(w.get_block(from), BlockID::AIR);
         assert_eq!(w.get_block(target), BlockID::SAND);
+    }
+
+    #[test]
+    fn floating_hard_block_projects_to_nearest_support() {
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        clear_box(&mut w, 6..=10, 1..=8, 6..=10);
+        let floating = Position::new(8, 5, 8);
+        let settled = Position::new(8, 1, 8);
+        w.set_block(floating, BlockID::STONE_BRICKS);
+
+        let projections = resolve_floating_after_edit(&mut w, floating);
+        let updates = projection_deltas(&projections);
+
+        assert_eq!(w.get_block(floating), BlockID::AIR);
+        assert_eq!(w.get_block(settled), BlockID::STONE_BRICKS);
+        assert!(updates.contains(&(floating, BlockID::AIR)));
+        assert!(updates.contains(&(settled, BlockID::STONE_BRICKS)));
+        assert_eq!(projections.len(), 1);
+        assert_eq!(w.free_objects.len(), 1);
+        let object = w.free_objects.values().next().unwrap();
+        assert_eq!(object.samples.len(), 1);
+        assert_eq!(object.state, voxweb_core::FreeObjectState::Projected);
+    }
+
+    #[test]
+    fn floating_hard_component_projects_as_one_object() {
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        clear_box(&mut w, 6..=11, 1..=8, 6..=10);
+        let a = Position::new(8, 5, 8);
+        let b = Position::new(9, 5, 8);
+        w.set_block(a, BlockID::STONE_BRICKS);
+        w.set_block(b, BlockID::WOOD);
+
+        let projections = resolve_floating_after_edit(&mut w, a);
+        let updates = projection_deltas(&projections);
+
+        assert_eq!(w.get_block(a), BlockID::AIR);
+        assert_eq!(w.get_block(b), BlockID::AIR);
+        assert_eq!(w.get_block(Position::new(8, 1, 8)), BlockID::STONE_BRICKS);
+        assert_eq!(w.get_block(Position::new(9, 1, 8)), BlockID::WOOD);
+        assert!(updates.contains(&(Position::new(8, 1, 8), BlockID::STONE_BRICKS)));
+        assert!(updates.contains(&(Position::new(9, 1, 8), BlockID::WOOD)));
+        assert_eq!(projections.len(), 1);
+        assert_eq!(w.free_objects.len(), 1);
+        assert_eq!(w.free_objects.values().next().unwrap().samples.len(), 2);
+    }
+
+    #[test]
+    fn grounded_floating_only_component_stays_static() {
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        clear_box(&mut w, 6..=10, 1..=8, 6..=10);
+        let base = Position::new(8, 1, 8);
+        let top = Position::new(8, 2, 8);
+        w.set_block(base, BlockID::STONE_BRICKS);
+        w.set_block(top, BlockID::STONE_BRICKS);
+
+        let projections = resolve_floating_after_edit(&mut w, top);
+
+        assert!(projections.is_empty());
+        assert_eq!(w.get_block(base), BlockID::STONE_BRICKS);
+        assert_eq!(w.get_block(top), BlockID::STONE_BRICKS);
+        assert!(w.free_objects.is_empty());
+    }
+
+    fn clear_box(
+        world: &mut World,
+        xs: std::ops::RangeInclusive<i32>,
+        ys: std::ops::RangeInclusive<i32>,
+        zs: std::ops::RangeInclusive<i32>,
+    ) {
+        for x in xs.clone() {
+            for y in ys.clone() {
+                for z in zs.clone() {
+                    world.set_block(Position::new(x, y, z), BlockID::AIR);
+                }
+            }
+        }
+    }
+
+    fn projection_deltas(projections: &[FreeObjectProjection]) -> Vec<(Position, BlockID)> {
+        projections
+            .iter()
+            .flat_map(|projection| projection.deltas.iter().copied())
+            .collect()
     }
 }

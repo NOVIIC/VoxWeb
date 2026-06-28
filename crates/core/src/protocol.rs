@@ -6,14 +6,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::block::{BlockID, MaterialCell};
 use crate::chunk::{ChunkPos, Position};
+use crate::object::ObjectID;
 
 // —— 协议常量 ——
 
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v7：世界快照/单点更新切到 FieldChunk / MaterialCell 语义。
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8：硬材质 FreeObject 即时投影事件接入网络语义。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// FieldSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -134,6 +135,11 @@ pub enum ServerMessage {
     },
     /// 单 cell 更新（挖放结果广播）
     FieldDelta { pos: Position, cell: MaterialCell },
+    /// FreeObject 投影回静态场。当前用于 FloatingOnly 硬材质小连通块即时坍落。
+    FreeObjectProject {
+        object_id: ObjectID,
+        deltas: Vec<(Position, MaterialCell)>,
+    },
     /// 挖放请求的仲裁结果
     ActionAck {
         request_id: u32,
@@ -336,9 +342,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_seven() {
-        // FieldSnapshot / FieldDelta 网络语义为 v7；破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 7);
+    fn protocol_version_is_eight() {
+        // FreeObjectProject 网络语义为 v8；破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -375,6 +381,17 @@ mod tests {
             request_id: 43,
             accepted: false,
             reason: AckReason::OutOfRange,
+        });
+    }
+
+    #[test]
+    fn roundtrip_free_object_project() {
+        roundtrip(&ServerMessage::FreeObjectProject {
+            object_id: 7,
+            deltas: vec![(
+                Position::new(1, 2, 3),
+                MaterialCell::from_block_id(BlockID::STONE_BRICKS),
+            )],
         });
     }
 
