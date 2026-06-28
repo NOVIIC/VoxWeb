@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::block::{BlockID, MaterialCell};
-use crate::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
+use crate::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, DecodeError, STORAGE_VERSION};
 
 pub type ObjectID = u64;
 
@@ -28,6 +28,12 @@ pub struct Span {
     pub y_start: u16,
     pub length: u16,
     pub cell: MaterialCell,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredFieldChunk {
+    version: u8,
+    field: FieldChunk,
 }
 
 impl FieldChunk {
@@ -72,6 +78,54 @@ impl FieldChunk {
     pub fn set(&mut self, lx: usize, ly: usize, lz: usize, cell: MaterialCell) {
         self.columns[column_index(lx, lz)].set(ly, cell);
     }
+}
+
+/// OPFS 存盘用编码：`StoredFieldChunk { version, field }`。
+pub fn encode(field: &FieldChunk) -> Vec<u8> {
+    let stored = StoredFieldChunk {
+        version: STORAGE_VERSION,
+        field: field.clone(),
+    };
+    crate::protocol::encode(&stored).expect("StoredFieldChunk serialization should not fail")
+}
+
+/// OPFS 存盘用解码。当前只接受 v2 `StoredFieldChunk` 格式。
+pub fn decode(bytes: &[u8]) -> Result<FieldChunk, DecodeError> {
+    let stored: StoredFieldChunk =
+        crate::protocol::decode(bytes).map_err(|e| DecodeError::Corrupted(e.to_string()))?;
+    if stored.version != STORAGE_VERSION {
+        return Err(DecodeError::VersionMismatch {
+            found: stored.version,
+            expected: STORAGE_VERSION,
+        });
+    }
+    validate_field_chunk(&stored.field)?;
+    Ok(stored.field)
+}
+
+fn validate_field_chunk(field: &FieldChunk) -> Result<(), DecodeError> {
+    if field.columns.len() != CHUNK_X * CHUNK_Z {
+        return Err(DecodeError::LengthMismatch(field.columns.len()));
+    }
+    for column in field.columns.iter() {
+        match column {
+            Column::Spans(spans) => {
+                for span in spans {
+                    let start = span.y_start as usize;
+                    let end = start.saturating_add(span.length as usize);
+                    if span.length == 0 || end > CHUNK_Y {
+                        return Err(DecodeError::LengthMismatch(end));
+                    }
+                }
+            }
+            Column::Dense(cells) => {
+                if cells.len() != CHUNK_Y {
+                    return Err(DecodeError::LengthMismatch(cells.len()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Column {
@@ -211,5 +265,54 @@ mod tests {
         let column = &field.columns[column_index(2, 2)];
         assert!(column.is_dense());
         assert_eq!(field.get(2, 10, 2), MaterialCell::full(BlockID::GLASS));
+    }
+
+    #[test]
+    fn stored_field_chunk_roundtrip() {
+        let mut chunk = Chunk::empty();
+        chunk.set(0, 0, 0, BlockID::BEDROCK);
+        chunk.set(0, 1, 0, BlockID::STONE);
+        chunk.set(4, 70, 5, BlockID::SAND);
+        let field = FieldChunk::from_chunk(&chunk);
+
+        let bytes = encode(&field);
+        let decoded = decode(&bytes).expect("decode field");
+
+        assert_eq!(decoded, field);
+        assert_eq!(decoded.to_chunk(), chunk);
+    }
+
+    #[test]
+    fn stored_field_chunk_rejects_wrong_column_count() {
+        let malformed = StoredFieldChunk {
+            version: STORAGE_VERSION,
+            field: FieldChunk {
+                columns: vec![Column::empty()].into_boxed_slice(),
+                free_object_refs: Vec::new(),
+            },
+        };
+        let bytes = crate::protocol::encode(&malformed).unwrap();
+
+        assert!(matches!(
+            decode(&bytes),
+            Err(DecodeError::LengthMismatch(1))
+        ));
+    }
+
+    #[test]
+    fn stored_field_chunk_rejects_future_version() {
+        let stored = StoredFieldChunk {
+            version: STORAGE_VERSION + 1,
+            field: FieldChunk::empty(),
+        };
+        let bytes = crate::protocol::encode(&stored).unwrap();
+
+        assert_eq!(
+            decode(&bytes),
+            Err(DecodeError::VersionMismatch {
+                found: STORAGE_VERSION + 1,
+                expected: STORAGE_VERSION,
+            })
+        );
     }
 }

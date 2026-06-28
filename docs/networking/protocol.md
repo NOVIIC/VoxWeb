@@ -22,13 +22,14 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 6; // Host 视距上限同步
+pub const PROTOCOL_VERSION: u32 = 7; // FieldSnapshot / FieldDelta 网络语义
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
 
 | 版本 | 变化 |
 |---|---|
+| v7 | `ChunkRequest` 改为 `FieldRequest`；`ChunkSnapshot` 改为 `FieldSnapshot`，payload 使用 `field::encode(FieldChunk)`；`BlockUpdate` 改为 `FieldDelta { pos, cell: MaterialCell }` |
 | v6 | `Welcome` 增加 `host_render_distance: u32`；`ChunkRequest` 增加 `center` / `render_distance`；新增 `HostSettings` 用于 Host 视距变化通知 |
 | v5 | 新增 `ClientMessage::ChunkRequest { chunks: Vec<ChunkPos> }`；Remote 移动或渲染距离变化时向 Host 请求视距内缺失区块 |
 | v4 | `Break` / `Place` 增加 `input_tick: u32` 与 `player_position: Vec3`；Host 用点击时玩家脚底位置校验挖放范围，避免高 RTT / unreliable 丢包时用旧位置误拒 |
@@ -45,7 +46,7 @@ pub const PROTOCOL_VERSION: u32 = 6; // Host 视距上限同步
 |---|---|---|---|---|
 | `Hello` | reliable | 一次（连接建立后） | `display_name: String, version: u32` | 加入握手 |
 | `PlayerInput` | unreliable | 60Hz | `tick: u32, position: Vec3, yaw: f32, pitch: f32` | 玩家移动同步；`tick` 是该客户端本地单调递增的输入序号 |
-| `ChunkRequest` | reliable | 按需 | `center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>` | Remote 请求 Host 发送自己有效视距内缺失的 chunk |
+| `FieldRequest` | reliable | 按需 | `center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>` | Remote 请求 Host 发送自己有效视距内缺失的 FieldChunk |
 | `Break` | reliable | 按需 | `pos: Position, request_id: u32, input_tick: u32, player_position: Vec3` | 挖方块；携带点击时脚底位置用于高延迟范围校验 |
 | `Place` | reliable | 按需 | `pos: Position, block: BlockID, request_id: u32, input_tick: u32, player_position: Vec3` | 放方块；携带点击时脚底位置用于高延迟范围/重叠校验 |
 | `Chat` | reliable | 按需 | `content: String` | 文字聊天（≤ 256 字符） |
@@ -57,8 +58,8 @@ pub const PROTOCOL_VERSION: u32 = 6; // Host 视距上限同步
 | 消息 | 通道 | 频率 | 字段 | 接收对象 | 说明 |
 |---|---|---|---|---|---|
 | `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单；v6 起含 Host 视距上限） |
-| `ChunkSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 chunk 数据，分片 |
-| `BlockUpdate` | reliable | 按需 | `pos: Position, block: BlockID` | 广播 | 单方块变更 |
+| `FieldSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 FieldChunk 数据，分片 |
+| `FieldDelta` | reliable | 按需 | `pos: Position, cell: MaterialCell` | 广播 | 单 cell 变更 |
 | `ActionAck` | reliable | 应答 | `request_id: u32, accepted: bool, reason: AckReason` | 单一 | 挖放应答 |
 | `PlayerTick` | unreliable | 60Hz | `tick: u32, players: Vec<PlayerSnapshot>, server_time_ms: u64` | 广播 | 全员位置广播 |
 | `PeerJoined` | reliable | 按需 | `entity_id: u32, display_name: String` | 广播（除新加入者） | 新玩家加入通告 |
@@ -73,13 +74,14 @@ pub const PROTOCOL_VERSION: u32 = 6; // Host 视距上限同步
 | 类型 | 含义 |
 |---|---|
 | `BlockID` | `u16` |
+| `MaterialCell` | `{ occupancy: u8, primary: MaterialID, secondary: Option<MixSlot>, flags: CellFlags }` |
 | `Position` | `{ x: i32, y: i32, z: i32 }` |
 | `ChunkPos` | `{ x: i32, z: i32 }` |
 | `Vec3` | `[f32; 3]`（glam::Vec3 的 serde 表示） |
 | `String` | UTF-8，bincode 默认带 varint 长度前缀 |
 | `u32 request_id` | 客户端单调递增，用于 ActionAck 配对 |
 | `PlayerInput.tick` | 客户端本地 60Hz 输入序号，用于服务端丢弃乱序输入，也用于客户端协调 |
-| `ChunkRequest.render_distance` | Remote 已按 Host 上限裁剪后的有效视距；Host 再取 `min(request, host_render_distance)` 做最终校验 |
+| `FieldRequest.render_distance` | Remote 已按 Host 上限裁剪后的有效视距；Host 再取 `min(request, host_render_distance)` 做最终校验 |
 | `Break/Place.input_tick` | 玩家点击时已生成的最新本地输入序号；用于日志/调试，并允许 Host 判断该操作来自哪个预测时刻 |
 | `Break/Place.player_position` | 玩家点击时的脚底位置；Host 用它做挖放距离和放置重叠校验，避免可靠操作包先于最新 `PlayerInput` 到达时被旧位置误拒 |
 | `PlayerTick.tick` | 服务端 60Hz 累计 tick，用于远端插值、调试和 UI |
@@ -103,9 +105,9 @@ DataChannel 双通道 OPEN
    │                                       server.add_player → entity_id
    │◀── (reliable) Welcome{entity_id, server_tick, world_seed, host_render_distance}
    │
-   │◀── (reliable) bootstrap ChunkSnapshot（出生点默认半径）
-   │── (reliable) ChunkRequest{chunks=[视距内缺失区块]} ─▶
-   │◀── (reliable) ChunkSnapshot 分片（补齐 Remote 视距）
+   │◀── (reliable) bootstrap FieldSnapshot（出生点默认半径）
+   │── (reliable) FieldRequest{chunks=[视距内缺失区块]} ─▶
+   │◀── (reliable) FieldSnapshot 分片（补齐 Remote 视距）
    │
    │◀── (reliable) PeerJoined{entity_id=X, name="Alice"}（其它老玩家收到）
    │
@@ -116,60 +118,59 @@ DataChannel 双通道 OPEN
 
 ---
 
-## 五、Chunk 快照同步
+## 五、Field 快照同步
 
 Remote 客户端应始终维护自己视距范围内的 chunk 集合。
 
 - 加入房间时 Host 先推送出生点附近的 bootstrap 快照（当前半径 6），让默认设置能尽快预载。
 - Remote 收到 `Welcome` 后计算有效视距 `effective_render_distance = min(local_render_distance, host_render_distance)`，按该半径请求缺失区块；渲染距离大于 bootstrap 半径时会立刻请求外圈。
 - InGame 后 Remote 每次跨 chunk 边界或渲染距离变化，都会重新计算 desired 集合，只请求尚未加载且不在 in-flight 的缺失区块。
-- Host 收到请求后先确认请求中心离服务端记录的玩家位置足够近，再按 `min(request.render_distance, host_render_distance)` 校验每个 chunk，合法才 `ensure_chunk_generated` 并用 `ChunkSnapshot` 分片回传。
+- Host 收到请求后先确认请求中心离服务端记录的玩家位置足够近，再按 `min(request.render_distance, host_render_distance)` 校验每个 chunk，合法才 `ensure_chunk_generated` 并用 `FieldSnapshot` 分片回传。
 - Host 修改自身视距时广播 `HostSettings`；Remote 收到后立即更新有效视距并在下一帧卸载超出范围的本地缓存。
 
-### palette+RLE 压缩编码
+### FieldChunk 编码
 
-Chunk 发送前通过 `encode_chunk()` 压缩为 palette+RLE 格式（定义在 `crates/core/src/chunk.rs`）：
+FieldSnapshot 发送前通过 `voxweb_core::field::encode(field)` 编码 `FieldChunk`：
 
 ```rust
-struct CompressedChunk {
-    palette: Vec<BlockID>,      // 本 chunk 出现的所有不同 BlockID（按首次出现顺序）
-    runs: Vec<(u16, u32)>,      // (palette_index, run_length) 连续相同方块的 run
+struct StoredFieldChunk {
+    version: u8,
+    field: FieldChunk,
 }
 ```
 
-编码后整体做 bincode 序列化，作为 `ChunkSnapshot.payload`。
+编码后整体做 bincode 序列化，作为 `FieldSnapshot.payload`。`FieldChunk` 内部使用 16×16 column store：自然地形列为 `Column::Spans(Vec<Span>)`，高熵编辑列可退化为 `Column::Dense(Box<[MaterialCell]>)`。
 
-| Chunk 内容 | 压缩前 (raw bincode Vec<u16>) | 压缩后 (palette+RLE) |
+| FieldChunk 内容 | dense 等价大小 | FieldChunk 编码后 |
 |---|---|---|
-| 全 AIR | ~131 KB | < 20 B |
-| 全 STONE | ~131 KB | < 20 B |
-| 典型地形（草/泥/石/空气） | ~131 KB | 2-5 KB |
-| 高多样性建筑 | ~131 KB | 8-20 KB |
+| 全 AIR | ~128 KB | < 20 B |
+| 全 STONE | ~128 KB | < 20 B |
+| 典型地形（草/泥/石/空气） | ~128 KB | 2-5 KB |
+| 高多样性建筑 | ~128 KB | 8-20 KB |
 
-典型地形压缩比约 **30x-60x**，初始快照（169 chunk）从 ~22 MB 降至 ~0.5 MB。
+典型地形压缩比约 **30x-60x**，初始快照（169 chunk）从 ~22 MB dense 等价降至约 ~0.5 MB。
 
 ### 分片规则
 
 ```
-单个 chunk 压缩后 payload 远小于原始 131KB
+单个 FieldChunk 编码后 payload 通常远小于 dense 等价大小
 DataChannel SCTP 用户消息上限 ≈ 16KB（不同浏览器实现略异，保守 14KB）
 
 → payload 切片为 ≤ 14336 字节
 → 每片附 (frag_index, frag_total) header
-→ 接收端按 ChunkPos 维度组装，齐了就 decode_chunk 解压
+→ 接收端按 ChunkPos 维度组装，齐了就 field::decode 解码
 ```
 
-典型地形 chunk 压缩后仅 2-5 KB，**大多数 chunk 不需分片**（frag_total=1）。
+典型地形 FieldChunk 编码后仅 2-5 KB，**大多数 chunk 不需分片**（frag_total=1）。
 
 ### 接收端组装
 
-ChunkAssembler 只负责拼字节，不关心编码格式。组装完成后调用 `decode_chunk()` 解压为 `Vec<BlockID>`。
+ChunkAssembler 只负责拼字节，不关心编码格式。组装完成后调用 `field::decode()` 解码为 `FieldChunk`，再写入 `server.world.load_field_chunk_from_storage` 同步 FieldChunk 与 dense Chunk 视图。
 
 ```rust
-// 组装器入口不变；解码层从 protocol::decode → chunk::decode_chunk
 if let Some(full) = assembler.ingest(pos, frag_index, frag_total, payload) {
-    let blocks = voxweb_core::chunk::decode_chunk(&full)?;
-    // blocks.len() == CHUNK_SIZE (65536)
+    let field = voxweb_core::field::decode(&full)?;
+    server.load_field_chunk_from_storage(pos, field);
 }
 ```
 
@@ -180,7 +181,7 @@ if let Some(full) = assembler.ingest(pos, frag_index, frag_total, payload) {
 - `PeerConnection::send()` 发送后检查 `bufferedAmount`，超过 **1 MB 高水位**时设置暂停标志
 - 暂停后该 peer 的 reliable 消息被推迟到下帧发送，等待 `onbufferedamountlow` 事件清除暂停标志
 - `host_route_outbox()` 返回流控阻塞的未发送消息，由 `flush_server_outbox()` 重新入队 server.outbox
-- 中继模式额外使用 Worker 下发的 `max_rate` 做客户端本地令牌桶节流（默认按 80% 留余量）；高视距产生的大量 `ChunkSnapshot` 会分帧发送，避免触发 `relay_closed{reason:"rate_limit"}`
+- 中继模式额外使用 Worker 下发的 `max_rate` 做客户端本地令牌桶节流（默认按 80% 留余量）；高视距产生的大量 `FieldSnapshot` 会分帧发送，避免触发 `relay_closed{reason:"rate_limit"}`
 
 ---
 
@@ -227,18 +228,18 @@ Remote                          Host
                                             world.set_block AIR
                                             relaxed = relax_after_edit(pos)
                                             outbox: ActionAck{42, accepted=true}
-                                            outbox: BlockUpdate{(10,64,5), AIR}（广播）
-                                            outbox: relaxed BlockUpdate...（广播）
+                                            outbox: FieldDelta{(10,64,5), AIR cell}（广播）
+                                            outbox: relaxed FieldDelta...（广播）
                                           NG：
                                             outbox: ActionAck{42, accepted=false, reason}
    ◀── (reliable) ActionAck{42, accepted=true}
    prediction.commit(42)
-   ◀── (reliable) BlockUpdate{(10,64,5), AIR}
-   client.world_view.set_block AIR
+   ◀── (reliable) FieldDelta{(10,64,5), AIR cell}
+   client.world_view.set_cell AIR
    mesh_jobs.enqueue(chunk_pos)
 ```
 
-若被挖放的材质或其邻近材质触发 `ImmediateRelaxation`，Host 会在同一可靠通道继续广播一串普通 `BlockUpdate`。Remote 不独立决定最终滑落位置，只把这些更新按顺序写入本地世界并重网格化受影响 chunk。
+若被挖放的材质或其邻近材质触发 `ImmediateRelaxation`，Host 会在同一可靠通道继续广播一串 `FieldDelta`。Remote 不独立决定最终滑落位置，只把这些更新按顺序写入本地世界并重网格化受影响 chunk。
 
 ```
 若 ActionAck.accepted=false：
@@ -288,15 +289,15 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 | `PlayerInput` | 24 字节 | varint 后 |
 | `PlayerTick`（4 玩家，delta） | ~30-120 字节 | delta 模式下多数 tick 只含 0-2 个玩家 |
 | `PlayerTick`（8 玩家，全量） | ~220 字节 | 每 0.5s 强制全量 |
-| `ChunkRequest`（一次移动外圈） | 100-400 字节 | 请求中心 + 有效视距 + 缺失 `ChunkPos` 列表；完整视距首包最多约 441 个 chunk |
+| `FieldRequest`（一次移动外圈） | 100-400 字节 | 请求中心 + 有效视距 + 缺失 `ChunkPos` 列表；完整视距首包最多约 441 个 chunk |
 | `Break/Place` | 16-20 字节 | |
-| `BlockUpdate` | 16 字节 | |
-| `ChunkSnapshot`（典型地形 chunk） | 2-5 KB | palette+RLE 压缩后；通常不需分片 |
-| `ChunkSnapshot`（高多样性 chunk） | 8-20 KB | 可能需要 1-2 片 |
+| `FieldDelta` | 20-40 字节 | 取决于 `MaterialCell` secondary slot |
+| `FieldSnapshot`（典型地形 chunk） | 2-5 KB | FieldChunk column store 编码后；通常不需分片 |
+| `FieldSnapshot`（高多样性 chunk） | 8-20 KB | 可能需要 1-2 片 |
 | `Chat`（短消息） | 30-100 字节 | |
 | `ActionAck` | 12 字节 | |
 
-bootstrap 初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB）。渲染距离更大时，Remote 会通过 `ChunkRequest` 只补请求外圈。
+bootstrap 初始快照（169 chunk）：典型地形 ~0.5 MB（dense 等价 ~22 MB）。渲染距离更大时，Remote 会通过 `FieldRequest` 只补请求外圈。
 
 ---
 
@@ -317,6 +318,6 @@ bootstrap 初始快照（169 chunk）：典型地形 ~0.5 MB（压缩前 ~22 MB�
 
 ## 十一、可选演进
 
-- 操作日志同步（让 Remote 重放 BlockUpdate 历史，避免重复全量同步）
+- 操作日志同步（让 Remote 重放 FieldDelta 历史，避免重复全量同步）
 - 端到端加密（双重保险）
 - 更复杂的 Welcome 流程（双向能力协商，如纹理包版本）

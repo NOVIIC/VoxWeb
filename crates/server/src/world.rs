@@ -28,7 +28,7 @@ pub struct World {
     /// Phase 5：被 set_block 修改过的 ChunkPos 集合。
     /// 持久化层（Phase 8）通过 drain_dirty 取出待写；Phase 5 暂不消费。
     pub dirty_chunks: HashSet<ChunkPos>,
-    /// Phase 8：dirty / in-flight / retry 状态机。保留 `dirty_chunks` 是为了兼容旧测试和旧入口。
+    /// Phase 8：dirty / in-flight / retry 状态机。`dirty_chunks` 保留为轻量只读视图，便于测试和调试。
     pub persistence: PersistenceManager,
     /// 简易 LRU 顺序表。front 旧、back 新；容量不引入外部 crate。
     lru_order: VecDeque<ChunkPos>,
@@ -156,7 +156,7 @@ impl World {
         drained
     }
 
-    /// 将 dirty 移入 in-flight，并同步旧 dirty 集合。
+    /// 将 dirty 移入 in-flight，并同步 `dirty_chunks` 视图。
     pub fn snapshot_dirty(&mut self, limit: usize, current_tick: u64) -> Vec<ChunkPos> {
         let positions = self.persistence.snapshot_dirty(limit, current_tick);
         for pos in &positions {
@@ -165,7 +165,7 @@ impl World {
         positions
     }
 
-    /// 持久化写入成功后同时清理新旧 dirty 状态。
+    /// 持久化写入成功后清理 dirty 状态。
     pub fn commit_flushed(&mut self, positions: &[ChunkPos]) {
         for pos in positions {
             self.dirty_chunks.remove(pos);
@@ -173,7 +173,7 @@ impl World {
         self.persistence.commit_flushed(positions);
     }
 
-    /// 持久化写入失败后同时恢复新旧 dirty 状态。
+    /// 持久化写入失败后恢复 dirty 状态。
     pub fn record_flush_failure(&mut self, positions: &[ChunkPos], current_tick: u64) {
         for pos in positions {
             self.dirty_chunks.insert(*pos);
@@ -187,9 +187,9 @@ impl World {
         self.tick_count += 1;
     }
 
-    /// 直接载入持久化层读出的 chunk，不标 dirty。
-    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: Chunk) {
-        let field = FieldChunk::from_chunk(&chunk);
+    /// 直接载入持久化层读出的 FieldChunk，不标 dirty。
+    pub fn load_field_chunk_from_storage(&mut self, pos: ChunkPos, field: FieldChunk) {
+        let chunk = field.to_chunk();
         self.chunks.insert(pos, chunk);
         self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_flushed_clears_legacy_dirty_set() {
+    fn commit_flushed_clears_dirty_view() {
         let mut world = World::new(0);
         let cp = ChunkPos::new(0, 0);
         world.ensure_chunk_generated(cp);
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn record_flush_failure_restores_legacy_dirty_set() {
+    fn record_flush_failure_restores_dirty_view() {
         let mut world = World::new(0);
         let cp = ChunkPos::new(0, 0);
         world.ensure_chunk_generated(cp);

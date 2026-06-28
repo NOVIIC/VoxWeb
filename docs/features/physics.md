@@ -356,7 +356,7 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 服务端仲裁按材质属性执行额外规则：y=0 永远视为世界底部边界；`properties(block).breakable == false` 的材质不可挖（当前为 BEDROCK）；放置请求只能使用 `appears_in_hotbar == true` 的材质，防止客户端通过协议放置 AIR / BEDROCK 等非创造模式材料。
 
-`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果仍通过现有多条 `BlockUpdate` 同步给 Remote。
+`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote。
 
 ### 8.1 视觉反馈
 
@@ -378,8 +378,8 @@ fn on_left_click(&mut self) {
 
     let request_id = self.prediction.next_request_id();
 
-    // 乐观更新（仅 Remote 角色；Local-Only 等服务端 BlockUpdate）
-    // 软材质后续滑落以 Host 返回的额外 BlockUpdate 为准。
+    // 乐观更新（仅 Remote 角色；Local-Only 等服务端 FieldDelta）
+    // 软材质后续滑落以 Host 返回的额外 FieldDelta 为准。
     if matches!(self.role, Role::Remote) {
         let backup = self.world_view.get_block(hit.block_pos);
         self.prediction.pending_actions.insert(request_id, PendingAction {

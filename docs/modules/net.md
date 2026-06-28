@@ -174,7 +174,7 @@ impl SignalingClient {
 }
 ```
 
-`RelayActive.max_rate` 会被 Host 端记录为本地中继发送令牌桶的上限；`host_route_outbox()` 在真正调用 `send_relay_binary()` 前预扣 token，预算不足时把当前及后续 outbox 消息推迟到下一帧，避免高视距 ChunkSnapshot 突发触发 Worker 的 `rate_limit`。
+`RelayActive.max_rate` 会被 Host 端记录为本地中继发送令牌桶的上限；`host_route_outbox()` 在真正调用 `send_relay_binary()` 前预扣 token，预算不足时把当前及后续 outbox 消息推迟到下一帧，避免高视距 FieldSnapshot 突发触发 Worker 的 `rate_limit`。
 
 **注意**：`web_sys::WebSocket` 的事件回调通过 `Closure<dyn FnMut(...)>` 注册，回调内只能 `inbox.borrow_mut().push_back(event)`，不能直接做长时间工作（保持回调短）。
 
@@ -220,7 +220,7 @@ pub enum ChannelKind { Reliable, Unreliable }
 
 | 通道 | 配置 | 用途 |
 |---|---|---|
-| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | ChunkRequest, ChunkSnapshot, HostSettings, BlockUpdate, Chat, Hello/Welcome, ActionAck, Join/Leave |
+| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | FieldRequest, FieldSnapshot, HostSettings, FieldDelta, Chat, Hello/Welcome, ActionAck, Join/Leave |
 | `unreliable` | `ordered: false, maxRetransmits: 0, maxPacketLifeTime: null` | PlayerInput, PlayerTick, Ping/Pong |
 
 `maxRetransmits: 0` 实现"发出去就完事"，丢失不重传，适合频繁的位置广播。
@@ -377,14 +377,14 @@ Local 通道不区分 reliable/unreliable，单 mpsc 即可；Host / Remote 走�
 |---|---|---|
 | `ClientMessage::Hello` | reliable | 不能丢，需 ack |
 | `ClientMessage::PlayerInput` | unreliable | 60Hz 高频，丢一两帧不影响 |
-| `ClientMessage::ChunkRequest` | reliable | Remote 缺失区块必须送达 |
+| `ClientMessage::FieldRequest` | reliable | Remote 缺失区块必须送达 |
 | `ClientMessage::Break/Place` | reliable | 一次性操作必须送达 |
 | `ClientMessage::Chat` | reliable | 同上 |
 | `ClientMessage::Ping` | unreliable | 时延探测，丢失忽略 |
 | `ServerMessage::Welcome` | reliable | 必须送达 |
 | `ServerMessage::HostSettings` | reliable | Host 视距上限变化，必须送达 |
-| `ServerMessage::ChunkSnapshot` | reliable | 不能丢、按序 |
-| `ServerMessage::BlockUpdate` | reliable | 状态不可丢 |
+| `ServerMessage::FieldSnapshot` | reliable | 不能丢、按序 |
+| `ServerMessage::FieldDelta` | reliable | 状态不可丢 |
 | `ServerMessage::ActionAck` | reliable | 必须送达 |
 | `ServerMessage::PlayerTick` | unreliable | 高频广播，最新即可 |
 | `ServerMessage::PeerJoined/Left` | reliable | 状态变化必须送达 |

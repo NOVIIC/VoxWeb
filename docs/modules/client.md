@@ -53,7 +53,7 @@ crates/client/src/
 ├── hotbar.rs           9 格快捷栏 + 方块标签
 ├── prediction.rs       输入历史、位置协调、挖放 PendingActions
 ├── interp.rs           远端玩家位置插值（PlayerInterp, 100ms 延迟）
-├── chunk_assembler.rs  ChunkSnapshot 分片接收与组装
+├── chunk_assembler.rs  FieldSnapshot 分片接收与组装
 ├── storage.rs          OPFS 异步包装（WorldStorage trait + OpfsStorage）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
@@ -241,7 +241,7 @@ pub mod settings_storage {
 pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 ```
 
-Local / Host 模式下 mesh 回调可直接借 `server.world.get_block_world`；Remote 模式的世界视图由 ChunkSnapshot 和 BlockUpdate 喂入，再交给同一套 mesh job 管线。
+Local / Host 模式下 mesh 回调可直接借 `server.world.get_block_world`；Remote 模式的世界视图由 FieldSnapshot 和 FieldDelta 喂入，再交给同一套 mesh job 管线。
 
 ### 世界会话清理
 
@@ -274,7 +274,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
 
 专用于 `Connecting` 状态：
 1. `poll_net(app)` — 推进网络状态机（信令+WebRTC 协商）
-2. **drain Server→Client inbox** — Remote 端收 Welcome / ChunkSnapshot / BlockUpdate 等消息
+2. **drain Server→Client inbox** — Remote 端收 Welcome / FieldSnapshot / FieldDelta 等消息
 3. **区块预载**：若 `preload_state.active`：
    - Host/Local：调 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成出生点周围 chunk 并入队网格化
    - Remote：仅运行 `mesh_jobs.run_until_budget(16ms)`（chunk 由上一步的 inbox drain 喂入）
@@ -300,7 +300,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
 fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
     // 1. drain Client→Server → Server.handle_message → 推回 outbox
     // 2. drain Server→Client → apply_server_message
-    //    （Welcome / ActionAck / BlockUpdate）
+    //    （Welcome / ActionAck / FieldDelta）
 
     // 3. 输入 → 物理 + 动作
     //    - 鼠标 apply_mouse
@@ -608,17 +608,17 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
    - Local：跳过此步，直接进入区块预载
 5. **区块预载**：网络 Connected 后启动，加载出生点周围 `(2*render_distance+1)^2` 个 chunk：
    - Host/Local：本地 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成 + 入队，每帧 `mesh_jobs.run_until_budget(16ms)` 网格化
-   - Remote：先消费 Host bootstrap `ChunkSnapshot`；随后使用 `min(local_render_distance, host_render_distance)` 作为有效视距，若范围内还有缺失 chunk，则发送 `ClientMessage::ChunkRequest` 请求 Host 补齐，收到快照后入队网格化
+   - Remote：先消费 Host bootstrap `FieldSnapshot`；随后使用 `min(local_render_distance, host_render_distance)` 作为有效视距，若范围内还有缺失 chunk，则发送 `ClientMessage::FieldRequest` 请求 Host 补齐，收到快照后入队网格化
    - 完成条件：`received >= total && mesh_jobs.is_empty()` → `state = InGame`
 6. 进入 InGame 后请求指针锁
 
 ### Remote 区块流式同步
 
 Remote 模式不会本地生成地形。`ChunkLoader` 在 Remote 下维护两组集合：
-- `loaded`：已经收到完整 `ChunkSnapshot` 并写入本地 world 的 chunk
-- `requested`：已经通过 `ChunkRequest` 发给 Host、正在等待快照的 chunk
+- `loaded`：已经收到完整 `FieldSnapshot` 并写入本地 world 的 chunk
+- `requested`：已经通过 `FieldRequest` 发给 Host、正在等待快照的 chunk
 
-Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `ChunkRequest`。收到 `ChunkSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
+Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `FieldRequest`。收到 `FieldSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
 
 `Game::effective_render_distance()` 定义：
 - Local/Host：直接使用自己的 `settings.render_distance`

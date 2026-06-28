@@ -26,7 +26,7 @@ crates/core/
 ├── Cargo.toml
 └── src/
     ├── lib.rs          模块声明 + 公开 re-export
-    ├── block.rs        BlockID/MaterialID 兼容层 + 硬编码材质属性表
+    ├── block.rs        BlockID/MaterialID 过渡层 + 硬编码材质属性表
     ├── chunk.rs        Chunk + Position + ChunkPos
     ├── field.rs        FieldChunk + Column + Span 原型
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
@@ -57,7 +57,7 @@ impl BlockID {
 }
 ```
 
-`MaterialID` 当前是 `BlockID` 的类型别名。统一体素方案的第一步保持 `ChunkSnapshot`、`BlockUpdate` 和 OPFS 编码不变，先把材质语义落到属性表和操作仲裁。
+`MaterialID` 当前是 `BlockID` 的类型别名。统一体素方案已把 OPFS 和网络快照切到 `FieldChunk` / `MaterialCell`；`BlockID` 仍作为当前渲染、碰撞和热栏的适配标识。
 
 ### MaterialProperties / BlockProperties
 
@@ -86,7 +86,7 @@ pub struct BlockProperties {
 pub fn properties(id: BlockID) -> &'static BlockProperties { ... }
 ```
 
-`MaterialProperties` 当前是 `BlockProperties` 的别名；`MATERIAL_REGISTRY.properties(id)` 是后续迁移到真正 registry 的兼容入口。
+`MaterialProperties` 当前是 `BlockProperties` 的别名；`MATERIAL_REGISTRY.properties(id)` 是后续迁移到真正 registry 的过渡入口。
 
 ### MaterialCell 原型
 
@@ -99,11 +99,11 @@ pub struct MaterialCell {
 }
 ```
 
-当前运行时 chunk 仍保存 `Vec<BlockID>`，`MaterialCell` 先作为 FieldChunk / FieldDelta / FreeObject 后续迁移的公开数据结构原型。
+当前运行时 chunk 仍保存 `Vec<BlockID>` 作为渲染/碰撞适配视图；`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta` 和后续 FreeObject 迁移。
 
 ### `field.rs` — FieldChunk 原型
 
-统一体素方案的存储底座已经有独立数据结构，但还未替换运行时 `Chunk`：
+统一体素方案的存储和网络快照底座已经有独立数据结构；运行时 dense `Chunk` 仍作为当前渲染/碰撞适配视图：
 
 ```rust
 pub struct FieldChunk {
@@ -189,22 +189,16 @@ impl Chunk {
 
 **索引选择理由**：`y` 在最高位 → 同层方块在内存上连续，利于水平遍历（贪婪网格化按层扫描时缓存命中）。
 
-### Chunk 网络压缩（palette + RLE）
+### FieldChunk 编码
 
-`encode_chunk` / `decode_chunk` 用于 ChunkSnapshot 网络传输（详见 [`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。
+`field::encode` / `field::decode` 用于 OPFS 存盘和网络 `FieldSnapshot` 传输（详见 [`networking/protocol.md` §五](../networking/protocol.md#五field-快照同步)）。
 
 ```rust
-/// 将 blocks 数组编码为 palette+RLE 压缩字节。
-/// 算法：扫描连续相同 BlockID 合并为 run；记录 (palette_index, run_length)。
-pub fn encode_chunk(blocks: &[BlockID]) -> Result<Vec<u8>, String>;
-
-/// 将 encode_chunk 的压缩字节还原为 Vec<BlockID>（长度恒为 CHUNK_SIZE）。
-pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<BlockID>, String>;
+pub fn encode(field: &FieldChunk) -> Vec<u8>;
+pub fn decode(bytes: &[u8]) -> Result<FieldChunk, DecodeError>;
 ```
 
-内部格式：`CompressedChunk { palette: Vec<BlockID>, runs: Vec<(u16, u32)> }` → bincode 序列化。
-
-典型地形（草/泥/石/空气 4 种方块）从 ~131 KB 压缩到 2-5 KB（**30-60x**）。
+内部格式：`StoredFieldChunk { version, field }` → bincode 序列化。典型自然地形通过 span column store 从 dense 等价 ~128 KB 压到 2-5 KB。
 
 ### 边界检查
 
@@ -226,8 +220,8 @@ pub enum ClientMessage {
     Hello { display_name: String, version: u32 },
     /// 玩家移动同步（高频，走 unreliable 通道）
     PlayerInput { tick: u32, position: glam::Vec3, yaw: f32, pitch: f32 },
-    /// Remote 请求 Host 发送有效视距内缺失的 chunk。
-    ChunkRequest { center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos> },
+    /// Remote 请求 Host 发送有效视距内缺失的 FieldChunk。
+    FieldRequest { center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos> },
     /// 方块挖掘。input_tick / player_position 表示玩家点击时的本地预测状态，
     /// Host 用它避免高延迟下最新 PlayerInput 还没到达造成范围误判。
     Break { pos: Position, request_id: u32, input_tick: u32, player_position: glam::Vec3 },
@@ -244,10 +238,10 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// 加入握手响应（含玩家 entity_id 与 server tick）
     Welcome { entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry> },
-    /// 全量 Chunk 数据（分片）
-    ChunkSnapshot { pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8> },
-    /// 单方块更新
-    BlockUpdate { pos: Position, block: BlockID },
+    /// 全量 FieldChunk 数据（分片）
+    FieldSnapshot { pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8> },
+    /// 单 cell 更新
+    FieldDelta { pos: Position, cell: MaterialCell },
     /// 挖放请求结果（携 request_id 用于客户端协调）
     ActionAck { request_id: u32, accepted: bool, reason: AckReason },
     /// 远端玩家位置广播（高频，unreliable）
@@ -318,7 +312,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::De
 
 ### 消息分片
 
-`ChunkSnapshot` 单条可能大于 16KB（DataChannel MTU），通过 `frag_index` / `frag_total` 显式分片，由接收端组装。详细流程见 [`networking/protocol.md`](../networking/protocol.md#chunk-快照同步)。
+`FieldSnapshot` 单条可能大于 16KB（DataChannel MTU），通过 `frag_index` / `frag_total` 显式分片，由接收端组装。详细流程见 [`networking/protocol.md`](../networking/protocol.md#field-快照同步)。
 
 ---
 

@@ -82,7 +82,7 @@ fn distance_to_block_center(player_feet: Vec3, pos: Position) -> f32 {
 /// 挖放后立即运行一小段局部颗粒松弛。
 ///
 /// 当前仍基于 `BlockID` dense chunk 做兼容实现：`ImmediateRelaxation` 材质会优先竖直下落，
-/// 受阻后尝试向斜下方滑落。返回值是需要广播给客户端的权威 `BlockUpdate` 序列。
+/// 受阻后尝试向斜下方滑落。返回值是需要广播给客户端的权威 `FieldDelta` 序列。
 pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
     let mut updates = Vec::new();
     let mut queue = VecDeque::new();
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn break_bottom_layer_is_rejected_even_for_legacy_stone() {
+    fn break_bottom_layer_is_rejected_even_when_manually_set_to_stone() {
         let mut w = World::new(0);
         w.ensure_chunk_generated(ChunkPos::new(0, 0));
         w.set_block(Position::new(3, 0, 3), BlockID::STONE);

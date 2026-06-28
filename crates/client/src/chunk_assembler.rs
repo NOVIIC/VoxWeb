@@ -1,10 +1,9 @@
-//! ChunkSnapshot 分片组装器。
+//! FieldSnapshot 分片组装器。
 //!
-//! Host 用 bootstrap 快照或 `ChunkRequest` 响应把每个 chunk 的 bincode 编码结果切片发送；
+//! Host 用 bootstrap 快照或 `FieldRequest` 响应把每个 FieldChunk 的 bincode 编码结果切片发送；
 //! Remote 端接收时通过本模块按 ChunkPos 汇集，齐了返回 concatenated bytes。
 //!
-//! Phase 5：不关心具体编码格式；解码（Vec<BlockID> → Chunk）在上层 `apply_server_message` 做。
-//! Phase 8 引入 palette+RLE 压缩后，这层不需要改动。
+//! 本层不关心具体编码格式；解码在上层 `apply_server_message` 做。
 
 use std::collections::HashMap;
 
@@ -43,7 +42,7 @@ impl PartialAssemble {
     }
 }
 
-/// 分片组装器。Host 一次性发入局快照，接收端靠这个汇集每個 chunk 的分片。
+/// 分片组装器。Host 一次性发入局快照，接收端靠这个汇集每个 chunk 的分片。
 #[derive(Default)]
 pub struct ChunkAssembler {
     partials: HashMap<ChunkPos, PartialAssemble>,
@@ -59,7 +58,7 @@ impl ChunkAssembler {
     /// * `pos` — chunk 坐标
     /// * `frag_index` — 本片的序号（0-based）
     /// * `frag_total` — 该 chunk 的片总数
-    /// * `payload` — 本片的字节（由调用方从 `ChunkSnapshot` 中移出）
+    /// * `payload` — 本片的字节（由调用方从 `FieldSnapshot` 中移出）
     ///
     /// 当所有片到齐时返回完整的 concatenated bytes，并把该 chunk 的临时状态清掉；
     /// 尚未到齐返回 `None`。

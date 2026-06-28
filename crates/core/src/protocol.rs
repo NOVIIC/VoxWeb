@@ -4,7 +4,7 @@
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::block::BlockID;
+use crate::block::{BlockID, MaterialCell};
 use crate::chunk::{ChunkPos, Position};
 
 // —— 协议常量 ——
@@ -12,12 +12,12 @@ use crate::chunk::{ChunkPos, Position};
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v6（Phase 8）：Welcome 携带 Host 视距，ChunkRequest 带请求中心与有效视距。
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7：世界快照/单点更新切到 FieldChunk / MaterialCell 语义。
+pub const PROTOCOL_VERSION: u32 = 7;
 
-/// ChunkSnapshot 单片 payload 上限（字节）。
+/// FieldSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
-pub const CHUNK_SNAPSHOT_PAYLOAD_MAX: usize = 14 * 1024;
+pub const FIELD_SNAPSHOT_PAYLOAD_MAX: usize = 14 * 1024;
 
 /// 单个玩家实体的全局唯一 ID。Phase 5 起由 Server::add_player 分配（u32，1 起步）。
 /// 0 表示"未分配"（Welcome 之前的 Remote 端使用）。
@@ -69,12 +69,12 @@ pub enum ClientMessage {
         yaw: f32,
         pitch: f32,
     },
-    /// 请求 Host 发送指定区块快照。
+    /// 请求 Host 发送指定 FieldChunk 快照。
     ///
     /// Remote 端只保存自己视距范围内的区块；当玩家进入新 chunk 或渲染距离变化时，
     /// 客户端计算缺失区块列表并通过 reliable 通道请求。Host 收到后按需生成，
-    /// 再用 [`ServerMessage::ChunkSnapshot`] 分片回传。
-    ChunkRequest {
+    /// 再用 [`ServerMessage::FieldSnapshot`] 分片回传。
+    FieldRequest {
         /// Remote 当前用于计算 desired 集合的中心 chunk。
         center: ChunkPos,
         /// Remote 已经按 Host 上限裁剪后的有效视距。
@@ -125,15 +125,15 @@ pub enum ServerMessage {
         host_render_distance: u32,
         players: Vec<PlayerEntry>,
     },
-    /// 全量 Chunk 快照（分片传输，接收端按 frag_index 组装）
-    ChunkSnapshot {
+    /// 全量 FieldChunk 快照（分片传输，接收端按 frag_index 组装）
+    FieldSnapshot {
         pos: ChunkPos,
         frag_index: u16,
         frag_total: u16,
         payload: Vec<u8>,
     },
-    /// 单方块更新（挖放结果广播）
-    BlockUpdate { pos: Position, block: BlockID },
+    /// 单 cell 更新（挖放结果广播）
+    FieldDelta { pos: Position, cell: MaterialCell },
     /// 挖放请求的仲裁结果
     ActionAck {
         request_id: u32,
@@ -233,7 +233,7 @@ pub enum Recipient {
     All,
     /// 广播给除 eid 之外的所有玩家。常用于"PeerJoined 通知其他人但不通知新加入者"。
     Except(EntityId),
-    /// 仅发给单个 eid。常用于 Welcome / ActionAck / ChunkSnapshot 等单点回执。
+    /// 仅发给单个 eid。常用于 Welcome / ActionAck / FieldSnapshot 等单点回执。
     One(EntityId),
 }
 
@@ -327,8 +327,8 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_chunk_request() {
-        roundtrip(&ClientMessage::ChunkRequest {
+    fn roundtrip_field_request() {
+        roundtrip(&ClientMessage::FieldRequest {
             center: ChunkPos::new(0, 0),
             render_distance: 6,
             chunks: vec![ChunkPos::new(0, 0), ChunkPos::new(-3, 5)],
@@ -336,9 +336,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_six() {
-        // Phase 8 Host 视距上限同步为 v6；任何破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_version_is_seven() {
+        // FieldSnapshot / FieldDelta 网络语义为 v7；破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]
