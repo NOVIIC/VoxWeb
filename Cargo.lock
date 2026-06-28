@@ -2032,7 +2032,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "voxweb-client"
-version = "0.6.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "bincode",
  "console_error_panic_hook",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "voxweb-core"
-version = "0.6.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "bincode",
  "bitflags 2.11.1",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "voxweb-net"
-version = "0.6.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "bincode",
  "futures-channel",
@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "voxweb-render"
-version = "0.6.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "bytemuck",
  "futures-channel",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "voxweb-server"
-version = "0.6.0"
+version = "0.7.0-alpha.1"
 dependencies = [
  "bincode",
  "getrandom 0.2.17",
