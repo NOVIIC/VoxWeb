@@ -49,14 +49,14 @@ fn add_player_allocates_increasing_ids_and_enqueues_welcome_peerjoined_snapshot(
     });
     assert!(pj_for_bob.is_some(), "missing PeerJoined for eid 2");
 
-    // ChunkSnapshot：至少有一片到 eid1
+    // FieldSnapshot：至少有一片到 eid1
     let has_snapshot = server.outbox.iter().any(|m| {
         matches!(
             (&m.recipient, &m.message),
-            (Recipient::One(e), ServerMessage::ChunkSnapshot { .. }) if *e == 1
+            (Recipient::One(e), ServerMessage::FieldSnapshot { .. }) if *e == 1
         )
     });
-    assert!(has_snapshot, "expected at least one ChunkSnapshot fragment");
+    assert!(has_snapshot, "expected at least one FieldSnapshot fragment");
 }
 
 #[test]
@@ -133,7 +133,7 @@ fn handle_message_player_input_updates_player_entity_and_rejects_old_tick() {
 }
 
 #[test]
-fn handle_message_chunk_request_generates_and_sends_snapshot() {
+fn handle_message_field_request_generates_and_sends_snapshot() {
     let mut server = Server::new(0);
     server.set_host_render_distance(8);
     let eid = server.add_player("A".into());
@@ -143,7 +143,7 @@ fn handle_message_chunk_request_generates_and_sends_snapshot() {
     assert!(!server.world.chunks.contains_key(&requested));
     server.handle_message(
         eid,
-        ClientMessage::ChunkRequest {
+        ClientMessage::FieldRequest {
             center: ChunkPos::new(0, 0),
             render_distance: 8,
             chunks: vec![requested],
@@ -154,15 +154,15 @@ fn handle_message_chunk_request_generates_and_sends_snapshot() {
     let snapshot = find_outbox(&server, |m| {
         matches!(
             (&m.recipient, &m.message),
-            (Recipient::One(e), ServerMessage::ChunkSnapshot { pos, .. })
+            (Recipient::One(e), ServerMessage::FieldSnapshot { pos, .. })
                 if *e == eid && *pos == requested
         )
     });
-    assert!(snapshot.is_some(), "missing requested ChunkSnapshot");
+    assert!(snapshot.is_some(), "missing requested FieldSnapshot");
 }
 
 #[test]
-fn handle_message_chunk_request_ignores_far_chunks() {
+fn handle_message_field_request_ignores_far_chunks() {
     let mut server = Server::new(0);
     let eid = server.add_player("A".into());
     server.drain_outbox();
@@ -170,7 +170,7 @@ fn handle_message_chunk_request_ignores_far_chunks() {
     let far = ChunkPos::new(40, 0);
     server.handle_message(
         eid,
-        ClientMessage::ChunkRequest {
+        ClientMessage::FieldRequest {
             center: ChunkPos::new(0, 0),
             render_distance: 10,
             chunks: vec![far],
@@ -179,13 +179,13 @@ fn handle_message_chunk_request_ignores_far_chunks() {
 
     let snapshot = find_outbox(
         &server,
-        |m| matches!(m.message, ServerMessage::ChunkSnapshot { pos, .. } if pos == far),
+        |m| matches!(m.message, ServerMessage::FieldSnapshot { pos, .. } if pos == far),
     );
     assert!(snapshot.is_none(), "far chunk request should be ignored");
 }
 
 #[test]
-fn handle_message_chunk_request_is_capped_by_host_render_distance() {
+fn handle_message_field_request_is_capped_by_host_render_distance() {
     let mut server = Server::new(0);
     server.set_host_render_distance(4);
     let eid = server.add_player("A".into());
@@ -195,7 +195,7 @@ fn handle_message_chunk_request_is_capped_by_host_render_distance() {
     let denied = ChunkPos::new(5, 0);
     server.handle_message(
         eid,
-        ClientMessage::ChunkRequest {
+        ClientMessage::FieldRequest {
             center: ChunkPos::new(0, 0),
             render_distance: 10,
             chunks: vec![allowed, denied],
@@ -230,7 +230,7 @@ fn prepare_world() -> (Server, EntityId) {
 }
 
 #[test]
-fn handle_message_break_enqueues_ack_one_and_blockupdate_all() {
+fn handle_message_break_enqueues_ack_one_and_field_delta_all() {
     let (mut server, eid) = prepare_world();
     server.handle_message(
         eid,
@@ -254,11 +254,11 @@ fn handle_message_break_enqueues_ack_one_and_blockupdate_all() {
     let bu = find_outbox(&server, |m| {
         matches!(
             (&m.recipient, &m.message),
-            (Recipient::All, ServerMessage::BlockUpdate { block, .. })
-                if *block == voxweb_core::BlockID::AIR
+            (Recipient::All, ServerMessage::FieldDelta { cell, .. })
+                if cell.to_block_id() == voxweb_core::BlockID::AIR
         )
     });
-    assert!(bu.is_some(), "missing BlockUpdate All");
+    assert!(bu.is_some(), "missing FieldDelta All");
 
     assert_eq!(
         server.world.get_block(Position::new(3, 64, 3)),
@@ -267,7 +267,56 @@ fn handle_message_break_enqueues_ack_one_and_blockupdate_all() {
 }
 
 #[test]
-fn handle_message_break_out_of_range_only_ack_no_blockupdate() {
+fn handle_message_break_broadcasts_free_object_projection_for_floating_hard_block() {
+    let (mut server, eid) = prepare_world();
+    let support = Position::new(3, 64, 3);
+    let lower_support = Position::new(3, 63, 3);
+    let floating = Position::new(3, 65, 3);
+    server
+        .world
+        .set_block(lower_support, voxweb_core::BlockID::STONE);
+    server
+        .world
+        .set_block(floating, voxweb_core::BlockID::STONE);
+
+    server.handle_message(
+        eid,
+        ClientMessage::Break {
+            pos: support,
+            request_id: 43,
+            input_tick: 6,
+            player_position: Vec3::new(3.5, 65.0, 3.5),
+        },
+    );
+
+    assert_eq!(server.world.get_block(floating), voxweb_core::BlockID::AIR);
+    assert_eq!(server.world.get_block(support), voxweb_core::BlockID::STONE);
+    assert_eq!(server.world.free_objects.len(), 1);
+
+    let projection = find_outbox(&server, |m| {
+        matches!(
+            (&m.recipient, &m.message),
+            (
+                Recipient::All,
+                ServerMessage::FreeObjectProject {
+                    object_id: 1,
+                    deltas,
+                }
+            ) if deltas.iter().any(|(pos, cell)| {
+                *pos == floating && cell.to_block_id() == voxweb_core::BlockID::AIR
+            }) && deltas.iter().any(|(pos, cell)| {
+                *pos == support && cell.to_block_id() == voxweb_core::BlockID::STONE
+            })
+        )
+    });
+    assert!(
+        projection.is_some(),
+        "missing FreeObjectProject with projection deltas"
+    );
+}
+
+#[test]
+fn handle_message_break_out_of_range_only_ack_no_field_delta() {
     let (mut server, eid) = prepare_world();
     server.handle_message(
         eid,
@@ -293,11 +342,11 @@ fn handle_message_break_out_of_range_only_ack_no_blockupdate() {
     });
     assert!(ack.is_some());
     let bu = find_outbox(&server, |m| {
-        matches!(m.message, ServerMessage::BlockUpdate { .. })
+        matches!(m.message, ServerMessage::FieldDelta { .. })
     });
     assert!(
         bu.is_none(),
-        "out-of-range break should not enqueue BlockUpdate"
+        "out-of-range break should not enqueue FieldDelta"
     );
     assert_eq!(
         server.world.get_block(Position::new(15, 64, 15)),
@@ -306,7 +355,7 @@ fn handle_message_break_out_of_range_only_ack_no_blockupdate() {
 }
 
 #[test]
-fn handle_message_place_overlap_rejected_and_no_blockupdate() {
+fn handle_message_place_overlap_rejected_and_no_field_delta() {
     let (mut server, eid) = prepare_world();
     server.handle_message(
         eid,
@@ -333,9 +382,53 @@ fn handle_message_place_overlap_rejected_and_no_blockupdate() {
     });
     assert!(ack.is_some());
     let bu = find_outbox(&server, |m| {
-        matches!(m.message, ServerMessage::BlockUpdate { .. })
+        matches!(m.message, ServerMessage::FieldDelta { .. })
     });
     assert!(bu.is_none());
+}
+
+#[test]
+fn handle_message_place_granular_broadcasts_relaxed_updates() {
+    let (mut server, eid) = prepare_world();
+    let placed = Position::new(5, 66, 3);
+    let settled = Position::new(5, 65, 3);
+    server.world.set_block(placed, voxweb_core::BlockID::AIR);
+    server.world.set_block(settled, voxweb_core::BlockID::AIR);
+
+    server.handle_message(
+        eid,
+        ClientMessage::Place {
+            pos: placed,
+            block: voxweb_core::BlockID::SAND,
+            request_id: 99,
+            input_tick: 6,
+            player_position: Vec3::new(3.5, 65.0, 3.5),
+        },
+    );
+
+    assert_eq!(server.world.get_block(placed), voxweb_core::BlockID::AIR);
+    assert_eq!(server.world.get_block(settled), voxweb_core::BlockID::SAND);
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::FieldDelta { pos, cell }
+                if pos == placed && cell.to_block_id() == voxweb_core::BlockID::SAND
+        )
+    }));
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::FieldDelta { pos, cell }
+                if pos == placed && cell.to_block_id() == voxweb_core::BlockID::AIR
+        )
+    }));
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::FieldDelta { pos, cell }
+                if pos == settled && cell.to_block_id() == voxweb_core::BlockID::SAND
+        )
+    }));
 }
 
 #[test]

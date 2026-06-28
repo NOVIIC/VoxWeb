@@ -26,11 +26,13 @@
 当前 server crate 覆盖完整权威世界循环：
 
 - `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
+- `World::field_chunks` 同步维护 `FieldChunk` MaterialField 镜像；当前渲染/碰撞仍从 `chunks` 适配读取，网络快照直接发送 FieldChunk
+- `World::free_objects` 记录第一版 FreeObject 生命周期结果：小型 `FloatingOnly` 连通块会被提取、整体下落并投影回静态场
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
-- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性
+- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`relax_after_edit` 对 `ImmediateRelaxation` 材质做局部下落/滑落
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
 - `Server` 通过 `handle_message` 消费 Local / Host / Remote 输入，向 outbox 写入点对点或广播消息
-- `send_initial_snapshot` 与 `ChunkRequest` 负责 Remote 初始和运行时 chunk 同步
+- `send_initial_snapshot` 与 `FieldRequest` 负责 Remote 初始和运行时 FieldChunk 同步
 - `dirty_chunks`、LRU 和 pinned 集合为 OPFS 持久化提供最小变更集和内存上限
 
 ---
@@ -42,7 +44,7 @@ crates/server/src/
 ├── lib.rs              World + Server 主结构 + 公开 API
 ├── world.rs            ChunkStore + EntityTable + Tick
 ├── terrain.rs          Perlin 地形生成
-├── physics.rs          物理仲裁（位置合法性、挖放校验）
+├── physics.rs          物理仲裁（位置合法性、挖放校验、局部颗粒松弛）
 ├── persistence.rs      PersistenceManager + LRU 卸载（具体存储读写在 client::storage）
 └── handle_message_tests.rs  Server 消息处理单元测试
 ```
@@ -57,6 +59,8 @@ crates/server/src/
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
+    pub field_chunks: HashMap<ChunkPos, FieldChunk>, // MaterialField 镜像
+    pub free_objects: HashMap<ObjectID, FreeObject>, // 已提取/投影的材质团记录
     pub terrain: TerrainGenerator,           // Perlin 高度图
     pub tick_count: u64,                     // tick 累加器；驱动玩家广播
     pub dirty_chunks: HashSet<ChunkPos>,     // 需要持久化的 chunk
@@ -74,7 +78,8 @@ impl World {
     /// 卸载 chunk（移除 chunks 表）。调用方需要先处理 dirty flush / pinned 约束。
     pub fn unload_chunk(&mut self, pos: ChunkPos);
 
-    /// 直接读写方块；`set_block` 会标记 dirty，chunk 未加载或 local_index 越界时静默忽略。
+    /// 直接读写方块；`set_block` 会同步更新 chunks + field_chunks 并标记 dirty。
+    /// chunk 未加载或 local_index 越界时静默忽略。
     pub fn get_block(&self, pos: Position) -> BlockID;
     pub fn set_block(&mut self, pos: Position, block: BlockID);
 
@@ -126,7 +131,7 @@ impl Server {
 
     /// 处理来自客户端的消息（Local 或 Remote）。
     /// Hello → 插入 players 表 + Welcome；PlayerInput → 更新 players 表；
-    /// Break/Place → 调 validate → Ok 则 set_block + ActionAck + BlockUpdate；失败仅 ActionAck。
+    /// Break/Place → 调 validate → Ok 则 set_block + ActionAck + FieldDelta；失败仅 ActionAck。
     pub fn handle_message(&mut self, sender: u32, msg: ClientMessage) -> Vec<ServerMessage>;
 
     /// 推进一个逻辑帧（60Hz 调用）。
@@ -136,8 +141,7 @@ impl Server {
     pub fn add_player(&mut self, display_name: String) -> EntityId;
     pub fn remove_player(&mut self, entity_id: EntityId);
     pub fn drain_outbox(&mut self) -> Vec<OutboundMessage>;
-    pub fn take_dirty_chunks(&mut self) -> Vec<(ChunkPos, Chunk)>;
-    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: Chunk);
+    pub fn load_field_chunk_from_storage(&mut self, pos: ChunkPos, field: FieldChunk);
 }
 ```
 
@@ -148,7 +152,7 @@ impl Server {
 ### Chunk 生命周期
 
 ```
-ChunkLoader / ChunkRequest ──▶ World::ensure_chunk_generated(pos)
+ChunkLoader / FieldRequest ──▶ World::ensure_chunk_generated(pos)
                                   ├─ 已加载？跳过
                                   ├─ OPFS 有存档？由 client::storage 异步加载后回写
                                   └─ 未加载且无存档？terrain.generate_chunk(pos) → 插入
@@ -156,7 +160,7 @@ ChunkLoader / ChunkRequest ──▶ World::ensure_chunk_generated(pos)
 LRU / 视距卸载 ──▶ flush dirty（由 client 触发） ──▶ World::unload_chunk(pos)
 ```
 
-**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_chunk_from_storage`。
+**注意**：`server` 自身**不直接读 OPFS**（核心原则：server 无浏览器依赖）。持久化由 `client::storage` 异步任务完成，加载完成后调 `server.load_field_chunk_from_storage`。
 
 ### 玩家位置更新
 
@@ -230,7 +234,7 @@ fn broadcast_tick(&mut self) {
    - 采样 `perlin.get([world_x * 0.01, world_z * 0.01])` → 值域 `[-1, 1]`
    - 映射到高度 `height = ((noise + 1) * 0.5 * CHUNK_Y * 0.4) as usize`（最高 ≈ 102）
 3. 分层填充每个 `(lx, ly, lz)`：
-   - `ly == 0` → 强制 STONE（基岩兜底，避免下溢）
+   - `ly == 0` → 强制 BEDROCK（不可破坏世界边界，避免挖穿底部）
    - `ly + 3 < height` → STONE
    - `ly < height` → DIRT
    - `ly == height` → GRASS
@@ -259,20 +263,22 @@ pub const MAX_REACH: f32 = 6.0;    // 眼睛到方块中心的最大距离
 pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckReason {
     // 1) y 越界检查
     // 2) 眼-块中心距离 > MAX_REACH → OutOfRange
-    // 3) 目标已是 AIR → BlockNotEmpty（语义复用）
+    // 3) y == 0 → BlockNotEmpty（世界底部边界）
+    // 4) 目标已是 AIR → BlockNotEmpty（语义复用）
+    // 5) properties(block).breakable == false → BlockNotEmpty（如 BEDROCK）
     //    Ok
 }
 ```
 
 ### 放方块
 ```rust
-pub fn validate_place(
-    world: &World, pos: Position, _block: BlockID, player_feet: Vec3
-) -> AckReason {
+pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet: Vec3) -> AckReason {
     // 1) y 越界检查
     // 2) 距离 > MAX_REACH → OutOfRange
-    // 3) 目标非空 → BlockNotEmpty
-    // 4) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
+    // 3) y == 0 → BlockNotEmpty
+    // 4) block == AIR 或 !properties(block).appears_in_hotbar → BlockNotEmpty
+    // 5) 目标非空 → BlockNotEmpty
+    // 6) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
     //    Ok
 }
 ```
@@ -280,6 +286,29 @@ pub fn validate_place(
 共享 AABB 工具在 `voxweb_core::geometry`（`Aabb`、`player_aabb`、`Aabb::block_at`、`Aabb::intersects`），client 和 server 共用同一套定义。
 
 玩家位置由 `Server::players: HashMap<u32, Vec3>` 提供（Hello 插入初始 spawn，PlayerInput 60Hz 更新）。`validate_break/place` 的签名接受显式 `player_feet` 参数（而非 entity_id），便于测试时直接注入位置。
+
+### 局部颗粒松弛与硬材质浮空
+
+```rust
+pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
+    // 1) 从 origin 及其上方/四邻域入队
+    // 2) 只处理 properties(block).stability == ImmediateRelaxation 的材质
+    // 3) 优先竖直下落；受阻后按确定性方向尝试斜下滑落
+    // 4) 单次挖放受 RELAXATION_MOVE_BUDGET / RELAXATION_VISIT_BUDGET 限流
+    // 5) 返回每个 cell 的权威 FieldDelta 序列
+}
+
+pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectProjection> {
+    // 1) 从 origin 及其上方/四邻域收集 FloatingOnly 候选
+    // 2) BFS 找小型硬材质连通块；超过预算视为大型地形/建筑并保持静态
+    // 3) 若连通块没有接触任何稳定 solid 支撑，记录 FreeObject
+    // 4) 整体下落到最近支撑面并投影回 Field/Chunk
+    // 5) 返回每个 FreeObject 的旧位置 AIR + 新位置材质投影 delta
+}
+```
+
+当前这是 `BlockID` dense chunk 上的过渡原型，不做质量拆分和多材质混合；它保证 Host / Local-Only 立即给玩家软材质反馈，并通过 `FieldDelta` 同步结果。
+硬材质第一版同样是整格过渡实现：不会模拟可见刚体飞行，而是在同一权威步骤完成提取、下落、投影，并通过 `FreeObjectProject` 广播投影结果。
 
 ---
 
@@ -317,18 +346,23 @@ match msg {
     ClientMessage::PlayerInput { tick, position, yaw, pitch } => {
         self.handle_player_input(sender, tick, position, yaw, pitch);
     }
-    ClientMessage::ChunkRequest { center, render_distance, chunks } => {
+    ClientMessage::FieldRequest { center, render_distance, chunks } => {
         // 去重、限制单包数量，并确认请求中心没有明显远离该玩家服务端位置；
         // 每个 chunk 还要在 min(render_distance, host_render_distance) 内才会回传。
-        self.handle_chunk_request(sender, center, render_distance, chunks);
+        self.handle_field_request(sender, center, render_distance, chunks);
     }
     ClientMessage::Break { pos, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
         match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
-                self.world.dirty_chunks.insert(pos.to_chunk_pos());
-                self.outbox.push_back(broadcast(BlockUpdate { pos, block: BlockID::AIR }));
+                let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                let projections = physics::resolve_floating_after_edit(&mut self.world, pos);
+                self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::EMPTY }));
+                for (pos, block) in relaxed {
+                    self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::from_block_id(block) }));
+                }
+                self.enqueue_free_object_projections(projections);
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
             }
             Err(reason) => {
@@ -338,7 +372,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠 */
+        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠；成功后 set_block + relax_after_edit + FieldDelta，并用 FreeObjectProject 广播硬材质投影 */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));
@@ -353,9 +387,9 @@ match msg {
 
 ## 九、初始与按需快照同步
 
-Remote 通过 ChunkSnapshot 分片拿到初始世界；Local-Only / Host 的本地玩家则通过 `ChunkLoader` 直接触发 `server.world.ensure_chunk_generated`。
+Remote 通过 FieldSnapshot 分片拿到初始世界；Local-Only / Host 的本地玩家则通过 `ChunkLoader` 直接触发 `server.world.ensure_chunk_generated`。
 
-新玩家 `Hello` → `Welcome` 之后，Server 先把出生点附近 bootstrap 半径内的 chunk 通过 `ChunkSnapshot` 分片发给该玩家（仅该玩家，`Recipient::One`）。bootstrap 半径不会超过 Host 的视距。Remote 端随后按 `min(local_render_distance, host_render_distance)` 计算缺失区块，发送 `ChunkRequest` 补齐外圈；进入游戏后每次跨 chunk 边界继续按这个机制请求新区块。
+新玩家 `Hello` → `Welcome` 之后，Server 先把出生点附近 bootstrap 半径内的 chunk 通过 `FieldSnapshot` 分片发给该玩家（仅该玩家，`Recipient::One`）。bootstrap 半径不会超过 Host 的视距。Remote 端随后按 `min(local_render_distance, host_render_distance)` 计算缺失区块，发送 `FieldRequest` 补齐外圈；进入游戏后每次跨 chunk 边界继续按这个机制请求新区块。
 
 伪代码：
 ```rust
@@ -365,12 +399,11 @@ fn send_initial_snapshot(&mut self, recipient: EntityId) {
         for dz in -RD..=RD {
             let pos = ChunkPos { x: center.x + dx, z: center.z + dz };
             self.world.ensure_chunk_generated(pos);
-            let chunk = self.world.chunks.get(&pos);
-            // palette+RLE 压缩：典型地形 ~131KB → ~2-5KB
-            let payload = voxweb_core::chunk::encode_chunk(&chunk.blocks)?;
-            // 切片为 ≤ 14KB（大多数 chunk 压缩后不需分片，frag_total=1）
+            let field = self.world.field_chunks.get(&pos);
+            let payload = voxweb_core::field::encode(field);
+            // 切片为 ≤ 14KB（大多数 FieldChunk 编码后不需分片，frag_total=1）
             for (i, frag) in payload.chunks(MAX_FRAG).enumerate() {
-                self.enqueue(Recipient::One(recipient), ChunkSnapshot {
+                self.enqueue(Recipient::One(recipient), FieldSnapshot {
                     pos, frag_index: i as u16, frag_total: total as u16, payload: frag.to_vec(),
                 }));
             }
@@ -382,7 +415,7 @@ fn send_initial_snapshot(&mut self, recipient: EntityId) {
 按需请求伪代码：
 
 ```rust
-fn handle_chunk_request(&mut self, recipient: EntityId, center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>) {
+fn handle_field_request(&mut self, recipient: EntityId, center: ChunkPos, render_distance: u32, chunks: Vec<ChunkPos>) {
     let player_center = chunk_pos_of_world(self.players[&recipient].position);
     if chebyshev_distance(center, player_center) > CHUNK_REQUEST_CENTER_GRACE {
         return;
@@ -392,7 +425,7 @@ fn handle_chunk_request(&mut self, recipient: EntityId, center: ChunkPos, render
         if chebyshev_distance(pos, center) > allowed_radius {
             continue;
         }
-        self.send_chunk_snapshot(recipient, pos);
+        self.send_field_snapshot(recipient, pos);
     }
 }
 ```
@@ -424,8 +457,8 @@ impl PersistenceManager {
 
 **实际存储实现不在 server crate 内**（避免引入 `web-sys` 依赖污染 server 的平台无关性）：
 - Client 端 [`crates/client/src/storage.rs`](../../crates/client/src/storage.rs) 实现 `WorldStorage` trait（默认 `OpfsStorage`）
-- Client 主循环每 3 秒：`let to_flush = persistence.snapshot_dirty(4, tick);` → 主线程 encode（每批最多 4 chunk）→ `spawn_local(async { storage.save_chunks(...).await })` → 成功 commit / 失败 record_failure
-- 加载请求由 client 触发：`storage.load_chunk(pos)` → `decode` → `server.load_chunk_from_storage(pos, chunk)`
+- Client 主循环每 3 秒：`let to_flush = persistence.snapshot_dirty(4, tick);` → 主线程 `field::encode`（每批最多 4 chunk）→ `spawn_local(async { storage.save_chunks(...).await })` → 成功 commit / 失败 record_failure
+- 加载请求由 client 触发：`storage.load_chunk(pos)` → `field::decode` → `server.load_field_chunk_from_storage(pos, field)`
 
 `World` 还配套 LRU + pinned 集合避免内存爆炸（capacity 4096，渲染距离内 chunk 不可驱逐；dirty chunk 驱逐前必须先 flush）。
 
@@ -443,8 +476,9 @@ impl PersistenceManager {
 - `World::get_block_world` chunk 内 / 未加载 / y 越界三种情况
 
 **Physics / message dispatch**：
-- `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / AIR → BlockNotEmpty
-- `physics::validate_place`：y 越界 / 射程 / BlockNotEmpty / AABB Overlap
+- `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / 底层边界 / AIR / 不可破坏材质 → BlockNotEmpty
+- `physics::validate_place`：y 越界 / 射程 / 底层边界 / 非热栏材质 / BlockNotEmpty / AABB Overlap
+- `physics::relax_after_edit`：沙/土/草竖直下落、破坏支撑后补落、受阻后斜下滑落、单次预算限制
 - `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
 - 全部 10 个单元测试通过 `cargo test -p voxweb-server --lib`
 

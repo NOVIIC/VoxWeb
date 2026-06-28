@@ -307,7 +307,7 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 ### 屏幕底部中央：Hotbar（9 格）
 
-横向 9 格，每格 58×42，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格左上显示材质色块，中部显示槽位号 1-9，底部显示方块标签（`STONE` / `DIRT` / ...）；选中格使用暖金底 + 2px 描边，非选中格使用深色半透明底 + 1px 低对比边框。
+横向 9 格，每格 58×42，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格左上显示材质色块，中部显示槽位号 1-9，底部显示方块标签（`STONE` / `DIRT` / ... / `BRICK`）；默认顺序是 STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER / STONE_BRICKS。选中格使用暖金底 + 2px 描边，非选中格使用深色半透明底 + 1px 低对比边框。
 
 ```rust
 egui::Area::new(egui::Id::new("hud_hotbar"))

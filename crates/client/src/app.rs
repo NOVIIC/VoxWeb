@@ -340,7 +340,7 @@ pub struct Game {
 impl Game {
     /// 启动一个单机游戏：创建 Server + 配对 NetEndpoint + 初始相机/物理。
     /// Phase 5：构造时立即调 `server.add_player(display_name)` 把 Host 本人入表，
-    /// 丢弃随之产生的初始 outbox（Welcome/PeerJoined/ChunkSnapshot — 对自己冗余）。
+    /// 丢弃随之产生的初始 outbox（Welcome/PeerJoined/FieldSnapshot — 对自己冗余）。
     pub fn new_local(seed: u64, settings: AppSettings, display_name: &str) -> Self {
         let server = Rc::new(RefCell::new(Server::new(seed)));
         let eid = {
@@ -403,7 +403,7 @@ impl Game {
     }
 
     /// 启动一个 Remote 客户端：连信令、等 Host SDP。
-    /// Phase 5：Remote 端 `server` 是**纯方块数据宿主**（接收 ChunkSnapshot / BlockUpdate 写入），
+    /// Phase 5：Remote 端 `server` 是**纯方块数据宿主**（接收 FieldSnapshot / FieldDelta 写入），
     /// 不调 add_player / tick / handle_message — 自身 entity_id 由 Welcome 填回。
     pub fn new_remote(
         settings: AppSettings,

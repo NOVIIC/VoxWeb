@@ -141,7 +141,7 @@ fn handle_break_input(&mut self, hit: RaycastHit) {
     let input_tick = self.local_input_tick;
     let player_position = self.physics.feet_position;
 
-    // 本地立即修改（仅 Remote 视角；Local/Host 与 server 共享世界，仍等权威 BlockUpdate）
+    // 本地立即修改（仅 Remote 视角；Local/Host 与 server 共享世界，仍等权威 FieldDelta）
     if matches!(self.role, Role::Remote) {
         self.world_view.set_block(hit.pos, BlockID::AIR);
         self.mesh_jobs.enqueue(hit.pos.to_chunk_pos(), Priority::High);
@@ -172,7 +172,7 @@ fn handle_action_ack(&mut self, ack: ActionAck) {
     let Some(action) = pending else { return; };
 
     if ack.accepted {
-        // 等 BlockUpdate 真正 commit；这里仅留作日志（也可以直接什么都不做）
+        // 等 FieldDelta 真正 commit；这里仅留作日志（也可以直接什么都不做）
     } else {
         // 回滚
         self.world_view.set_block(action.pos, action.backup);
@@ -182,16 +182,16 @@ fn handle_action_ack(&mut self, ack: ActionAck) {
 }
 ```
 
-### 3.4 BlockUpdate 处理
+### 3.4 FieldDelta 处理
 
 ```rust
-fn handle_block_update(&mut self, update: BlockUpdate) {
-    self.world_view.set_block(update.pos, update.block);
+fn handle_field_delta(&mut self, update: FieldDelta) {
+    self.world_view.set_block(update.pos, update.cell.to_block_id());
     self.mesh_jobs.enqueue(update.pos.to_chunk_pos(), Priority::High);
 }
 ```
 
-> 注意：BlockUpdate 可能在 ActionAck 之前到达（reliable 但分通道乱序在某些实现下可能发生；保险起见两条都按"幂等更新"处理）。
+> 注意：FieldDelta 可能在 ActionAck 之前到达（reliable 但分通道乱序在某些实现下可能发生；保险起见两条都按"幂等更新"处理）。
 
 ### 3.5 超时处理
 

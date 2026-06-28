@@ -305,7 +305,7 @@ pub fn run_until_budget(
 ### 触发条件
 
 将 chunk 加入网格化队列：
-- 首次加载（Local / Host 由 `ChunkLoader.update` 触发；Remote 由 ChunkSnapshot 组装完成触发）
+- 首次加载（Local / Host 由 `ChunkLoader.update` 触发；Remote 由 FieldSnapshot 组装完成触发）
 - 方块更新（自身或相邻 chunk 边界方块）
 - 邻居 chunk 由"未加载"变"已加载"时，由 `ChunkLoader.update` 显式触发（见 `docs/modules/client.md` §6.7）
 - 玩家走出后再回来，由 `ChunkLoader.update` 触发
@@ -322,8 +322,8 @@ pub fn run_until_budget(
 - 同步快
 
 ### Remote
-- 收到 `ChunkSnapshot` → assembler 组装完成 → `world_view.insert(pos, chunk)` → 入队
-- 收到 `BlockUpdate` → `world_view.set_block` → 该 chunk + 6 邻居（如果方块在边界）入队
+- 收到 `FieldSnapshot` → assembler 组装完成 → `world.load_field_chunk_from_storage(pos, field)` → 入队
+- 收到 `FieldDelta` → `world.set_block_untracked(pos, cell.to_block_id())` → 该 chunk + 6 邻居（如果方块在边界）入队
 
 ### 边界方块更新
 方块在 `lx == 0` / `lx == 15` 等边界时，邻居 chunk 也需重网格化（因为跨区块剔除可能改变）。
