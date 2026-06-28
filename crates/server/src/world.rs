@@ -6,10 +6,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use voxweb_core::block::{BlockID, MaterialCell};
+use voxweb_core::block::BlockID;
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
-use voxweb_core::field::FieldChunk;
-use voxweb_core::object::{FreeObject, ObjectID};
 
 use crate::persistence::PersistenceManager;
 use crate::terrain::TerrainGenerator;
@@ -21,23 +19,18 @@ pub const DEFAULT_CHUNK_CACHE_CAPACITY: usize = 4096;
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
-    /// MaterialField 镜像。当前渲染/碰撞仍使用 `chunks` 适配视图，但权威写入会同步维护这里。
-    pub field_chunks: HashMap<ChunkPos, FieldChunk>,
-    /// 从静态场提取并投影过的材质团。第一版只记录生命周期结果，渲染仍靠投影后的 FieldDelta。
-    pub free_objects: HashMap<ObjectID, FreeObject>,
     pub terrain: TerrainGenerator,
     /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
     pub tick_count: u64,
     /// Phase 5：被 set_block 修改过的 ChunkPos 集合。
     /// 持久化层（Phase 8）通过 drain_dirty 取出待写；Phase 5 暂不消费。
     pub dirty_chunks: HashSet<ChunkPos>,
-    /// Phase 8：dirty / in-flight / retry 状态机。`dirty_chunks` 保留为轻量只读视图，便于测试和调试。
+    /// Phase 8：dirty / in-flight / retry 状态机。保留 `dirty_chunks` 是为了兼容旧测试和旧入口。
     pub persistence: PersistenceManager,
     /// 简易 LRU 顺序表。front 旧、back 新；容量不引入外部 crate。
     lru_order: VecDeque<ChunkPos>,
     pinned_chunks: HashSet<ChunkPos>,
     chunk_cache_capacity: usize,
-    next_object_id: ObjectID,
 }
 
 impl World {
@@ -45,8 +38,6 @@ impl World {
         Self {
             seed,
             chunks: HashMap::new(),
-            field_chunks: HashMap::new(),
-            free_objects: HashMap::new(),
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
             dirty_chunks: HashSet::new(),
@@ -54,7 +45,6 @@ impl World {
             lru_order: VecDeque::new(),
             pinned_chunks: HashSet::new(),
             chunk_cache_capacity: DEFAULT_CHUNK_CACHE_CAPACITY,
-            next_object_id: 1,
         }
     }
 
@@ -62,18 +52,11 @@ impl World {
     /// Phase 2 的 chunk 入口点（由 client::chunk_loader 调用）。
     pub fn ensure_chunk_generated(&mut self, pos: ChunkPos) {
         if self.chunks.contains_key(&pos) {
-            if !self.field_chunks.contains_key(&pos)
-                && let Some(chunk) = self.chunks.get(&pos)
-            {
-                self.field_chunks.insert(pos, FieldChunk::from_chunk(chunk));
-            }
             self.touch_chunk(pos);
             return;
         }
         let chunk = self.terrain.generate_chunk(pos);
-        let field = FieldChunk::from_chunk(&chunk);
         self.chunks.insert(pos, chunk);
-        self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
         self.evict_if_needed();
     }
@@ -82,7 +65,6 @@ impl World {
     pub fn unload_chunk(&mut self, pos: ChunkPos) {
         if !self.persistence.is_dirty_or_in_flight(pos) {
             self.chunks.remove(&pos);
-            self.field_chunks.remove(&pos);
             self.lru_order.retain(|p| *p != pos);
         }
     }
@@ -126,11 +108,6 @@ impl World {
                 return;
             }
             chunk.blocks[idx] = block;
-            let lx = pos.x.rem_euclid(CHUNK_X as i32) as usize;
-            let lz = pos.z.rem_euclid(CHUNK_Z as i32) as usize;
-            if let Some(field) = self.field_chunks.get_mut(&cp) {
-                field.set(lx, pos.y as usize, lz, MaterialCell::from_block_id(block));
-            }
             if track_dirty {
                 self.dirty_chunks.insert(cp);
                 self.persistence.mark_dirty(cp);
@@ -162,7 +139,7 @@ impl World {
         drained
     }
 
-    /// 将 dirty 移入 in-flight，并同步 `dirty_chunks` 视图。
+    /// 将 dirty 移入 in-flight，并同步旧 dirty 集合。
     pub fn snapshot_dirty(&mut self, limit: usize, current_tick: u64) -> Vec<ChunkPos> {
         let positions = self.persistence.snapshot_dirty(limit, current_tick);
         for pos in &positions {
@@ -171,7 +148,7 @@ impl World {
         positions
     }
 
-    /// 持久化写入成功后清理 dirty 状态。
+    /// 持久化写入成功后同时清理新旧 dirty 状态。
     pub fn commit_flushed(&mut self, positions: &[ChunkPos]) {
         for pos in positions {
             self.dirty_chunks.remove(pos);
@@ -179,7 +156,7 @@ impl World {
         self.persistence.commit_flushed(positions);
     }
 
-    /// 持久化写入失败后恢复 dirty 状态。
+    /// 持久化写入失败后同时恢复新旧 dirty 状态。
     pub fn record_flush_failure(&mut self, positions: &[ChunkPos], current_tick: u64) {
         for pos in positions {
             self.dirty_chunks.insert(*pos);
@@ -193,33 +170,11 @@ impl World {
         self.tick_count += 1;
     }
 
-    /// 直接载入持久化层读出的 FieldChunk，不标 dirty。
-    pub fn load_field_chunk_from_storage(&mut self, pos: ChunkPos, field: FieldChunk) {
-        let chunk = field.to_chunk();
+    /// 直接载入持久化层读出的 chunk，不标 dirty。
+    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: Chunk) {
         self.chunks.insert(pos, chunk);
-        self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
         self.evict_if_needed();
-    }
-
-    pub fn record_projected_free_object(
-        &mut self,
-        cells: &[(Position, BlockID)],
-        final_offset_y: i32,
-    ) -> Option<ObjectID> {
-        let id = self.next_object_id;
-        self.next_object_id = if self.next_object_id == ObjectID::MAX {
-            1
-        } else {
-            self.next_object_id + 1
-        };
-        let materials = cells
-            .iter()
-            .map(|(pos, block)| (*pos, *block))
-            .collect::<Vec<_>>();
-        let object = FreeObject::projected_from_cells(id, &materials, final_offset_y)?;
-        self.free_objects.insert(id, object);
-        Some(id)
     }
 
     pub fn set_chunk_cache_capacity(&mut self, capacity: usize) {
@@ -265,7 +220,6 @@ impl World {
                 continue;
             }
             self.chunks.remove(&candidate);
-            self.field_chunks.remove(&candidate);
         }
     }
 }
@@ -284,7 +238,6 @@ mod tests {
         // 首次生成
         world.ensure_chunk_generated(pos);
         assert!(world.chunks.contains_key(&pos));
-        assert!(world.field_chunks.contains_key(&pos));
         let snapshot: Vec<BlockID> = world.chunks[&pos].blocks.clone();
         // Perlin 地形：至少应有非 AIR 方块（基岩 + 一层地形）
         assert!(
@@ -295,7 +248,6 @@ mod tests {
         // 第二次调用：不应覆盖（同 blocks）
         world.ensure_chunk_generated(pos);
         assert_eq!(world.chunks[&pos].blocks, snapshot);
-        assert_eq!(world.field_chunks[&pos].to_chunk().blocks, snapshot);
     }
 
     #[test]
@@ -326,7 +278,6 @@ mod tests {
         assert!(world.chunks.contains_key(&pos));
         world.unload_chunk(pos);
         assert!(!world.chunks.contains_key(&pos));
-        assert!(!world.field_chunks.contains_key(&pos));
     }
 
     #[test]
@@ -335,12 +286,6 @@ mod tests {
         world.ensure_chunk_generated(ChunkPos::new(0, 0));
         world.set_block(Position::new(5, 100, 7), BlockID::STONE);
         assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
-        assert_eq!(
-            world.field_chunks[&ChunkPos::new(0, 0)]
-                .get(5, 100, 7)
-                .to_block_id(),
-            BlockID::STONE
-        );
     }
 
     #[test]
@@ -363,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_flushed_clears_dirty_view() {
+    fn commit_flushed_clears_legacy_dirty_set() {
         let mut world = World::new(0);
         let cp = ChunkPos::new(0, 0);
         world.ensure_chunk_generated(cp);
@@ -379,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn record_flush_failure_restores_dirty_view() {
+    fn record_flush_failure_restores_legacy_dirty_set() {
         let mut world = World::new(0);
         let cp = ChunkPos::new(0, 0);
         world.ensure_chunk_generated(cp);
@@ -400,10 +345,6 @@ mod tests {
 
         world.set_block_untracked(Position::new(5, 100, 7), BlockID::STONE);
         assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
-        assert_eq!(
-            world.field_chunks[&cp].get(5, 100, 7).to_block_id(),
-            BlockID::STONE
-        );
         assert!(world.dirty_chunks.is_empty());
         assert_eq!(world.persistence.dirty_len(), 0);
     }

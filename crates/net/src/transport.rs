@@ -1,7 +1,7 @@
 //! 通道分配与消息序列化辅助。
 //!
 //! 两条 DataChannel：
-//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、FieldRequest/FieldSnapshot、FieldDelta、FreeObjectProject、ActionAck、Chat、PeerJoined/Left
+//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、ChunkRequest/ChunkSnapshot、BlockUpdate、ActionAck、Chat、PeerJoined/Left
 //! - `unreliable` (unordered + 0 retransmits): PlayerInput、PlayerTick、Ping/Pong
 //!
 //! 选择依据见 docs/networking/protocol.md §三 通道列。
@@ -22,7 +22,7 @@ pub fn channel_for_client_message(msg: &ClientMessage) -> ChannelKind {
     match msg {
         ClientMessage::PlayerInput { .. } | ClientMessage::Ping { .. } => ChannelKind::Unreliable,
         ClientMessage::Hello { .. }
-        | ClientMessage::FieldRequest { .. }
+        | ClientMessage::ChunkRequest { .. }
         | ClientMessage::Break { .. }
         | ClientMessage::Place { .. }
         | ClientMessage::Chat { .. } => ChannelKind::Reliable,
@@ -35,9 +35,8 @@ pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
         ServerMessage::PlayerTick { .. } | ServerMessage::Pong { .. } => ChannelKind::Unreliable,
         ServerMessage::Welcome { .. }
         | ServerMessage::HostSettings { .. }
-        | ServerMessage::FieldSnapshot { .. }
-        | ServerMessage::FieldDelta { .. }
-        | ServerMessage::FreeObjectProject { .. }
+        | ServerMessage::ChunkSnapshot { .. }
+        | ServerMessage::BlockUpdate { .. }
         | ServerMessage::ActionAck { .. }
         | ServerMessage::PeerJoined { .. }
         | ServerMessage::PeerLeft { .. }
@@ -105,7 +104,7 @@ mod tests {
             ChannelKind::Reliable
         );
         assert_eq!(
-            channel_for_client_message(&ClientMessage::FieldRequest {
+            channel_for_client_message(&ClientMessage::ChunkRequest {
                 center: voxweb_core::ChunkPos::new(0, 0),
                 render_distance: 2,
                 chunks: vec![voxweb_core::ChunkPos::new(1, -2)],

@@ -4,7 +4,6 @@
 //! 与服务端校验（放置位置不能压在玩家身上）共用同一套定义，避免两端漂移。
 
 use glam::Vec3;
-use serde::{Deserialize, Serialize};
 
 use crate::chunk::Position;
 
@@ -16,7 +15,7 @@ pub const PLAYER_HEIGHT: f32 = 1.8;
 pub const PLAYER_EYE_OFFSET: f32 = 1.62;
 
 /// 轴对齐包围盒。`min.x <= max.x` 等约束由调用者保证。
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Aabb {
     pub min: Vec3,
     pub max: Vec3,

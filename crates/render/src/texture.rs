@@ -197,29 +197,6 @@ pub fn generate_atlas_rgba() -> Vec<u8> {
         };
         rgba([58 + n, 124 + n + leaf, 62 + n], 255)
     });
-    paint_tile(&mut data, 9, |x, y| {
-        let mortar = x.is_multiple_of(16) || y.is_multiple_of(8) || (y / 8) % 2 == 1 && x == 8;
-        if mortar {
-            rgba([70, 74, 72], 255)
-        } else {
-            let n = signed_noise(x, y, 131, 14);
-            let chip = if noise(x, y, 137).is_multiple_of(17) {
-                -22
-            } else {
-                0
-            };
-            rgba([116 + n + chip, 120 + n + chip, 116 + n + chip], 255)
-        }
-    });
-    paint_tile(&mut data, 10, |x, y| {
-        let n = signed_noise(x, y, 151, 18);
-        let crack = if (x * 3 + y * 5 + noise(x, y, 157) % 11).is_multiple_of(23) {
-            -42
-        } else {
-            0
-        };
-        rgba([48 + n + crack, 52 + n + crack, 56 + n + crack], 255)
-    });
 
     data
 }
@@ -283,8 +260,6 @@ mod tests {
         assert_ne!(pixel(&data, 1, 8, 8), pixel(&data, 0, 8, 8));
         assert_ne!(pixel(&data, 4, 8, 8), pixel(&data, 0, 8, 8));
         assert_ne!(pixel(&data, 8, 8, 8), pixel(&data, 0, 8, 8));
-        assert_ne!(pixel(&data, 9, 8, 8), pixel(&data, 0, 8, 8));
-        assert_ne!(pixel(&data, 10, 8, 8), pixel(&data, 0, 8, 8));
     }
 
     #[test]

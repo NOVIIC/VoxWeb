@@ -302,8 +302,8 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
         {
             let server_ref = server.borrow();
             for pos in &snapshot_positions {
-                if let Some(field) = server_ref.world.field_chunks.get(pos) {
-                    let bytes = voxweb_core::field::encode(field);
+                if let Some(chunk) = server_ref.world.chunks.get(pos) {
+                    let bytes = voxweb_core::chunk::encode(chunk);
                     encoded_sizes.push((*pos, bytes.len() as u64));
                     encoded.push((*pos, bytes));
                 }
@@ -899,8 +899,8 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
-                                Ok(field) => loaded.push((pos, field)),
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -916,10 +916,8 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, field) in loaded {
-                        g.server
-                            .borrow_mut()
-                            .load_field_chunk_from_storage(pos, field);
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -964,8 +962,8 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
-                                Ok(field) => loaded.push((pos, field)),
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -981,10 +979,8 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, field) in loaded {
-                        g.server
-                            .borrow_mut()
-                            .load_field_chunk_from_storage(pos, field);
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -1029,8 +1025,8 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
-                                Ok(field) => loaded.push((pos, field)),
+                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                                Ok(chunk) => loaded.push((pos, chunk)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -1046,10 +1042,8 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, field) in loaded {
-                        g.server
-                            .borrow_mut()
-                            .load_field_chunk_from_storage(pos, field);
+                    for (pos, chunk) in loaded {
+                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -1143,8 +1137,8 @@ fn spawn_persisted_chunk_load(
 ) {
     wasm_bindgen_futures::spawn_local(async move {
         let loaded = match storage.load_chunk(pos).await {
-            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
-                Ok(field) => Some(Ok(field)),
+            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
+                Ok(chunk) => Some(Ok(chunk)),
                 Err(e) => {
                     log::warn!("[storage] decode persisted chunk {pos:?} failed: {e:?}");
                     Some(Err(()))
@@ -1166,16 +1160,14 @@ fn spawn_persisted_chunk_load(
         };
         g.pending_persisted_loads.remove(&pos);
         match loaded {
-            Some(Ok(field)) => {
+            Some(Ok(chunk)) => {
                 let should_apply = {
                     let server = g.server.borrow();
                     !server.world.persistence.is_dirty_or_in_flight(pos)
                 };
                 g.loaded_persisted_chunks.insert(pos);
                 if should_apply {
-                    g.server
-                        .borrow_mut()
-                        .load_field_chunk_from_storage(pos, field);
+                    g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
                     enqueue_chunk_and_neighbors(&mut g.mesh_jobs, pos, MeshPriority::High);
                 } else {
                     log::debug!(
@@ -1213,7 +1205,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
     // —— 1. 推进网络状态机（与 InGame 复用 poll_net 路径）——
     poll_net(app);
 
-    // —— 1b. drain Server→Client inbox（Remote 端收 FieldSnapshot / Welcome 等）——
+    // —— 1b. drain Server→Client inbox（Remote 端收 ChunkSnapshot / Welcome 等）——
     {
         let mut a = app.borrow_mut();
         if let Some(game) = a.game.as_mut() {
@@ -1266,7 +1258,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
                 drop(server_mut);
                 if !requests.is_empty() {
                     log::debug!("[remote] request {} spawn preload chunks", requests.len());
-                    game.net.send_client_message(ClientMessage::FieldRequest {
+                    game.net.send_client_message(ClientMessage::ChunkRequest {
                         center: chunk_pos_of(voxweb_server::DEFAULT_SPAWN),
                         render_distance: game.chunk_loader.render_distance.max(0) as u32,
                         chunks: requests,
@@ -1940,7 +1932,7 @@ fn render_game_frame(
     };
 
     // —— 5. ChunkLoader 滚动 ——
-    // Local/Host 直接生成；Remote 只请求缺失 chunk，由 Host 回 FieldSnapshot。
+    // Local/Host 直接生成；Remote 只请求缺失 chunk，由 Host 回 ChunkSnapshot。
     {
         let mut a = app.borrow_mut();
         let App {
@@ -1963,7 +1955,7 @@ fn render_game_frame(
                 drop(server_mut);
                 if !requests.is_empty() {
                     log::debug!("[remote] request {} chunks near camera", requests.len());
-                    game.net.send_client_message(ClientMessage::FieldRequest {
+                    game.net.send_client_message(ClientMessage::ChunkRequest {
                         center: chunk_pos_of(camera_pos),
                         render_distance: game.chunk_loader.render_distance.max(0) as u32,
                         chunks: requests,
@@ -2453,8 +2445,8 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         {
             let server_ref = server.borrow();
             for pos in &positions {
-                if let Some(field) = server_ref.world.field_chunks.get(pos) {
-                    let bytes = voxweb_core::field::encode(field);
+                if let Some(chunk) = server_ref.world.chunks.get(pos) {
+                    let bytes = voxweb_core::chunk::encode(chunk);
                     encoded_sizes.push((*pos, bytes.len() as u64));
                     encoded.push((*pos, bytes));
                 }
@@ -2575,7 +2567,7 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         let input_tick = game.local_input_tick;
         let player_position = game.physics.feet_position;
         // Remote 的 server.world 只是本地世界视图，可以安全乐观修改；
-        // Local/Host 与权威 server 共享同一份 world，仍等 FieldDelta，避免提前改世界干扰校验。
+        // Local/Host 与权威 server 共享同一份 world，仍等 BlockUpdate，避免提前改世界干扰校验。
         if game.mode == GameMode::Remote {
             game.server
                 .borrow_mut()
@@ -2733,17 +2725,15 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     .or_insert_with(|| RemotePlayerState::new(display_name.clone(), ex_eid));
             }
             // Remote：清掉本地占位生成的 chunks（Phase 4 用 seed=0 生成了一个空世界），
-            // 后续 FieldSnapshot 逐个填充 Host 的真实世界。
+            // 后续 ChunkSnapshot 逐个填充 Host 的真实世界。
             if game.mode == GameMode::Remote {
-                let mut server = game.server.borrow_mut();
-                server.world.chunks.clear();
-                server.world.field_chunks.clear();
+                game.server.borrow_mut().world.chunks.clear();
             }
         }
         ServerMessage::HostSettings { render_distance } => {
             apply_host_render_distance(game, render_distance);
         }
-        ServerMessage::FieldSnapshot {
+        ServerMessage::ChunkSnapshot {
             pos,
             frag_index,
             frag_total,
@@ -2753,11 +2743,10 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 .chunk_assembler
                 .ingest(pos, frag_index, frag_total, payload)
             {
-                match voxweb_core::field::decode(&full) {
-                    Ok(field) => {
-                        game.server
-                            .borrow_mut()
-                            .load_field_chunk_from_storage(pos, field);
+                match voxweb_core::chunk::decode_chunk(&full) {
+                    Ok(blocks) => {
+                        let chunk = voxweb_core::chunk::Chunk { blocks };
+                        game.server.borrow_mut().world.chunks.insert(pos, chunk);
                         game.chunk_loader.mark_loaded(pos);
                         // 自己 + 相邻 8 个 chunk 都重 mesh
                         for dz in -1..=1i32 {
@@ -2770,13 +2759,12 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                         }
                     }
                     Err(e) => {
-                        log::warn!("[client] FieldSnapshot {pos:?} decode failed: {e:?}");
+                        log::warn!("[client] ChunkSnapshot {pos:?} decode failed: {e}");
                     }
                 }
             }
         }
-        ServerMessage::FieldDelta { pos, cell } => {
-            let block = cell.to_block_id();
+        ServerMessage::BlockUpdate { pos, block } => {
             // Remote：先写 world，再做 remesh（因为 Remote 的 server 不做本地 handle_message）
             if game.mode == GameMode::Remote {
                 game.server
@@ -2786,20 +2774,6 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             }
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
-            }
-        }
-        ServerMessage::FreeObjectProject { deltas, .. } => {
-            for (pos, cell) in deltas {
-                let block = cell.to_block_id();
-                if game.mode == GameMode::Remote {
-                    game.server
-                        .borrow_mut()
-                        .world
-                        .set_block_untracked(pos, block);
-                }
-                for cp in affected_chunks(pos) {
-                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
-                }
             }
         }
         ServerMessage::ActionAck {

@@ -3,9 +3,9 @@
 > **何时阅读**：改存档逻辑；增删存储字段；调写入频率；处理配额异常；评估迁移到 Worker 同步路径
 > **关联文档**：[`README.md`](../../README.md) · [`modules/server.md`](../modules/server.md) · [`modules/client.md`](../modules/client.md) · [`reference.md`](../reference.md) · [`roadmap.md`](../roadmap.md)
 >
-> **当前状态**：Variant A 已落地。`field::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
+> **当前状态**：Variant A 已落地。`chunk::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
 > `PersistenceManager` snapshot/commit/failure、启动 prime、运行时按需 OPFS 覆盖、3s 周期 flush、
-> `pagehide` / 回大厅 best-effort flush、LRU/pinned、配额 UI、`storage_version` 不匹配拒绝与大厅删档入口已实现。
+> `pagehide` / 回大厅 best-effort flush、LRU/pinned、配额 UI、`storage_version` 高版本拒绝与大厅删档入口已实现。
 > Worker sync handle 作为可选升级路径保留在 §十二。
 
 ---
@@ -16,7 +16,7 @@
 - Remote 不持有权威世界
 - 重连时从 Host 重新拉取快照即可
 
-存档生命周期绑定到 **world key**。当前 UI 创建新存档时使用 `<created_at_s>__<seed>`，因此同一个 seed 也可以创建多份独立世界；大厅选择已有存档时按 key 重新打开。不再保留 `room_id + seed` 旧命名入口。
+存档生命周期绑定到 **world key**。当前 UI 创建新存档时使用 `<created_at_s>__<seed>`，因此同一个 seed 也可以创建多份独立世界；大厅选择已有存档时按 key 重新打开。`room_id + seed` 形式仅作为旧版兼容 / 迁移命名保留，不再作为新存档的自动复用规则。
 
 > 背景：本项目评估过 IndexedDB，但在"多人长期房间"（约 10000 dirty chunk）压力下，IDB 在配额、内存常驻、启动加载、退出 flush 四方面都会撞墙，故改为 OPFS。详见下节对比。
 
@@ -48,7 +48,7 @@ opfs:/voxweb/
 └── <world_key>/                     # 一个世界一个目录，当前为 <created_at_s>__<seed>
     ├── world.json                   # WorldRecord（JSON，便于 DevTools 调试）
     └── chunks/
-        ├── <cx>_<cz>.bin            # field::encode() 输出：FieldChunk + bincode
+        ├── <cx>_<cz>.bin            # encode() 输出：palette + RLE + bincode
         ├── 0_0.bin
         ├── 0_1.bin
         └── ...
@@ -64,7 +64,7 @@ opfs:/voxweb/
   "display_name": "abc123",
   "created_at_ms": 1746000000000,
   "updated_at_ms": 1746000060000,
-  "storage_version": 2,                 // 见第十节存储版本策略
+  "storage_version": 1,                 // 见第十节 migration
   "protocol_version": 1                 // 写入时的 ClientMessage 协议版本
 }
 ```
@@ -82,34 +82,24 @@ opfs:/voxweb/
 
 ### 单 chunk 文件 `<cx>_<cz>.bin`
 
-二进制，结构由 [`crates/core/src/field.rs`](../../crates/core/src/field.rs) 的 `encode` / `decode` 决定（见第四节）。命名约定：负坐标使用 `n` 前缀，例如 `n1_2.bin` 表示 `(-1, 2)`；这样 OPFS 文件名跨平台安全（避免某些实现不接受连字符）。
+二进制，结构由 [`crates/core/src/chunk.rs`](../../crates/core/src/chunk.rs) 的 `encode` / `decode` 决定（见第四节）。命名约定：负坐标使用 `n` 前缀，例如 `n1_2.bin` 表示 `(-1, 2)`；这样 OPFS 文件名跨平台安全（避免某些实现不接受连字符）。
 
 ---
 
-## 四、FieldChunk 存储格式
+## 四、Chunk 压缩格式（palette + RLE）
 
-> OPFS 磁盘存储与网络 `FieldSnapshot` 均使用 `FieldChunk` 编码。运行时仍维护 dense `Chunk` 作为当前渲染/碰撞适配视图。
-> 当前 `FloatingOnly` 硬材质 FreeObject 会在同一权威步骤投影回 `FieldChunk`，因此 OPFS 只保存投影后的静态场；后续引入跨帧 active FreeObject 后再扩展 `world.json` / object record。
+> 此格式同时用于 **OPFS 磁盘存储**（本节）和 **ChunkSnapshot 网络传输**（[`networking/protocol.md` §五](../networking/protocol.md#五chunk-快照同步)）。网络和磁盘侧都复用 `crates/core/src/chunk.rs` 的 encode/decode 逻辑。
 
-`FieldChunk` 是统一体素方案的存档底座：每个 chunk 由 16×16 个 column 组成，column 可以是 span 压缩，也可以在高熵编辑后退化为 dense cell 列。
+未压缩的 `Chunk` 在内存中是 `Vec<BlockID>`，长度 65536，每个 `BlockID` 2 字节 = **128 KB/chunk**。万级 chunk 直接 dump 会撑爆 OPFS 配额。
 
 实际格式（bincode 2.x，little-endian + varint）：
 
 ```rust
 #[derive(Serialize, Deserialize)]
-struct StoredFieldChunk {
-    version: u8,             // 2（与 STORAGE_VERSION 同步）
-    field: FieldChunk,
-}
-
-struct FieldChunk {
-    columns: Box<[Column]>,  // 逻辑长度恒为 16 * 16
-    free_object_refs: Vec<ObjectID>,
-}
-
-enum Column {
-    Spans(Vec<Span>),
-    Dense(Box<[MaterialCell]>), // 逻辑长度恒为 256
+struct EncodedChunk {
+    version: u8,             // 1（与 STORAGE_VERSION 同步）
+    palette: Vec<BlockID>,   // 出现过的所有 BlockID，无重复，典型 < 32 项
+    runs: Vec<(u16, u32)>,   // (palette_index, run_length)，runs 总长 == CHUNK_SIZE
 }
 ```
 
@@ -125,10 +115,10 @@ enum Column {
 ### 公开接口
 
 ```rust
-// crates/core/src/field.rs
-pub const STORAGE_VERSION: u8 = 2;
+// crates/core/src/chunk.rs
+pub const STORAGE_VERSION: u8 = 1;
 
-pub fn encode(field: &FieldChunk) -> Vec<u8>;
+pub fn encode(chunk: &Chunk) -> Vec<u8>;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -138,10 +128,10 @@ pub enum DecodeError {
     LengthMismatch(usize),
 }
 
-pub fn decode(bytes: &[u8]) -> Result<FieldChunk, DecodeError>;
+pub fn decode(bytes: &[u8]) -> Result<Chunk, DecodeError>;
 ```
 
-> 注意：当前 `core::lib.rs` 已 re-export `protocol::encode`（消息编码）。FieldChunk 的 encode/decode 以 `voxweb_core::field::encode` / `decode` 形式引用，避免命名冲突。
+> 注意：当前 `core::lib.rs` 已 re-export `protocol::encode`（消息编码）。chunk 的 encode/decode 仅以 `voxweb_core::chunk::encode` 形式引用，**不**在 lib.rs 顶层 re-export，避免命名冲突。
 
 ### 单测要求
 
@@ -243,8 +233,8 @@ async fn start_host(app: &mut App, room_id: String, seed: u64) {
     for pos in chunks_within(spawn, 4) {
         if known.contains(&pos) {
             if let Some(bytes) = storage.load_chunk(pos).await? {
-                let field = voxweb_core::field::decode(&bytes)?;
-                server.load_field_chunk_from_storage(pos, field);
+                let chunk = voxweb_core::chunk::decode(&bytes)?;
+                server.load_chunk_from_storage(pos, chunk);
             }
         }
     }
@@ -270,7 +260,7 @@ async fn start_host(app: &mut App, room_id: String, seed: u64) {
 - `loaded_persisted_chunks`：本次运行已用 OPFS 数据覆盖过的 chunk
 - `pending_persisted_loads`：已发起但尚未完成的异步读取
 
-Local / Host 每帧更新视距内 chunk 后，会为 `known_persisted - loaded_persisted_chunks - pending_persisted_loads` 发起 `storage.load_chunk(pos)`。读取成功后调用 `server.load_field_chunk_from_storage(pos, field)` 覆盖运行时世界，并重网格化该 chunk 与水平邻居；若该 chunk 已经 dirty / in-flight，则跳过覆盖，避免磁盘数据覆盖玩家刚刚做的新编辑。
+Local / Host 每帧更新视距内 chunk 后，会为 `known_persisted - loaded_persisted_chunks - pending_persisted_loads` 发起 `storage.load_chunk(pos)`。读取成功后调用 `server.load_chunk_from_storage(pos, chunk)` 覆盖运行时世界，并重网格化该 chunk 与水平邻居；若该 chunk 已经 dirty / in-flight，则跳过覆盖，避免旧存档覆盖玩家刚刚做的新编辑。
 
 注意：server crate 本身保持平台无关（无 `web-sys` 依赖）。异步 load 由 client 端协程发起，完成后回写到本地权威 `server.world`。
 
@@ -293,8 +283,8 @@ fn maybe_flush_persistence(&mut self) {
     // 主线程 encode（每帧最多 4 chunk → 单帧 < 4 ms）
     let encoded: Vec<(ChunkPos, Vec<u8>)> = to_flush.iter()
         .filter_map(|pos| {
-            let field = persistence.world.peek_field_chunk(*pos)?;
-            Some((*pos, voxweb_core::field::encode(field)))
+            let chunk = persistence.world.peek_chunk(*pos)?;
+            Some((*pos, voxweb_core::chunk::encode(chunk)))
         })
         .collect();
     let positions: Vec<ChunkPos> = encoded.iter().map(|(p, _)| *p).collect();
@@ -426,18 +416,21 @@ HUD：SAVE 4.2 MB / 7.9 GB
 
 ---
 
-## 十、存储版本策略
+## 十、协议 migration（替代强制删档）
 
-`world.json.storage_version` 写入 `STORAGE_VERSION`。当前不维护存档迁移；版本不匹配时直接拒绝打开，由玩家在大厅删档或新建世界。
+`world.json.storage_version` 写入 `STORAGE_VERSION`。加载时三分支：
 
 ```rust
-if world.storage_version != STORAGE_VERSION {
-    return Err(StorageError::NeedsUpgrade {
-        found: world.storage_version,
-        supported: STORAGE_VERSION,
-    });
+match world.storage_version.cmp(&STORAGE_VERSION) {
+    Ordering::Equal => { /* 直接用 */ }
+    Ordering::Less => migrate(&mut world, &storage)?,     // 跑 migrations[old..new]
+    Ordering::Greater => return Err(StorageError::NeedsUpgrade),  // 用户需升级 VoxWeb
 }
 ```
+
+`migrations` 是有序数组，每项 `fn(&mut World, &OpfsStorage) -> Result<(), MigrationError>`。当前仅含 identity（v1→v1）；后续 schema 升级时新增对应迁移步骤。
+
+不再"版本不同就删档"——大存档用户的累积损失不可接受。
 
 ---
 
@@ -451,7 +444,7 @@ if world.storage_version != STORAGE_VERSION {
 | OPFS 读取失败 | 视为 chunk 不存在 → 走 terrain 生成；记录损坏 key 供调试 |
 | 配额满 | UI 弹红色提示 → 玩家手动清理或导出 |
 | Chunk 解码失败 | 视为不存在；调用 `tracing::warn!`，文件保留供事后分析 |
-| `storage_version` 不匹配 | 大厅显示版本不匹配；玩家可删档或创建新世界 |
+| `storage_version` 高于本版本 | 大厅显示"需升级 VoxWeb 才能打开此存档"，提供升级链接 |
 
 ---
 
@@ -557,5 +550,5 @@ window.voxwebDebug.quota()                   // 打印 quota / usage
 - 多版本备份 / 时光回溯
 - 自动云同步（与 GitHub/Drive 集成）
 - 加密存档（涉及密钥管理；浏览器内 ROI 低）
-- Chunk 增量 diff（每次只存 delta） — 实现复杂收益有限，已用 FieldChunk span/dense column store 摊薄
+- Chunk 增量 diff（每次只存 delta） — 实现复杂收益有限，已用 palette+RLE 摊薄
 - 跨域共享存档（不同站点的 OPFS 互相隔离，无法直接共享）
