@@ -10,7 +10,7 @@
 `render` crate 封装 wgpu，对外提供：
 - 与 `<canvas>` 绑定的 `Renderer` 入口
 - Render Graph 多 Pass 调度
-- Chunk 网格生成（贪婪算法 + 跨区块面剔除 + u32 顶点压缩）
+- Chunk 网格生成（硬方块贪婪算法 + 软颗粒平滑提面 + 跨区块面剔除 + 顶点格式管理）
 - 纹理图集 + 深度纹理 + Uniform Buffer 资源管理
 
 **不负责**：
@@ -34,8 +34,8 @@ crates/render/src/
 │   ├── skybox.rs       天空盒 Pass
 │   ├── transparent.rs  半透明 Pass
 │   └── selection.rs    选中方块线框 Pass
-├── chunk_mesh.rs       贪婪网格化 + 跨区块面剔除 + AO + bounds
-├── vertex.rs           u32 压缩格式 + 解包工具
+├── chunk_mesh.rs       硬方块贪婪网格化 + SmoothGranular 平滑提面 + 跨区块面剔除 + AO + bounds
+├── vertex.rs           硬方块 u32 压缩格式 + 软表面 float 顶点格式
 ├── texture.rs          纹理图集
 └── shaders/
     ├── chunk.wgsl      实体方块着色器
@@ -75,9 +75,9 @@ pub async fn init_device(canvas: &web_sys::HtmlCanvasElement) -> Result<DeviceCo
 
 ---
 
-## 四、`vertex.rs` — u32 压缩顶点格式
+## 四、`vertex.rs` — 顶点格式
 
-详细布局见 [`features/meshing.md` 顶点压缩章节](../features/meshing.md#二u32-顶点压缩格式)。本文只列接口：
+详细布局见 [`features/meshing.md`](../features/meshing.md)。本文只列接口：
 
 ```rust
 /// 压缩后的顶点：单 u32
@@ -95,6 +95,22 @@ pub enum Face { PosX = 0, NegX = 1, PosY = 2, NegY = 3, PosZ = 4, NegZ = 5 }
 
 /// wgpu 顶点缓冲布局描述（u32 attribute）
 pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static>;
+```
+
+`SmoothGranular` 材质使用独立 float 顶点格式，允许非整数高度与真实三角面法线：
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SmoothVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub raw_uv: [f32; 2],
+    pub tex_index: f32,
+    pub ao: f32,
+}
+
+pub fn smooth_vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static>;
 ```
 
 WGSL 解包：
@@ -157,11 +173,11 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 - 深度比较：`Less`（如果有 Depth Pre-Pass，可改 `Equal` 进一步省 fragment work）
 - Cull 模式：当前为 `None`（贪婪网格 winding 已保持外侧 CCW；后续可单独启用 Back-face culling 验证收益）
 - Blend：禁用
-- 顶点格式：`PackedVertex`（u32）+ `u32` index buffer
+- 顶点格式：硬材质 `PackedVertex`（u32）+ `u32` index buffer；`SmoothGranular` 走 `SmoothVertex` float buffer + `u32` index buffer
 
 **Draw 调用顺序**：先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
-**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。
+**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness / slope brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。硬材质保持锐利方块边；草、泥土、沙子等 `SmoothGranular` 根据邻近颗粒列插值顶部高度，边缘用梯形侧面连接。
 
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 

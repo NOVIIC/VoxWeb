@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，以及 `FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影；真实流体和可见刚体飞行尚未实现。
+> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影，以及 `SmoothGranular` 的第一版高度场平滑提面；真实流体、完整 Surface Nets / Marching Cubes 和可见刚体飞行尚未实现。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -93,7 +93,7 @@
 | `core::protocol` | bincode 消息、FieldRequest、FieldSnapshot、FieldDelta、BlockID 操作请求 | 扩展为 ApplyKernel、FreeObject 状态和投影事件 |
 | `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、`free_objects` 投影记录、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为运行时主格式，并持有 active FreeObject 模拟队列 |
 | `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 软材质局部下落/滑落和 `FloatingOnly` 小硬材质连通块即时提取/投影 | 后续扩展质量守恒 kernel、可见刚体运动和更细支撑图 |
-| `render::chunk_mesh` | 方块贪婪网格化、透明方块网格 | 变成 extractor 集合：blocky / smooth / fluid / object mesh |
+| `render::chunk_mesh` | 硬方块贪婪网格化、透明方块网格、`SmoothGranular` 高度场平滑提面 | 后续扩展为更完整 extractor 集合：blocky / smooth Surface Nets 或 Marching Cubes / fluid / object mesh |
 | `client::physics` | 玩家 AABB 分轴碰撞、本地预测 | 保留角色控制器，查询统一世界碰撞代理 |
 | `client::raycast` | DDA 命中 solid 方块 | 硬材质 DDA + 平滑材质 field ray query |
 | `client::mesh_jobs` | 分帧 chunk mesh 任务队列 | 继续承载各 extractor 的分帧预算 |
@@ -532,7 +532,7 @@ struct StabilityComponent {
 | 材质视觉类 | Extractor | 说明 |
 |---|---|---|
 | HardBlocky | blocky greedy / face meshing | 保留笔直方块、锐边、低成本 |
-| SmoothGranular | Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
+| SmoothGranular | 当前高度场平滑提面；后续 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
 | RigidBreakable FreeObject | local mesh cache + transform | 动态岩块、碎块 |
 | Fluid | future fluid surface extractor + transparent pass | 水面、透明排序、波动；第一版水只做静态透明占位 |
 | Mixed boundary | priority / blend / seam resolver | 处理硬软交界 |
@@ -743,8 +743,8 @@ struct FieldChunkRecord {
    - 验证软材质 cell 能提取平滑表面。
 
 2. **单 chunk extractor 原型**
-   - blocky extractor 和 Surface Nets / Marching Cubes 并存。
-   - 测量 CPU 时间、mesh 大小、边界缝。
+   - 已有 blocky extractor 和 `SmoothGranular` 高度场平滑提面并存。
+   - 后续把高度场提面升级为 Surface Nets / Marching Cubes，并测量 CPU 时间、mesh 大小、边界缝。
    - 重点测试硬软交界。
 
 3. **创造模式编辑**

@@ -10,7 +10,9 @@ use wgpu::util::DeviceExt;
 
 use voxweb_core::Aabb;
 
-use crate::vertex::{PackedVertex, vertex_buffer_layout};
+use crate::vertex::{
+    PackedVertex, SmoothVertex, smooth_vertex_buffer_layout, vertex_buffer_layout,
+};
 
 /// 每个 chunk draw call 上传的 uniform。
 #[repr(C)]
@@ -34,10 +36,14 @@ pub struct GlobalsUniform {
 /// 关键：globals buffer 必须**按 chunk 分别持有**，否则在单次 submit 中多次 `queue.write_buffer`
 /// 同一 buffer 会被合并到最后一次写入，导致所有 chunk 用同一个 chunk_origin 渲染（视觉上"全叠在一起"）。
 pub struct ChunkMeshGpu {
-    pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
+    pub vertex_buffer: Option<wgpu::Buffer>,
+    pub index_buffer: Option<wgpu::Buffer>,
     pub vertex_count: u32,
     pub index_count: u32,
+    pub smooth_vertex_buffer: Option<wgpu::Buffer>,
+    pub smooth_index_buffer: Option<wgpu::Buffer>,
+    pub smooth_vertex_count: u32,
+    pub smooth_index_count: u32,
     pub bounds: Aabb,
     pub globals_buffer: wgpu::Buffer,
     pub globals_bind_group: wgpu::BindGroup,
@@ -46,7 +52,9 @@ pub struct ChunkMeshGpu {
 /// 不透明方块渲染 Pass（Pipeline + bind group layout）。
 pub struct OpaquePass {
     pub pipeline: wgpu::RenderPipeline,
+    pub smooth_pipeline: wgpu::RenderPipeline,
     pub depth_pipeline: wgpu::RenderPipeline,
+    pub smooth_depth_pipeline: wgpu::RenderPipeline,
     pub globals_layout: wgpu::BindGroupLayout,
 }
 
@@ -126,6 +134,45 @@ impl OpaquePass {
             multiview_mask: None,
             cache: None,
         });
+        let smooth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("opaque.smooth_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_smooth"),
+                buffers: &[smooth_vertex_buffer_layout()],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("opaque.depth_prepass_pipeline"),
             layout: Some(&pipeline_layout),
@@ -156,10 +203,43 @@ impl OpaquePass {
             multiview_mask: None,
             cache: None,
         });
+        let smooth_depth_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("opaque.smooth_depth_prepass_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_smooth"),
+                    buffers: &[smooth_vertex_buffer_layout()],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            });
 
         Self {
             pipeline,
+            smooth_pipeline,
             depth_pipeline,
+            smooth_depth_pipeline,
             globals_layout,
         }
     }
@@ -170,20 +250,42 @@ impl OpaquePass {
         device: &wgpu::Device,
         vertices: &[PackedVertex],
         indices: &[u32],
+        smooth_vertices: &[SmoothVertex],
+        smooth_indices: &[u32],
         bounds: Aabb,
     ) -> Option<ChunkMeshGpu> {
-        if vertices.is_empty() || indices.is_empty() {
+        let has_blocky = !vertices.is_empty() && !indices.is_empty();
+        let has_smooth = !smooth_vertices.is_empty() && !smooth_indices.is_empty();
+        if !has_blocky && !has_smooth {
             return None;
         }
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk.vbuf"),
-            contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+        let vertex_buffer = has_blocky.then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk.vbuf"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk.ibuf"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
+        let index_buffer = has_blocky.then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk.ibuf"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
+        });
+        let smooth_vertex_buffer = has_smooth.then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk.smooth_vbuf"),
+                contents: bytemuck::cast_slice(smooth_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let smooth_index_buffer = has_smooth.then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chunk.smooth_ibuf"),
+                contents: bytemuck::cast_slice(smooth_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            })
         });
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk.globals"),
@@ -204,6 +306,10 @@ impl OpaquePass {
             index_buffer,
             vertex_count: vertices.len() as u32,
             index_count: indices.len() as u32,
+            smooth_vertex_buffer,
+            smooth_index_buffer,
+            smooth_vertex_count: smooth_vertices.len() as u32,
+            smooth_index_count: smooth_indices.len() as u32,
             bounds,
             globals_buffer,
             globals_bind_group,

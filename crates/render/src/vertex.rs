@@ -19,6 +19,32 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct PackedVertex(pub u32);
 
+/// 平滑材质使用的普通顶点格式。
+///
+/// `PackedVertex` 只能表达整数方块角点，适合硬方块贪婪网格；颗粒材质需要
+/// 非整数高度和真实法线，因此单独走这条 float 顶点路径。
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct SmoothVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub raw_uv: [f32; 2],
+    pub tex_index: f32,
+    pub ao: f32,
+}
+
+impl SmoothVertex {
+    pub fn new(position: [f32; 3], normal: [f32; 3], raw_uv: [f32; 2], tex_index: u8) -> Self {
+        Self {
+            position,
+            normal,
+            raw_uv,
+            tex_index: tex_index as f32,
+            ao: 3.0,
+        }
+    }
+}
+
 /// 面朝向枚举。值与 WGSL 中 face_dir 字段对齐。
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -73,6 +99,42 @@ pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
     }];
     wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<PackedVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: ATTRS,
+    }
+}
+
+/// 平滑材质顶点缓冲布局。
+pub fn smooth_vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: &[wgpu::VertexAttribute] = &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 12,
+            shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 24,
+            shader_location: 2,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: 32,
+            shader_location: 3,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: 36,
+            shader_location: 4,
+        },
+    ];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<SmoothVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: ATTRS,
     }

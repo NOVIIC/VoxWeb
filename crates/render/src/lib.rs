@@ -180,6 +180,8 @@ impl Renderer {
             &self.device,
             &mesh.vertices,
             &mesh.indices,
+            &mesh.smooth_vertices,
+            &mesh.smooth_indices,
             world_bounds,
         ) {
             Some(gpu) => {
@@ -234,7 +236,7 @@ impl Renderer {
     pub fn uploaded_vertex_count(&self) -> u32 {
         self.chunk_meshes
             .values()
-            .map(|mesh| mesh.vertex_count)
+            .map(|mesh| mesh.vertex_count + mesh.smooth_vertex_count)
             .sum()
     }
 
@@ -328,11 +330,11 @@ impl Renderer {
         stats.culled_chunks = stats.total_chunks.saturating_sub(stats.visible_chunks);
         stats.drawn_vertices = entries
             .iter()
-            .map(|(_, mesh)| mesh.vertex_count)
+            .map(|(_, mesh)| mesh.vertex_count + mesh.smooth_vertex_count)
             .sum::<u32>();
         stats.drawn_indices = entries
             .iter()
-            .map(|(_, mesh)| mesh.index_count)
+            .map(|(_, mesh)| mesh.index_count + mesh.smooth_index_count)
             .sum::<u32>();
 
         for (pos, mesh) in &entries {
@@ -399,11 +401,36 @@ impl Renderer {
         });
         pass.set_pipeline(&self.opaque_pass.pipeline);
         pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
-        for (_, mesh) in entries {
+        for (_, mesh) in &entries {
+            if mesh.index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.index_buffer else {
+                continue;
+            };
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        pass.set_pipeline(&self.opaque_pass.smooth_pipeline);
+        for (_, mesh) in entries {
+            if mesh.smooth_index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.smooth_vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.smooth_index_buffer else {
+                continue;
+            };
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.smooth_index_count, 0, 0..1);
         }
         stats
     }
@@ -473,11 +500,36 @@ impl Renderer {
         });
         pass.set_pipeline(&self.opaque_pass.depth_pipeline);
         pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
-        for (_, mesh) in entries {
+        for (_, mesh) in &entries {
+            if mesh.index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.index_buffer else {
+                continue;
+            };
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        pass.set_pipeline(&self.opaque_pass.smooth_depth_pipeline);
+        for (_, mesh) in entries {
+            if mesh.smooth_index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.smooth_vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.smooth_index_buffer else {
+                continue;
+            };
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.smooth_index_count, 0, 0..1);
         }
     }
 

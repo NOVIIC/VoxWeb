@@ -1,4 +1,4 @@
-# 网格化：贪婪算法 + 跨区块剔除 + 顶点压缩
+# 网格化：硬方块贪婪算法 + 软材质平滑提面
 
 > **何时阅读**：改 chunk 网格性能；调顶点格式；加新方块属性影响渲染；加 AO/光照
 > **关联文档**：[`README.md`](../../README.md) · [`modules/render.md`](../modules/render.md) · [`modules/core.md`](../modules/core.md) · [`modules/client.md`](../modules/client.md) · [`architecture.md`](../architecture.md)
@@ -9,11 +9,12 @@
 
 体素世界的每个区块（16×256×16）有 65536 个方块。如果每个方块都生成 6 个面 → 单 chunk 最多 390K 面。即使剔除掉中心被遮挡的，仍是几万个面。**朴素方案对 GPU 顶点带宽和 CPU 编码都是灾难**。
 
-本项目采用三个组合优化：
+本项目采用这些组合策略：
 
 1. **跨区块面剔除（Cross-Chunk Face Culling）**：相邻 chunk 边界处也做面剔除
-2. **贪婪网格化（Greedy Meshing）**：相邻同材质的方块面合并成大矩形
-3. **u32 顶点压缩**：单顶点 4 字节而非 36 字节
+2. **硬材质贪婪网格化（Greedy Meshing）**：相邻同材质的方块面合并成大矩形
+3. **软颗粒高度场提面**：`SmoothGranular` 材质（草/泥土/沙）用 float 顶点生成斜坡表面
+4. **u32 顶点压缩**：硬方块单顶点 4 字节而非 36 字节
 
 ---
 
@@ -22,15 +23,20 @@
 当前默认路径为 `generate_with_neighbors`：
 
 - 先用 `get_block_world` 做跨区块面剔除
-- 再按方向构造 mask，用贪婪网格化合并同材质且 AO 一致的可见单位面
-- 输出 `vertices + indices + bounds + visible_faces`
-- `visible_faces` 记录逐面基线的可见单位面数量，供 HUD 展示优化比例
+- `HardBlocky` / `Foliage` 等不透明硬表面按方向构造 mask，用贪婪网格化合并同材质且 AO 一致的可见单位面
+- `SmoothGranular` 表面不进入硬方块 mask，而是生成 `smooth_vertices + smooth_indices`：顶部高度由邻近颗粒列插值，边缘生成梯形侧面，并把真实法线交给 shader 光照
+- 透明材质仍输出 `transparent_vertices + transparent_indices`，交给 Transparent Pass
+- `visible_faces` 记录硬方块逐面基线的可见单位面数量，供 HUD 展示贪婪合并优化比例
 
 ---
 
-## 二、u32 顶点压缩格式
+## 二、顶点格式
 
-### 位段布局
+硬方块继续使用 u32 压缩顶点；软颗粒材质使用独立 float 顶点格式。
+
+### 2.1 硬方块 u32 顶点压缩格式
+
+#### 位段布局
 
 ```
 位 31 ─────────────────────────────────────── 位 0
@@ -52,7 +58,7 @@
 
 > 5 位 X/Z 略奢侈（实际只用 0..16），但保留扩展余量更安全；Y 需要 9 位，因为贪婪面顶点可落在 `ly = 256` 顶界。
 
-### Rust 编码
+#### Rust 编码
 
 ```rust
 pub fn pack(local_x: u8, local_y: u8, local_z: u8,
@@ -72,7 +78,7 @@ pub fn pack(local_x: u8, local_y: u8, local_z: u8,
 }
 ```
 
-### WGSL 解码
+#### WGSL 解码
 
 ```wgsl
 struct UnpackedVertex {
@@ -102,16 +108,32 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex {
 
 UV 计算：贪婪合并后的大矩形，UV 从 (0,0) 一直平铺到 (w, h) — 平铺由片段着色器中 `frac(uv) + atlas_offset` 完成。
 
-### 内存收益
+#### 内存收益
 
 | 顶点数 | 朴素 36 字节 | 压缩 4 字节 | 节省 |
 |---|---|---|---|
 | 1M | 36 MB | 4 MB | 89% |
 | 10M | 360 MB | 40 MB | 89% |
 
+### 2.2 软颗粒 float 顶点
+
+`SmoothVertex` 用于 `VisualClass::SmoothGranular`：
+
+```rust
+pub struct SmoothVertex {
+    pub position: [f32; 3], // chunk local，允许非整数 y
+    pub normal: [f32; 3],   // 三角面法线
+    pub raw_uv: [f32; 2],
+    pub tex_index: f32,
+    pub ao: f32,
+}
+```
+
+当前实现是第一版高度场平滑提面，不是完整 Surface Nets / Marching Cubes。它只改变视觉 mesh；权威世界、碰撞和 raycast 仍然按当前 `Chunk`/`BlockID` 适配视图工作。
+
 ---
 
-## 三、贪婪网格化算法
+## 三、硬方块贪婪网格化算法
 
 `generate_with_neighbors` 保持稳定入口，内部使用贪婪 mask 合并；同材质且 4 个角点 AO 完全一致的单位面才会合并。
 
