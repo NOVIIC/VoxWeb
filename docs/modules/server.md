@@ -230,7 +230,7 @@ fn broadcast_tick(&mut self) {
    - 采样 `perlin.get([world_x * 0.01, world_z * 0.01])` → 值域 `[-1, 1]`
    - 映射到高度 `height = ((noise + 1) * 0.5 * CHUNK_Y * 0.4) as usize`（最高 ≈ 102）
 3. 分层填充每个 `(lx, ly, lz)`：
-   - `ly == 0` → 强制 STONE（基岩兜底，避免下溢）
+   - `ly == 0` → 强制 BEDROCK（不可破坏世界边界，避免挖穿底部）
    - `ly + 3 < height` → STONE
    - `ly < height` → DIRT
    - `ly == height` → GRASS
@@ -259,20 +259,22 @@ pub const MAX_REACH: f32 = 6.0;    // 眼睛到方块中心的最大距离
 pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckReason {
     // 1) y 越界检查
     // 2) 眼-块中心距离 > MAX_REACH → OutOfRange
-    // 3) 目标已是 AIR → BlockNotEmpty（语义复用）
+    // 3) y == 0 → BlockNotEmpty（世界底部边界，兼容旧存档 STONE 底层）
+    // 4) 目标已是 AIR → BlockNotEmpty（语义复用）
+    // 5) properties(block).breakable == false → BlockNotEmpty（如 BEDROCK）
     //    Ok
 }
 ```
 
 ### 放方块
 ```rust
-pub fn validate_place(
-    world: &World, pos: Position, _block: BlockID, player_feet: Vec3
-) -> AckReason {
+pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet: Vec3) -> AckReason {
     // 1) y 越界检查
     // 2) 距离 > MAX_REACH → OutOfRange
-    // 3) 目标非空 → BlockNotEmpty
-    // 4) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
+    // 3) y == 0 → BlockNotEmpty
+    // 4) block == AIR 或 !properties(block).appears_in_hotbar → BlockNotEmpty
+    // 5) 目标非空 → BlockNotEmpty
+    // 6) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
     //    Ok
 }
 ```
@@ -443,8 +445,8 @@ impl PersistenceManager {
 - `World::get_block_world` chunk 内 / 未加载 / y 越界三种情况
 
 **Physics / message dispatch**：
-- `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / AIR → BlockNotEmpty
-- `physics::validate_place`：y 越界 / 射程 / BlockNotEmpty / AABB Overlap
+- `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / 底层边界 / AIR / 不可破坏材质 → BlockNotEmpty
+- `physics::validate_place`：y 越界 / 射程 / 底层边界 / 非热栏材质 / BlockNotEmpty / AABB Overlap
 - `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
 - 全部 10 个单元测试通过 `cargo test -p voxweb-server --lib`
 

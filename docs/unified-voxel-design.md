@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：设计讨论阶段，尚未实现
+> **状态**：原型部分落地。已实现 `MaterialID`/`MaterialProperties` 兼容层、`MaterialCell` 原型、石砖/基岩材质、基岩托底和基于材质属性的基础挖放仲裁；`FieldChunk`、颗粒松弛、FreeObject 生命周期和真实流体尚未实现。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -86,7 +86,7 @@
 
 | crate / 模块 | 当前职责 | 对统一体素方案的自然归属 |
 |---|---|---|
-| `core::block` | `BlockID` + 编译期 `BlockProperties` | 扩展为 `MaterialID` / `MaterialProperties` / `MaterialRegistry` |
+| `core::block` | `BlockID` + 编译期 `BlockProperties`；已新增 `MaterialID`/`MaterialProperties` 兼容别名、`MaterialCell` 原型和 `MaterialRegistry` 查询入口 | 后续迁移为独立 `MaterialRegistry` 与 FieldChunk schema |
 | `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标、palette+RLE | 扩展为 `FieldChunk`、列存储、field snapshot 编码 |
 | `core::protocol` | bincode 消息、ChunkSnapshot、BlockUpdate | 扩展为 field snapshot、operation delta、FreeObject 状态 |
 | `server::world` | `HashMap<ChunkPos, Chunk>`、地形、dirty、LRU | 持有权威 MaterialField、FreeObject 和模拟队列 |
@@ -257,7 +257,7 @@ enum StabilityPolicy {
 
 ### 5.2 第一版物质清单
 
-当前游戏快捷栏有 9 格，其中 1-8 是现有物质，第 9 格当前重复石头；目标设计中第 9 格改为石砖。石砖目前在代码中还不存在，需要后续新增 BlockID、纹理和 hotbar 显示。
+当前游戏快捷栏有 9 格，其中 1-8 是现有物质，第 9 格已改为石砖。石砖和基岩均已有 `BlockID`、材质属性、程序化纹理和基础 UI 色块。
 
 | hotbar | 物质 | 当前状态 | 视觉 | 物理策略 | 第一版行为 |
 |---|---|---|---|---|---|
@@ -269,8 +269,8 @@ enum StabilityPolicy {
 | 6 | 树叶 | 已存在 | Foliage | Decorative | 轻质装饰材料；不作为主要承重支撑，直接破坏即可移除，第一版不做枯萎或传播 |
 | 7 | 玻璃 | 已存在 | HardBlocky / Transparent | FloatingOnly | 透明建筑硬材质；可稳定建造，完全浮空才坍塌，破坏时可直接消失或后续扩展为碎片 |
 | 8 | 水 | 已存在 | Transparent placeholder | NoPhysics | 第一版不做真实流体；保留为静态透明占位/简化水块，不传播、不侵蚀、不参与 FreeObject |
-| 9 | 石砖 | 目标新增，当前不存在 | HardBlocky | FloatingOnly | 主要建筑块；比石头更偏人造稳定材料，只有完全浮空才坍塌，不参与自然地形生成 |
-| - | 基岩 | 目标新增世界材料 | HardBlocky | NoPhysics | 世界最底层材料；无法破坏、无物理模拟、不出现在物品栏，不参与掉落或坍塌 |
+| 9 | 石砖 | 已存在 | HardBlocky | FloatingOnly | 主要建筑块；比石头更偏人造稳定材料，只有完全浮空才坍塌，不参与自然地形生成 |
+| - | 基岩 | 已存在 | HardBlocky | NoPhysics | 世界最底层材料；无法破坏、无物理模拟、不出现在物品栏，不参与掉落或坍塌 |
 
 ### 5.3 世界底层
 

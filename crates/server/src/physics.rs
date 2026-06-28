@@ -5,7 +5,7 @@
 
 use glam::Vec3;
 
-use voxweb_core::block::BlockID;
+use voxweb_core::block::{BlockID, properties};
 use voxweb_core::chunk::{CHUNK_Y, Position};
 use voxweb_core::geometry::{Aabb, PLAYER_EYE_OFFSET, player_aabb};
 use voxweb_core::protocol::AckReason;
@@ -24,8 +24,15 @@ pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckRea
     if distance_to_block_center(player_feet, pos) > MAX_REACH {
         return AckReason::OutOfRange;
     }
-    if world.get_block(pos) == BlockID::AIR {
+    if pos.y == 0 {
+        return AckReason::BlockNotEmpty;
+    }
+    let block = world.get_block(pos);
+    if block == BlockID::AIR {
         // 试图挖空气：复用 BlockNotEmpty 语义表达 "目标方块状态不允许操作"
+        return AckReason::BlockNotEmpty;
+    }
+    if !properties(block).breakable {
         return AckReason::BlockNotEmpty;
     }
     AckReason::Ok
@@ -35,7 +42,7 @@ pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckRea
 pub fn validate_place(
     world: &World,
     pos: Position,
-    _block: BlockID,
+    block: BlockID,
     player_feet: Vec3,
 ) -> AckReason {
     if pos.y < 0 || pos.y >= CHUNK_Y as i32 {
@@ -43,6 +50,12 @@ pub fn validate_place(
     }
     if distance_to_block_center(player_feet, pos) > MAX_REACH {
         return AckReason::OutOfRange;
+    }
+    if pos.y == 0 {
+        return AckReason::BlockNotEmpty;
+    }
+    if block == BlockID::AIR || !properties(block).appears_in_hotbar {
+        return AckReason::BlockNotEmpty;
     }
     if world.get_block(pos) != BlockID::AIR {
         return AckReason::BlockNotEmpty;
@@ -132,6 +145,30 @@ mod tests {
     }
 
     #[test]
+    fn break_bedrock_is_rejected() {
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        w.set_block(Position::new(3, 64, 3), BlockID::BEDROCK);
+        let player = Vec3::new(3.5, 65.0, 3.5);
+        assert_eq!(
+            validate_break(&w, Position::new(3, 64, 3), player),
+            AckReason::BlockNotEmpty
+        );
+    }
+
+    #[test]
+    fn break_bottom_layer_is_rejected_even_for_legacy_stone() {
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        w.set_block(Position::new(3, 0, 3), BlockID::STONE);
+        let player = Vec3::new(3.5, 1.0, 3.5);
+        assert_eq!(
+            validate_break(&w, Position::new(3, 0, 3), player),
+            AckReason::BlockNotEmpty
+        );
+    }
+
+    #[test]
     fn place_out_of_y_range() {
         let w = World::new(0);
         let player = Vec3::new(0.0, 64.0, 0.0);
@@ -160,6 +197,26 @@ mod tests {
         assert_eq!(
             validate_place(&w, Position::new(5, 65, 3), BlockID::STONE, player),
             AckReason::Ok
+        );
+    }
+
+    #[test]
+    fn place_non_hotbar_material_is_rejected() {
+        let w = world_with_stone_chunk();
+        let player = Vec3::new(3.5, 65.0, 3.5);
+        assert_eq!(
+            validate_place(&w, Position::new(5, 65, 3), BlockID::BEDROCK, player),
+            AckReason::BlockNotEmpty
+        );
+    }
+
+    #[test]
+    fn place_on_bottom_layer_is_rejected() {
+        let w = World::new(0);
+        let player = Vec3::new(3.5, 1.0, 3.5);
+        assert_eq!(
+            validate_place(&w, Position::new(3, 0, 3), BlockID::STONE, player),
+            AckReason::BlockNotEmpty
         );
     }
 

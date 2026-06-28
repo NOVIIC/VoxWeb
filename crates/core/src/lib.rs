@@ -6,7 +6,11 @@ pub mod chunk;
 pub mod geometry;
 pub mod protocol;
 
-pub use block::{BlockID, BlockProperties, properties};
+pub use block::{
+    BlockID, BlockProperties, BreakKernel, CellFlags, MATERIAL_REGISTRY, MaterialCell, MaterialID,
+    MaterialProperties, MaterialRegistry, MechanicsClass, MixSlot, PlacementKernel,
+    StabilityPolicy, VisualClass, properties,
+};
 pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
 pub use protocol::{

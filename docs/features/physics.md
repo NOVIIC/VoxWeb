@@ -354,6 +354,8 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 完整时序见 [`networking/protocol.md` 6.2 章节](../networking/protocol.md#62-方块挖放reliable--ack)；本文重点是客户端体验。
 
+服务端仲裁按材质属性执行额外规则：y=0 永远视为世界底部边界；`properties(block).breakable == false` 的材质不可挖（当前为 BEDROCK）；放置请求只能使用 `appears_in_hotbar == true` 的材质，防止客户端通过协议放置 AIR / BEDROCK 等非创造模式材料。
+
 ### 8.1 视觉反馈
 
 每渲染帧：
@@ -476,7 +478,8 @@ fn handle_action_input(&mut self) {
 
 简化版：
 - 1-9 键切换当前手持方块
-- 内置可选方块：STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER（数字 1-8；9 留空）
+- 内置可选方块：STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER / STONE_BRICKS
+- BEDROCK 是世界底部边界材质，不进 hotbar，不能挖掘或放置
 - HUD 底部居中显示当前选中方块图标（v2）
 
 ```rust

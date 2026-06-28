@@ -26,7 +26,7 @@ crates/core/
 ├── Cargo.toml
 └── src/
     ├── lib.rs          模块声明 + 公开 re-export
-    ├── block.rs        BlockID + 硬编码方块属性表
+    ├── block.rs        BlockID/MaterialID 兼容层 + 硬编码材质属性表
     ├── chunk.rs        Chunk + Position + ChunkPos
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
 ```
@@ -51,11 +51,14 @@ impl BlockID {
     pub const SAND: BlockID = BlockID(6);
     pub const WOOD: BlockID = BlockID(7);
     pub const LEAVES: BlockID = BlockID(8);
-    // ... 后续按需扩展
+    pub const STONE_BRICKS: BlockID = BlockID(9);
+    pub const BEDROCK: BlockID = BlockID(10);
 }
 ```
 
-### BlockProperties
+`MaterialID` 当前是 `BlockID` 的类型别名。统一体素方案的第一步保持 `ChunkSnapshot`、`BlockUpdate` 和 OPFS 编码不变，先把材质语义落到属性表和操作仲裁。
+
+### MaterialProperties / BlockProperties
 
 每种 BlockID 关联静态属性表，用于查询：
 
@@ -66,10 +69,36 @@ pub struct BlockProperties {
     pub emits_light: bool,     // （v2）光源
     pub texture_index: u8,     // 纹理图集索引（顶点压缩用）
     pub display_name: &'static str,
+    pub visual_class: VisualClass,
+    pub mechanics: MechanicsClass,
+    pub placement_kernel: PlacementKernel,
+    pub break_kernel: BreakKernel,
+    pub placement_unit_mass: u16,
+    pub hardness: f32,
+    pub appears_in_hotbar: bool,
+    pub breakable: bool,
+    pub angle_of_repose: f32,
+    pub cohesion: f32,
+    pub stability: StabilityPolicy,
 }
 
 pub fn properties(id: BlockID) -> &'static BlockProperties { ... }
 ```
+
+`MaterialProperties` 当前是 `BlockProperties` 的别名；`MATERIAL_REGISTRY.properties(id)` 是后续迁移到真正 registry 的兼容入口。
+
+### MaterialCell 原型
+
+```rust
+pub struct MaterialCell {
+    pub occupancy: u8,              // 0 = 空，255 = 满
+    pub primary: MaterialID,         // occupancy = 0 时忽略
+    pub secondary: Option<MixSlot>,  // 可选混合通道
+    pub flags: CellFlags,
+}
+```
+
+当前运行时 chunk 仍保存 `Vec<BlockID>`，`MaterialCell` 先作为 FieldChunk / FieldDelta / FreeObject 后续迁移的公开数据结构原型。
 
 实现方式：编译期 `const` 数组按 `BlockID.0` 索引。新增方块时在数组追加一行。
 
@@ -276,7 +305,7 @@ pub mod chunk;
 pub mod geometry;
 pub mod protocol;
 
-pub use block::{BlockID, BlockProperties, properties};
+pub use block::{BlockID, BlockProperties, MaterialCell, MaterialID, properties};
 pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
 pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};
