@@ -1,14 +1,15 @@
 // VoxWeb 选中方块线框着色器 (Phase 3)
 //
 // 顶点输入：单个 vec3<f32>（单位立方体角点，范围 [0, 1]）。
-// Uniform：view_proj + block_origin（命中方块的世界最小角）。
+// Uniform：view_proj + box_min + box_size。
 //
-// 顶点位置 = block_origin + corner，直接 transform 到 clip 空间。
+// 顶点位置 = box_min + corner * box_size，直接 transform 到 clip 空间。
 // 片元一律输出半透明黑色。
 
 struct Globals {
     view_proj: mat4x4<f32>,
-    block_origin: vec4<f32>,  // xyz + padding
+    box_min: vec4<f32>,   // xyz + padding
+    box_size: vec4<f32>,  // xyz + padding
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -24,7 +25,7 @@ struct VsOut {
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
-    let world_pos = in.corner + g.block_origin.xyz;
+    let world_pos = g.box_min.xyz + in.corner * g.box_size.xyz;
     out.clip = g.view_proj * vec4<f32>(world_pos, 1.0);
     return out;
 }

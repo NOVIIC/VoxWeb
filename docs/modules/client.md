@@ -504,10 +504,10 @@ pub fn priority_for_distance(pos: ChunkPos, center: ChunkPos) -> MeshPriority;
 > **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠，主循环（[`crates/client/src/lib.rs`](../../crates/client/src/lib.rs)）严格遵守此顺序。
 
 ### 6.8 `physics.rs`（详见 [`features/physics.md`](../features/physics.md)）
-`LocalPhysics { feet_position, velocity, on_ground, mode }`—— Walk 模式：重力（−32 m/s²）、跳跃（8.4 m/s）、lerp 水平加速（HORIZ_ACC=12）、Y/X/Z 分轴碰撞、5cm 地面探测。Fly 模式：直接 `position += dir * FLY_SPEED * dt`。位置驱动 `camera.position = physics.eye_position()`。
+`LocalPhysics { feet_position, velocity, on_ground, mode }`—— Walk 模式：重力（−32 m/s²）、跳跃（8.4 m/s）、lerp 水平加速（HORIZ_ACC=12）、Y/X/Z 分轴碰撞、5cm 地面探测。Fly 模式：直接 `position += dir * FLY_SPEED * dt`。位置驱动 `camera.position = physics.eye_position()`。`SmoothGranular` 碰撞使用 `core::surface` 高度场：脚底下落时吸附到软坡面高度，AABB 与软材质的重叠按当前表面高度裁剪。
 
 ### 6.9 `raycast.rs`（详见 [`features/physics.md`](../features/physics.md)）
-Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, normal: IVec3, face: Face, distance }`——`Face` 复用 `render::vertex::Face`。命中条件 `block != AIR && properties(block).solid`。
+Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, normal: IVec3, face: Face, distance, point, surface_normal }`——`Face` 复用 `render::vertex::Face`。硬材质按 solid 体素命中；`SmoothGranular` 只有射线实际碰到 `core::surface` 高度场时才命中，并返回精确命中点和斜坡法线。选中线框对硬材质使用整格 AABB，对软材质使用当前高度场 AABB。
 
 ### 6.10 `hotbar.rs`
 `Hotbar { items: [BlockID; 9], selected: usize }`，1-9 键切换（`InputState::hotbar_request` 边沿）。`block_label(id) -> &'static str` 供 HUD 显示。
@@ -618,7 +618,7 @@ Remote 模式不会本地生成地形。`ChunkLoader` 在 Remote 下维护两组
 - `loaded`：已经收到完整 `FieldSnapshot` 并写入本地 world 的 chunk
 - `requested`：已经通过 `FieldRequest` 发给 Host、正在等待快照的 chunk
 
-运行时单格编辑通过 `FieldDelta` 写入本地 world；硬材质小连通块坍落通过 `FreeObjectProject` 携带一组投影 delta，客户端直接应用这些 cell 变化并对受影响 chunk 入队重网格化。当前不在 Remote 端渲染 FreeObject 飞行过程。
+运行时单格编辑通过 `FieldDelta` 写入本地 world；硬材质小连通块坍落通过 `FreeObjectProject` 携带一组投影 delta，客户端应用这些 cell 变化并对受影响 chunk 入队重网格化。同时客户端会从 delta 中配对旧位置 / 新位置，生成约 320ms 的短时盒体下落动画；这不是权威刚体状态，只是投影事件的可见反馈。
 
 Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `FieldRequest`。收到 `FieldSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
 

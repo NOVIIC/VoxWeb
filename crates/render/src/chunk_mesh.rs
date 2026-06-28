@@ -6,7 +6,8 @@
 
 use glam::Vec3;
 use voxweb_core::{
-    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, VisualClass, properties,
+    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, is_open_for_surface,
+    is_smooth_granular, properties, smooth_corner_height, smooth_height_normal,
 };
 
 use crate::vertex::{Face, PackedVertex, SmoothVertex};
@@ -168,6 +169,15 @@ struct MeshContext<'a> {
     get_block_world: &'a dyn Fn(i32, i32, i32) -> BlockID,
 }
 
+#[derive(Copy, Clone)]
+struct SmoothFaceInfo {
+    face_idx: usize,
+    lx: usize,
+    ly: usize,
+    lz: usize,
+    block: BlockID,
+}
+
 /// 生成一个 Chunk 的不透明网格顶点。
 ///
 /// 仅渲染非 AIR、且 `BlockProperties::transparent == false` 的方块。
@@ -248,24 +258,48 @@ fn emit_smooth_face(
 ) {
     let tex = properties(block).texture_index;
     let corners = smooth_face_corners(ctx, lx, ly, lz, face_idx, block);
-    push_smooth_triangle(mesh, [corners[0], corners[1], corners[2]], face_idx, tex);
-    push_smooth_triangle(mesh, [corners[0], corners[2], corners[3]], face_idx, tex);
+    push_smooth_quad(
+        ctx,
+        mesh,
+        corners,
+        tex,
+        SmoothFaceInfo {
+            face_idx,
+            lx,
+            ly,
+            lz,
+            block,
+        },
+    );
 }
 
-fn push_smooth_triangle(mesh: &mut ChunkMeshCpu, corners: [Vec3; 3], face_idx: usize, tex: u8) {
-    let normal = triangle_normal(corners);
+fn push_smooth_quad(
+    ctx: &MeshContext<'_>,
+    mesh: &mut ChunkMeshCpu,
+    corners: [Vec3; 4],
+    tex: u8,
+    info: SmoothFaceInfo,
+) {
     let base = mesh.smooth_vertices.len() as u32;
+    let normal = if info.face_idx == Face::PosY as usize {
+        let wx = ctx.origin_x + info.lx as i32;
+        let wy = info.ly as i32;
+        let wz = ctx.origin_z + info.lz as i32;
+        smooth_height_normal(ctx.get_block_world, wx, wy, wz, info.block)
+    } else {
+        quad_normal(corners)
+    };
     for p in corners {
         mesh.include_smooth_vertex(p);
         mesh.smooth_vertices.push(SmoothVertex::new(
             [p.x, p.y, p.z],
             [normal.x, normal.y, normal.z],
-            smooth_raw_uv(face_idx, p),
+            smooth_raw_uv(info.face_idx, p),
             tex,
         ));
     }
     mesh.smooth_indices
-        .extend_from_slice(&[base, base + 1, base + 2]);
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 fn smooth_face_corners(
@@ -281,7 +315,7 @@ fn smooth_face_corners(
     let wz = ctx.origin_z + lz as i32;
     let top_is_open = {
         let above = (ctx.get_block_world)(wx, wy + 1, wz);
-        above == BlockID::AIR || properties(above).transparent
+        is_open_for_surface(above)
     };
 
     FACE_CORNERS[face_idx].map(|(cx, cy, cz)| {
@@ -289,59 +323,21 @@ fn smooth_face_corners(
         let z = lz as f32 + cz as f32;
         let mut y = ly as f32 + cy as f32;
         if cy == 1 && top_is_open {
-            y = smooth_corner_height(ctx, wx + cx as i32, wz + cz as i32, wy, block);
+            y = smooth_corner_height(
+                ctx.get_block_world,
+                wx + cx as i32,
+                wz + cz as i32,
+                wy,
+                block,
+            );
         }
         Vec3::new(x, y, z)
     })
 }
 
-fn smooth_corner_height(
-    ctx: &MeshContext<'_>,
-    corner_wx: i32,
-    corner_wz: i32,
-    base_y: i32,
-    block: BlockID,
-) -> f32 {
-    let mut total = 0.0f32;
-    let mut count = 0.0f32;
-    for sx in [corner_wx - 1, corner_wx] {
-        for sz in [corner_wz - 1, corner_wz] {
-            if let Some(height) = nearby_smooth_column_height(ctx, sx, sz, base_y, block) {
-                total += height;
-                count += 1.0;
-            }
-        }
-    }
-    if count == 0.0 {
-        return base_y as f32 + 1.0;
-    }
-    (total / count).clamp(base_y as f32 + 0.35, base_y as f32 + 1.20)
-}
-
-fn nearby_smooth_column_height(
-    ctx: &MeshContext<'_>,
-    wx: i32,
-    wz: i32,
-    base_y: i32,
-    block: BlockID,
-) -> Option<f32> {
-    for y in ((base_y - 2).max(0)..=(base_y + 1).min(CHUNK_Y as i32 - 1)).rev() {
-        let here = (ctx.get_block_world)(wx, y, wz);
-        if !is_smooth_granular(here) {
-            continue;
-        }
-        let above = (ctx.get_block_world)(wx, y + 1, wz);
-        if above != BlockID::AIR && !properties(above).transparent {
-            continue;
-        }
-        let material_bias = if here == block { 0.0 } else { -0.08 };
-        return Some(y as f32 + 1.0 + material_bias);
-    }
-    None
-}
-
-fn triangle_normal(corners: [Vec3; 3]) -> Vec3 {
-    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
+fn quad_normal(corners: [Vec3; 4]) -> Vec3 {
+    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0])
+        + (corners[2] - corners[0]).cross(corners[3] - corners[0]);
     normal.try_normalize().unwrap_or(Vec3::Y)
 }
 
@@ -576,7 +572,10 @@ fn visible_cell(
     let wy = ly as i32;
     let wz = ctx.origin_z + lz as i32;
     let neighbor = (ctx.get_block_world)(wx + dx, wy + dy, wz + dz);
-    if neighbor != BlockID::AIR && !properties(neighbor).transparent {
+    if neighbor != BlockID::AIR
+        && !properties(neighbor).transparent
+        && !is_smooth_granular(neighbor)
+    {
         return None;
     }
 
@@ -703,12 +702,6 @@ fn blocks_ao(block: BlockID) -> bool {
     block != BlockID::AIR && !properties(block).transparent
 }
 
-fn is_smooth_granular(block: BlockID) -> bool {
-    block != BlockID::AIR
-        && !properties(block).transparent
-        && properties(block).visual_class == VisualClass::SmoothGranular
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +765,7 @@ mod tests {
         let mesh = generate_opaque_mesh(&chunk);
         assert_eq!(mesh.vertices.len(), 0);
         assert_eq!(mesh.indices.len(), 0);
-        assert_eq!(mesh.smooth_vertices.len(), 36);
+        assert_eq!(mesh.smooth_vertices.len(), 24);
         assert_eq!(mesh.smooth_indices.len(), 36);
     }
 
@@ -808,6 +801,19 @@ mod tests {
         });
         assert_eq!(with_n.vertex_count(), 20);
         assert_eq!(with_n.index_count(), 30);
+    }
+
+    #[test]
+    fn hard_face_remains_visible_against_smooth_neighbor() {
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 64, 5, BlockID::STONE);
+        chunk.set(6, 64, 5, BlockID::SAND);
+        let mesh = generate_opaque_mesh(&chunk);
+        assert!(
+            mesh.vertices.len() >= 24,
+            "hard block should keep visible faces when touching smooth material"
+        );
+        assert!(!mesh.smooth_vertices.is_empty());
     }
 
     #[test]

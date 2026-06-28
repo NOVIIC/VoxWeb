@@ -299,7 +299,7 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 ### 选中方块线框
 
-不在 egui 内画，由 `render::passes::opaque` 在画完世界后画一组线（或单独 Wireframe Pass）。线框的位置 = `app.current_hit.block_pos` 的方块 AABB 顶点。颜色：`vec4(0,0,0,0.6)`，深度测试 `LessEqual`，深度写入 `false`。
+不在 egui 内画，由 Selection Pass 在画完世界后画一组线。硬方块线框使用整格 AABB；`SmoothGranular` 使用 `core::surface` 高度场 AABB，避免框住完整立方体。颜色：`vec4(0,0,0,0.6)`，深度测试 `LessEqual`，深度写入 `false`。
 
 ### 左下角：聊天历史（最近消息）
 

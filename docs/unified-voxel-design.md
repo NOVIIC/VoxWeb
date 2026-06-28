@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影，以及 `SmoothGranular` 的第一版高度场平滑提面；真实流体、完整 Surface Nets / Marching Cubes 和可见刚体飞行尚未实现。
+> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影，客户端投影短动画，以及 `SmoothGranular` 的第一版高度场平滑提面 / raycast / 选中 / 客户端碰撞共用查询；真实流体、完整 Surface Nets / Marching Cubes 和权威可见刚体飞行尚未实现。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -89,13 +89,13 @@
 | `core::block` | `BlockID` + 编译期 `BlockProperties`；已新增 `MaterialID`/`MaterialProperties` 过渡别名、`MaterialCell` 原型和 `MaterialRegistry` 查询入口 | 后续迁移为独立 `MaterialRegistry` 与 FieldChunk schema |
 | `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标 | 继续作为当前渲染/碰撞适配格式，网络和存档已由 FieldChunk 承担 |
 | `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护；OPFS 和网络快照均使用 FieldChunk 编码 | 后续扩展 column delta、active FreeObject refs 和 region hash |
-| `core::object` | `FreeObject`、`ObjectSample`、`MaterialSummary`、`CollisionProxy` 与 `FreeObjectState` | 后续接入可见刚体飞行、网络状态和持久化 active object |
+| `core::object` | `FreeObject`、`ObjectSample`、`MaterialSummary`、`CollisionProxy` 与 `FreeObjectState` | 后续接入权威可见刚体飞行、网络状态和持久化 active object |
 | `core::protocol` | bincode 消息、FieldRequest、FieldSnapshot、FieldDelta、BlockID 操作请求 | 扩展为 ApplyKernel、FreeObject 状态和投影事件 |
 | `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、`free_objects` 投影记录、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为运行时主格式，并持有 active FreeObject 模拟队列 |
 | `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 软材质局部下落/滑落和 `FloatingOnly` 小硬材质连通块即时提取/投影 | 后续扩展质量守恒 kernel、可见刚体运动和更细支撑图 |
 | `render::chunk_mesh` | 硬方块贪婪网格化、透明方块网格、`SmoothGranular` 高度场平滑提面 | 后续扩展为更完整 extractor 集合：blocky / smooth Surface Nets 或 Marching Cubes / fluid / object mesh |
-| `client::physics` | 玩家 AABB 分轴碰撞、本地预测 | 保留角色控制器，查询统一世界碰撞代理 |
-| `client::raycast` | DDA 命中 solid 方块 | 硬材质 DDA + 平滑材质 field ray query |
+| `client::physics` | 玩家 AABB 分轴碰撞、本地预测；`SmoothGranular` 使用共享高度场做客户端碰撞 | 保留角色控制器，后续查询更完整统一世界碰撞代理 |
+| `client::raycast` | DDA 命中 solid 方块；`SmoothGranular` 使用共享高度场做精确命中 | 后续扩展为更完整平滑材质 field ray query |
 | `client::mesh_jobs` | 分帧 chunk mesh 任务队列 | 继续承载各 extractor 的分帧预算 |
 | `client::storage` | OPFS chunk 读写 | 存储 FieldChunk、FreeObject、schema 版本 |
 | `net` | WebRTC / WS 中继字节通道 | 仍只负责传输，不理解世界语义 |
@@ -532,8 +532,8 @@ struct StabilityComponent {
 | 材质视觉类 | Extractor | 说明 |
 |---|---|---|
 | HardBlocky | blocky greedy / face meshing | 保留笔直方块、锐边、低成本 |
-| SmoothGranular | 当前高度场平滑提面；后续 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
-| RigidBreakable FreeObject | local mesh cache + transform | 动态岩块、碎块 |
+| SmoothGranular | 当前共享高度场平滑提面 / raycast / 选中 / 客户端碰撞；后续 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
+| RigidBreakable FreeObject | 当前客户端投影短动画；后续 local mesh cache + transform | 动态岩块、碎块 |
 | Fluid | future fluid surface extractor + transparent pass | 水面、透明排序、波动；第一版水只做静态透明占位 |
 | Mixed boundary | priority / blend / seam resolver | 处理硬软交界 |
 
@@ -758,8 +758,8 @@ struct FieldChunkRecord {
 
 5. **FreeObject 生命周期**
    - 已有第一版：小型 `FloatingOnly` 硬材质连通块失去支撑后，从静态场提取为 `FreeObject` 记录，整体下落到最近支撑面，并在同一权威步骤投影回 `MaterialField`。
-   - 投影结果通过 `FreeObjectProject { object_id, deltas }` 广播；客户端直接应用 delta 并重网格化受影响 chunk。
-   - 尚未实现可见刚体飞行、碰撞反弹、碎裂和低频 FreeObject 网络状态。
+   - 投影结果通过 `FreeObjectProject { object_id, deltas }` 广播；客户端应用 delta、重网格化受影响 chunk，并从 delta 配对旧/新位置播放约 320ms 的短时下落动画。
+   - 尚未实现权威可见刚体飞行、碰撞反弹、碎裂和低频 FreeObject 网络状态。
    - 后续把即时投影替换为分帧动态过程。
 
 6. **结构完整性**

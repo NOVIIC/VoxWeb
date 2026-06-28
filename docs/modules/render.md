@@ -177,7 +177,7 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 
 **Draw 调用顺序**：先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
-**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness / slope brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。硬材质保持锐利方块边；草、泥土、沙子等 `SmoothGranular` 根据邻近颗粒列插值顶部高度，边缘用梯形侧面连接。
+**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness / slope brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。硬材质保持锐利方块边；草、泥土、沙子等 `SmoothGranular` 通过 `core::surface` 根据邻近颗粒列插值顶部高度，边缘用梯形侧面连接。硬软交界以硬表面优先，硬方块邻接软材质时保留硬方块面，避免双方同时剔除造成漏面。
 
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 
@@ -306,9 +306,9 @@ impl Renderer {
     pub fn render_transparent(&mut self, encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView, view_proj: Mat4, visual: VisualFrame);
 
-    /// 渲染选中方块线框（在 render_world 之后调用）
+    /// 渲染选中体积线框（在 render_world 之后调用）
     pub fn render_selection(&mut self, encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView, view_proj: Mat4, block_pos: Option<Position>);
+        color_view: &wgpu::TextureView, view_proj: Mat4, selection: Option<Aabb>);
 
     pub fn depth_view(&self) -> &wgpu::TextureView;
     pub fn loaded_chunk_count(&self) -> usize;

@@ -11,52 +11,54 @@ use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
-/// 玩家 AABB box 顶点（36 个，12 个三角形）。
-/// 以玩家脚底 (0, 0, 0) 为原点，尺寸 0.6×1.8×0.6。
+/// 单位 box 顶点（36 个，12 个三角形）。
+/// 实际尺寸由 instance.size 控制。玩家实例传入 0.6×1.8×0.6；
+/// FreeObject 投影动画传入 1×1×1。
 const CUBE_VERTICES: &[[f32; 3]] = &[
-    // +Y (top, y=1.8) — CCW from +Y
-    [-0.3, 1.8, 0.3],
-    [0.3, 1.8, 0.3],
-    [0.3, 1.8, -0.3],
-    [-0.3, 1.8, 0.3],
-    [0.3, 1.8, -0.3],
-    [-0.3, 1.8, -0.3],
+    // +Y (top, y=1) — CCW from +Y
+    [0.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 1.0],
+    [1.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0],
     // -Y (bottom, y=0) — CCW from -Y
-    [-0.3, 0.0, 0.3],
-    [0.3, 0.0, -0.3],
-    [0.3, 0.0, 0.3],
-    [-0.3, 0.0, 0.3],
-    [-0.3, 0.0, -0.3],
-    [0.3, 0.0, -0.3],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
     // +Z (front)
-    [-0.3, 0.0, 0.3],
-    [0.3, 0.0, 0.3],
-    [0.3, 1.8, 0.3],
-    [-0.3, 0.0, 0.3],
-    [0.3, 1.8, 0.3],
-    [-0.3, 1.8, 0.3],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [0.0, 1.0, 1.0],
     // -Z (back)
-    [0.3, 0.0, -0.3],
-    [-0.3, 0.0, -0.3],
-    [-0.3, 1.8, -0.3],
-    [0.3, 0.0, -0.3],
-    [-0.3, 1.8, -0.3],
-    [0.3, 1.8, -0.3],
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 1.0, 0.0],
     // +X (right)
-    [0.3, 0.0, 0.3],
-    [0.3, 0.0, -0.3],
-    [0.3, 1.8, -0.3],
-    [0.3, 0.0, 0.3],
-    [0.3, 1.8, -0.3],
-    [0.3, 1.8, 0.3],
+    [1.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 1.0, 1.0],
     // -X (left)
-    [-0.3, 0.0, -0.3],
-    [-0.3, 0.0, 0.3],
-    [-0.3, 1.8, 0.3],
-    [-0.3, 0.0, -0.3],
-    [-0.3, 1.8, 0.3],
-    [-0.3, 1.8, -0.3],
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 1.0, 1.0],
+    [0.0, 1.0, 0.0],
 ];
+const MAX_INSTANCE_COUNT: usize = 1024;
 
 /// 每帧上传的 globals uniform（与 OpaquePass 同结构，方便复用）。
 #[repr(C)]
@@ -73,6 +75,8 @@ pub struct PlayerGlobals {
 pub struct PlayerInstance {
     pub position: [f32; 3],
     pub _pad0: f32,
+    pub size: [f32; 3],
+    pub _pad_size: f32,
     pub color: [f32; 3],
     pub _pad1: f32,
 }
@@ -124,10 +128,10 @@ impl PlayerPass {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // 预留 16 个实例 × 32 字节
+        // 预留 1024 个实例，远端玩家和短时 FreeObject 投影动画共用。
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("player.ibuf"),
-            size: 16 * std::mem::size_of::<PlayerInstance>() as u64,
+            size: MAX_INSTANCE_COUNT as u64 * std::mem::size_of::<PlayerInstance>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -163,6 +167,11 @@ impl PlayerPass {
                 format: wgpu::VertexFormat::Float32x3,
                 offset: 16,
                 shader_location: 2,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 32,
+                shader_location: 3,
             },
         ];
 
@@ -233,8 +242,13 @@ impl PlayerPass {
             self.instance_count = 0;
             return;
         }
-        self.instance_count = instances.len() as u32;
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        let count = instances.len().min(MAX_INSTANCE_COUNT);
+        self.instance_count = count as u32;
+        queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&instances[..count]),
+        );
     }
 
     /// 编码玩家渲染 Pass。LoadOp=Load（不清屏/不清深度）。
@@ -318,11 +332,12 @@ fn face_normal(vi: u32) -> vec3<f32> {
 fn vs_main(
     @location(0) vert_pos: vec3<f32>,
     @location(1) inst_pos: vec3<f32>,
-    @location(2) inst_color: vec3<f32>,
+    @location(2) inst_size: vec3<f32>,
+    @location(3) inst_color: vec3<f32>,
     @builtin(vertex_index) vi: u32,
 ) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = vert_pos + inst_pos;
+    let world_pos = inst_pos + vert_pos * inst_size;
     out.clip_position = globals.view_proj * vec4<f32>(world_pos, 1.0);
     out.world_normal = face_normal(vi);
     out.color = inst_color;
@@ -345,8 +360,8 @@ mod player_tests {
     use super::*;
 
     #[test]
-    fn player_instance_layout_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<PlayerInstance>(), 32);
+    fn player_instance_layout_is_48_bytes() {
+        assert_eq!(std::mem::size_of::<PlayerInstance>(), 48);
     }
 
     #[test]

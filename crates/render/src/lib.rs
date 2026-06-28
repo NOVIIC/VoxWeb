@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
-use voxweb_core::chunk::Position;
 use voxweb_core::{Aabb, ChunkPos};
 
 use crate::chunk_mesh::ChunkMeshCpu;
@@ -685,21 +684,23 @@ impl Renderer {
         }
     }
 
-    /// 渲染选中方块的线框。`block_pos = None` 时跳过（玩家未瞄准任何方块）。
+    /// 渲染选中体积的线框。`selection = None` 时跳过（玩家未瞄准任何方块）。
     /// 必须在 `render_world` 之后调用，共享同一份 depth view 但不写深度。
     pub fn render_selection(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        block_pos: Option<Position>,
+        selection: Option<Aabb>,
     ) {
-        let Some(pos) = block_pos else {
+        let Some(selection) = selection else {
             return;
         };
+        let size = selection.max - selection.min;
         let globals = SelectionGlobals {
             view_proj: view_proj.to_cols_array_2d(),
-            block_origin: [pos.x as f32, pos.y as f32, pos.z as f32, 0.0],
+            box_min: [selection.min.x, selection.min.y, selection.min.z, 0.0],
+            box_size: [size.x.max(0.02), size.y.max(0.02), size.z.max(0.02), 0.0],
         };
         self.queue.write_buffer(
             &self.selection_pass.globals_buffer,

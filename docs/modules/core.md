@@ -30,6 +30,7 @@ crates/core/
     ├── chunk.rs        Chunk + Position + ChunkPos
     ├── field.rs        FieldChunk + Column + Span 原型
     ├── object.rs       FreeObject + ObjectSample + CollisionProxy
+    ├── surface.rs      SmoothGranular 高度场查询（渲染 / raycast / 客户端碰撞共用）
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
 ```
 
@@ -100,7 +101,7 @@ pub struct MaterialCell {
 }
 ```
 
-当前运行时 chunk 仍保存 `Vec<BlockID>` 作为渲染/碰撞适配视图；`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta` 和后续 FreeObject 迁移。
+当前运行时 chunk 仍保存 `Vec<BlockID>` 作为渲染/碰撞适配视图；`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta` 和后续 FreeObject 迁移。`surface.rs` 提供 `SmoothGranular` 高度场查询，确保渲染提面、DDA raycast、选中框和客户端玩家碰撞使用同一套软材质表面规则。
 
 ### `object.rs` — FreeObject
 

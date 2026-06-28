@@ -7,6 +7,7 @@ use glam::{IVec3, Vec3};
 
 use voxweb_core::block::{BlockID, properties};
 use voxweb_core::chunk::Position;
+use voxweb_core::{SmoothCellRef, is_smooth_granular, ray_intersect_smooth_cell};
 use voxweb_render::vertex::Face;
 
 /// DDA 射线检测结果。
@@ -22,6 +23,10 @@ pub struct RaycastHit {
     pub block: BlockID,
     /// 从射线起点到命中点的距离（米）
     pub distance: f32,
+    /// 精确命中点。硬方块为进入体素面的点；软材质为高度场表面点。
+    pub point: Vec3,
+    /// 精确表面法线。硬方块为轴向法线；软材质可为斜坡法线。
+    pub surface_normal: Vec3,
 }
 
 /// 从 `origin` 沿 `direction` 发射射线，在 `max_distance` 内查找第一个 solid 方块。
@@ -109,6 +114,8 @@ pub fn raycast(
             face: Face::PosY,
             block,
             distance: 0.0,
+            point: origin,
+            surface_normal: Vec3::Y,
         });
     }
 
@@ -143,12 +150,39 @@ pub fn raycast(
             // 命中面 = 进入该体素时穿过的那个面
             // 例如沿 +X 步进进入新体素 → 命中的是新体素的 NegX 面，normal 指向 -X
             let (face, normal) = face_and_normal(last_axis, step);
+            if is_smooth_granular(block) {
+                if let Some((smooth_distance, surface_normal)) = ray_intersect_smooth_cell(
+                    get_block,
+                    origin,
+                    dir,
+                    max_distance,
+                    SmoothCellRef {
+                        wx: current.x,
+                        wy: current.y,
+                        wz: current.z,
+                        block,
+                    },
+                ) {
+                    return Some(RaycastHit {
+                        pos: Position::new(current.x, current.y, current.z),
+                        normal: IVec3::new(0, 1, 0),
+                        face: Face::PosY,
+                        block,
+                        distance: smooth_distance,
+                        point: origin + dir * smooth_distance,
+                        surface_normal,
+                    });
+                }
+                continue;
+            }
             return Some(RaycastHit {
                 pos: Position::new(current.x, current.y, current.z),
                 normal,
                 face,
                 block,
                 distance: traveled,
+                point: origin + dir * traveled,
+                surface_normal: normal.as_vec3(),
             });
         }
     }
@@ -311,5 +345,27 @@ mod tests {
         let getter = single_block_at((0, 0, 0));
         let hit = raycast(Vec3::new(0.5, 64.5, 0.5), Vec3::ZERO, 10.0, &getter);
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn raycast_smooth_granular_returns_surface_distance() {
+        let getter = |x, y, z| {
+            if (x, y, z) == (0, 64, 0) {
+                BlockID::SAND
+            } else {
+                BlockID::AIR
+            }
+        };
+        let hit = raycast(
+            Vec3::new(0.5, 70.0, 0.5),
+            Vec3::new(0.0, -1.0, 0.0),
+            10.0,
+            &getter,
+        )
+        .expect("应命中沙面");
+        assert_eq!(hit.pos, Position::new(0, 64, 0));
+        assert_eq!(hit.face, Face::PosY);
+        assert!((hit.point.y - 65.0).abs() < 0.06, "point={:?}", hit.point);
+        assert!(hit.surface_normal.y > 0.8);
     }
 }

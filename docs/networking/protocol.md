@@ -245,7 +245,7 @@ Remote                          Host
 
 若被挖放的材质或其邻近材质触发 `ImmediateRelaxation`，Host 会在同一可靠通道继续广播一串 `FieldDelta`。Remote 不独立决定最终滑落位置，只把这些更新按顺序写入本地世界并重网格化受影响 chunk。
 
-若硬建筑材质触发 `FloatingOnly` 坍落，Host 会生成 `FreeObjectProject`：其中包含本次提取对象的 `object_id` 以及投影回静态场所需的 cell delta。当前客户端不渲染飞行中的刚体，而是直接应用这些 delta；后续可在 `FreeObjectProject` 前追加 `FreeObjectSpawn/State` 做可见动态过程。
+若硬建筑材质触发 `FloatingOnly` 坍落，Host 会生成 `FreeObjectProject`：其中包含本次提取对象的 `object_id` 以及投影回静态场所需的 cell delta。客户端会立即按权威 delta 更新静态场并重网格化，同时从 delta 中配对旧位置 / 新位置，播放约 320ms 的短时盒体下落动画。该动画只是投影事件的本地可见反馈，不是可同步的权威刚体状态；后续若需要真实飞行、碰撞反弹或碎裂，再在 `FreeObjectProject` 前追加 `FreeObjectSpawn/State`。
 
 ```
 若 ActionAck.accepted=false：

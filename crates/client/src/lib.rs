@@ -36,10 +36,12 @@ use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
+use voxweb_core::{Aabb, is_smooth_granular, smooth_cell_top_height};
 use voxweb_render::{Renderer, VisualFrame};
 
 use crate::app::{
-    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
+    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, FreeObjectCellAnimation,
+    FreeObjectProjectionAnimation, Game, GameMode, PreloadState, RemotePlayerState,
 };
 use crate::browser::{
     now_ms, random_seed, read_query_param, set_room_in_url, signaling_url, sync_canvas_size,
@@ -52,7 +54,7 @@ use crate::mesh_jobs::MeshPriority;
 use crate::prediction::{
     PendingAction, PendingKind, ReconcileResult, apply_pending_position_correction, reconcile_self,
 };
-use crate::raycast::raycast;
+use crate::raycast::{RaycastHit, raycast};
 use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
@@ -68,6 +70,63 @@ const PING_INTERVAL_MS: f64 = 5000.0;
 /// 普通自动保存间隔（毫秒）。退出 / 手动保存有单独快路径。
 const AUTO_SAVE_INTERVAL_MS: f64 = 3000.0;
 const AUTO_SAVE_BATCH_CHUNKS: usize = 4;
+
+fn selection_aabb_for_hit(get_block: &dyn Fn(i32, i32, i32) -> BlockID, hit: RaycastHit) -> Aabb {
+    let min = glam::Vec3::new(hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32);
+    if is_smooth_granular(hit.block) {
+        let top = smooth_cell_top_height(get_block, hit.pos.x, hit.pos.y, hit.pos.z, hit.block);
+        return Aabb::new(
+            min,
+            glam::Vec3::new(min.x + 1.0, top.max(min.y + 0.05), min.z + 1.0),
+        );
+    }
+    Aabb::new(min, min + glam::Vec3::ONE)
+}
+
+fn block_animation_color(block: BlockID) -> [f32; 3] {
+    match block {
+        BlockID::STONE => [0.46, 0.48, 0.50],
+        BlockID::GRASS => [0.35, 0.58, 0.26],
+        BlockID::DIRT => [0.45, 0.30, 0.18],
+        BlockID::SAND => [0.78, 0.67, 0.38],
+        BlockID::WOOD => [0.50, 0.32, 0.18],
+        BlockID::GLASS => [0.55, 0.78, 0.90],
+        BlockID::STONE_BRICKS => [0.42, 0.43, 0.46],
+        _ => [0.65, 0.62, 0.58],
+    }
+}
+
+fn enqueue_free_object_animation(
+    game: &mut Game,
+    deltas: &[(Position, voxweb_core::MaterialCell)],
+    now_ms: f64,
+) {
+    let air_positions = deltas
+        .iter()
+        .filter_map(|(pos, cell)| cell.is_empty().then_some(*pos))
+        .collect::<Vec<_>>();
+    let material_positions = deltas
+        .iter()
+        .filter_map(|(pos, cell)| {
+            let block = cell.to_block_id();
+            (block != BlockID::AIR).then_some((*pos, block))
+        })
+        .collect::<Vec<_>>();
+    if air_positions.is_empty() || air_positions.len() != material_positions.len() {
+        return;
+    }
+    let cells = air_positions
+        .into_iter()
+        .zip(material_positions)
+        .map(|(from, (to, block))| FreeObjectCellAnimation { from, to, block })
+        .collect::<Vec<_>>();
+    game.free_object_animations
+        .push(FreeObjectProjectionAnimation {
+            started_at_ms: now_ms,
+            duration_ms: 320.0,
+            cells,
+        });
+}
 const SAVE_NOW_BATCH_CHUNKS: usize = 16;
 
 /// Pong 校时样本权重。Pong 带 RTT 信息，可信度高于裸 PlayerTick。
@@ -1805,7 +1864,7 @@ fn render_game_frame(
     let mut request_pointer_lock_after = false;
     let mut request_exit_pointer_lock = false;
 
-    let (camera_pos, view_proj, fps_display, mesh_budget, current_hit_pos) = {
+    let (camera_pos, view_proj, fps_display, mesh_budget, current_selection) = {
         let mut a = app.borrow_mut();
         let fps_display = a.fps_display;
         let input_rc = a.input.clone();
@@ -1909,15 +1968,17 @@ fn render_game_frame(
         }
 
         // DDA 射线检测（每帧）
-        let hit = {
+        let (hit, selection) = {
             let server_borrow = world_ref.borrow();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
-            raycast(
+            let hit = raycast(
                 game.camera.position,
                 game.camera.forward(),
                 MAX_REACH,
                 &getter,
-            )
+            );
+            let selection = hit.map(|h| selection_aabb_for_hit(&getter, h));
+            (hit, selection)
         };
         game.current_hit = hit;
 
@@ -1935,7 +1996,7 @@ fn render_game_frame(
             game.camera.vp_matrix(),
             fps_display,
             game.settings.mesh_budget_ms,
-            game.current_hit.map(|h| h.pos),
+            selection,
         )
     };
 
@@ -2292,9 +2353,35 @@ fn render_game_frame(
                         && let Some(rp) = game.remote_players.get(&eid)
                     {
                         instances.push(voxweb_render::passes::player::PlayerInstance {
-                            position: pos.to_array(),
+                            position: [pos.x - 0.3, pos.y, pos.z - 0.3],
                             _pad0: 0.0,
+                            size: [0.6, 1.8, 0.6],
+                            _pad_size: 0.0,
                             color: rp.color_rgb,
+                            _pad1: 0.0,
+                        });
+                    }
+                }
+                game.free_object_animations
+                    .retain(|anim| !anim.is_finished(now));
+                for anim in &game.free_object_animations {
+                    let t = anim.progress(now);
+                    let eased = t * t * (3.0 - 2.0 * t);
+                    for cell in &anim.cells {
+                        let from = glam::Vec3::new(
+                            cell.from.x as f32,
+                            cell.from.y as f32,
+                            cell.from.z as f32,
+                        );
+                        let to =
+                            glam::Vec3::new(cell.to.x as f32, cell.to.y as f32, cell.to.z as f32);
+                        let p = from.lerp(to, eased);
+                        instances.push(voxweb_render::passes::player::PlayerInstance {
+                            position: p.to_array(),
+                            _pad0: 0.0,
+                            size: [1.0, 1.0, 1.0],
+                            _pad_size: 0.0,
+                            color: block_animation_color(cell.block),
                             _pad1: 0.0,
                         });
                     }
@@ -2313,7 +2400,7 @@ fn render_game_frame(
         // 选中方块线框（命中时）
         let selection_start = now_ms();
         a.renderer
-            .render_selection(&mut encoder, &view, view_proj, current_hit_pos);
+            .render_selection(&mut encoder, &view, view_proj, current_selection);
         let selection_pass_ms = (now_ms() - selection_start) as f32;
 
         // egui Pass
@@ -2789,6 +2876,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             }
         }
         ServerMessage::FreeObjectProject { deltas, .. } => {
+            enqueue_free_object_animation(game, &deltas, now_ms());
             for (pos, cell) in deltas {
                 let block = cell.to_block_id();
                 if game.mode == GameMode::Remote {

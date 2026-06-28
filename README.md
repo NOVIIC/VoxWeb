@@ -43,9 +43,10 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 - `core::block` 已有 MaterialID/MaterialProperties 过渡层；`core::field` 已有 FieldChunk/Column/Span 原型和 Chunk 双向转换，`server::World` 会同步维护 `field_chunks`
 - 石砖进入第 9 格 hotbar，世界最低层生成不可破坏基岩
 - `ImmediateRelaxation` 软材质已有局部松弛原型：沙/土/草在挖放后由 Host / Local-Only 立即下落或滑落，并通过多条 FieldDelta 同步
-- `FloatingOnly` 硬材质已有第一版稳定性：完全浮空的小连通块会提取为 FreeObject、整体下落并投影回静态场
+- `FloatingOnly` 硬材质已有第一版稳定性：完全浮空的小连通块会提取为 FreeObject、整体下落并投影回静态场；客户端会对 `FreeObjectProject` 做短时下落动画
 - 渲染主路径为 Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI
 - 网格化使用跨区块面剔除、硬材质贪婪合并、SmoothGranular 高度场平滑提面、AO、index buffer、视锥剔除和分帧任务队列
+- `SmoothGranular` 高度场查询已被渲染、raycast、选中框和客户端玩家碰撞共用，减少视觉与交互不一致
 - OPFS Variant A：主线程 async 存取、周期 flush、手动保存、删档、配额 UI 和严格版本校验
 
 仍需关注：

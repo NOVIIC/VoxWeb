@@ -7,6 +7,7 @@ pub mod field;
 pub mod geometry;
 pub mod object;
 pub mod protocol;
+pub mod surface;
 
 pub use block::{
     BlockID, BlockProperties, BreakKernel, CellFlags, MATERIAL_REGISTRY, MaterialCell, MaterialID,
@@ -22,4 +23,9 @@ pub use object::{
 pub use protocol::{
     AckReason, ClientMessage, EntityId, FIELD_SNAPSHOT_PAYLOAD_MAX, OutboundMessage,
     PROTOCOL_VERSION, PlayerEntry, PlayerSnapshot, Recipient, RoomEvent, ServerMessage, encode,
+};
+pub use surface::{
+    SmoothCellRef, is_open_for_surface, is_smooth_granular, nearby_smooth_column_height,
+    ray_intersect_smooth_cell, smooth_cell_top_height, smooth_corner_height, smooth_height_at,
+    smooth_height_normal,
 };
