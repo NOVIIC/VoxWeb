@@ -12,6 +12,7 @@ use glam::Vec3;
 
 use voxweb_core::block::{BlockID, properties};
 use voxweb_core::geometry::{Aabb, PLAYER_EYE_OFFSET, player_aabb};
+use voxweb_core::{is_smooth_granular, smooth_cell_top_height};
 
 use crate::camera::{Camera, CameraMode};
 use crate::input::InputState;
@@ -211,6 +212,13 @@ impl LocalPhysics {
         let candidate = player_aabb(new_feet);
         if collides_with_world(get_block, &candidate) {
             self.velocity.y = 0.0;
+            if dy < 0.0
+                && let Some(snap) =
+                    find_smooth_floor_snap(get_block, &candidate, self.feet_position.y)
+            {
+                self.feet_position.y = snap;
+                return;
+            }
             // 吸附到最近的整数 Y 面：floor 脚底 →
             //   下落时站在方块顶面；上跳时头顶刚好在方块底面以下
             // （因玩家高度 >1 格，ceil 会穿入方块，故统一用 floor）。
@@ -309,16 +317,68 @@ pub fn collides_with_world(get_block: &dyn Fn(i32, i32, i32) -> BlockID, aabb: &
                 if !block_solid(get_block(x, y, z)) {
                     continue;
                 }
-                if aabb.intersects(&Aabb::new(
-                    Vec3::new(x as f32, y as f32, z as f32),
-                    Vec3::new(x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0),
-                )) {
+                if block_intersects_aabb(get_block, x, y, z, aabb) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn block_intersects_aabb(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    x: i32,
+    y: i32,
+    z: i32,
+    aabb: &Aabb,
+) -> bool {
+    let block = get_block(x, y, z);
+    if is_smooth_granular(block) {
+        if aabb.max.x <= x as f32
+            || aabb.min.x >= x as f32 + 1.0
+            || aabb.max.z <= z as f32
+            || aabb.min.z >= z as f32 + 1.0
+        {
+            return false;
+        }
+        let top = smooth_cell_top_height(get_block, x, y, z, block);
+        return aabb.min.y < top && aabb.max.y > y as f32;
+    }
+    aabb.intersects(&Aabb::new(
+        Vec3::new(x as f32, y as f32, z as f32),
+        Vec3::new(x as f32 + 1.0, y as f32 + 1.0, z as f32 + 1.0),
+    ))
+}
+
+fn find_smooth_floor_snap(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    aabb: &Aabb,
+    previous_feet_y: f32,
+) -> Option<f32> {
+    let min_x = aabb.min.x.floor() as i32;
+    let max_x = (aabb.max.x - f32::EPSILON).floor() as i32;
+    let min_z = aabb.min.z.floor() as i32;
+    let max_z = (aabb.max.z - f32::EPSILON).floor() as i32;
+    let min_y = (aabb.min.y.floor() as i32 - 1).max(0);
+    let max_y = (previous_feet_y.ceil() as i32 + 1).min(voxweb_core::CHUNK_Y as i32 - 1);
+    let mut best: Option<f32> = None;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                let block = get_block(x, y, z);
+                if !is_smooth_granular(block) {
+                    continue;
+                }
+                let top = smooth_cell_top_height(get_block, x, y, z, block);
+                if top < aabb.min.y - 0.08 || top > previous_feet_y + 0.12 {
+                    continue;
+                }
+                best = Some(best.map_or(top, |old| old.max(top)));
+            }
+        }
+    }
+    best
 }
 
 /// 玩家脚下 GROUND_PROBE 米内有 solid 方块 → 在地面。
@@ -361,10 +421,7 @@ fn find_wall_snap_x(
                 }
                 let block_min_x = bx as f32;
                 let block_max_x = bx as f32 + 1.0;
-                if !aabb.intersects(&Aabb::new(
-                    Vec3::new(block_min_x, by as f32, bz as f32),
-                    Vec3::new(block_max_x, by as f32 + 1.0, bz as f32 + 1.0),
-                )) {
+                if !block_intersects_aabb(get_block, bx, by, bz, aabb) {
                     continue;
                 }
                 // 只在位移方向上吸附：右移贴左面，左移贴右面
@@ -409,10 +466,7 @@ fn find_wall_snap_z(
                 }
                 let block_min_z = bz as f32;
                 let block_max_z = bz as f32 + 1.0;
-                if !aabb.intersects(&Aabb::new(
-                    Vec3::new(bx as f32, by as f32, block_min_z),
-                    Vec3::new(bx as f32 + 1.0, by as f32 + 1.0, block_max_z),
-                )) {
+                if !block_intersects_aabb(get_block, bx, by, bz, aabb) {
                     continue;
                 }
                 let snap = if dz > 0.0 {

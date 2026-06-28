@@ -17,6 +17,14 @@ struct VsIn {
     @location(0) packed: u32,
 };
 
+struct SmoothVsIn {
+    @location(0) local_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) raw_uv: vec2<f32>,
+    @location(3) tex_f: f32,
+    @location(4) ao_f: f32,
+};
+
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) raw_uv: vec2<f32>,
@@ -24,6 +32,7 @@ struct VsOut {
     @location(2) ao: f32,
     @location(3) face_f: f32,
     @location(4) tex_f: f32,
+    @location(5) normal: vec3<f32>,
 };
 
 @vertex
@@ -45,6 +54,22 @@ fn vs_main(in: VsIn) -> VsOut {
     out.ao = f32(ao_raw) / 3.0;
     out.face_f = f32(face);
     out.tex_f = f32(tex);
+    out.normal = face_normal(face);
+    return out;
+}
+
+@vertex
+fn vs_smooth(in: SmoothVsIn) -> VsOut {
+    let world_pos = in.local_pos + g.chunk_origin.xyz;
+
+    var out: VsOut;
+    out.clip = g.view_proj * vec4<f32>(world_pos, 1.0);
+    out.raw_uv = in.raw_uv;
+    out.world_pos = world_pos;
+    out.ao = clamp(in.ao_f / 3.0, 0.0, 1.0);
+    out.face_f = 2.0;
+    out.tex_f = in.tex_f;
+    out.normal = normalize(in.normal);
     return out;
 }
 
@@ -53,10 +78,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = u32(in.face_f + 0.5);
     let tex = u32(in.tex_f + 0.5);
     let sample = textureSample(atlas_tex, atlas_sampler, atlas_uv(tex, in.raw_uv)).rgb;
-    let normal = face_normal(face);
+    let normal = normalize(in.normal);
     let sun = normalize(g.sun_dir.xyz);
     let direct = max(dot(normal, sun), 0.0);
-    let face_light = face_brightness(face) * (0.78 + 0.22 * direct);
+    let slope_light = clamp(0.68 + 0.32 * normal.y, 0.58, 1.02);
+    let face_light = face_brightness(face) * slope_light * (0.78 + 0.22 * direct);
     let ao_light = 0.58 + 0.42 * in.ao;
     var color = sample * face_light * ao_light;
 

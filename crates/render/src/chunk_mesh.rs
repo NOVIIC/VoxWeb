@@ -5,9 +5,12 @@
 //! CPU 侧输出 4 个压缩顶点 + 6 个索引，并记录本 chunk 的可见 bounds 供视锥剔除。
 
 use glam::Vec3;
-use voxweb_core::{Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, properties};
+use voxweb_core::{
+    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, is_open_for_surface,
+    is_smooth_granular, properties, smooth_corner_height, smooth_height_normal,
+};
 
-use crate::vertex::{Face, PackedVertex};
+use crate::vertex::{Face, PackedVertex, SmoothVertex};
 
 /// 一个 Chunk 的不透明网格 CPU 数据。
 pub struct ChunkMeshCpu {
@@ -15,6 +18,9 @@ pub struct ChunkMeshCpu {
     pub vertices: Vec<PackedVertex>,
     /// u32 index buffer。每个 quad 6 个索引。
     pub indices: Vec<u32>,
+    /// 平滑颗粒材质的 float 顶点。当前用于 SmoothGranular 材质的斜坡表面。
+    pub smooth_vertices: Vec<SmoothVertex>,
+    pub smooth_indices: Vec<u32>,
     /// 半透明方块独立顶点。Phase 8 起由 TransparentPass 负责 alpha blend。
     pub transparent_vertices: Vec<PackedVertex>,
     pub transparent_indices: Vec<u32>,
@@ -27,17 +33,32 @@ pub struct ChunkMeshCpu {
 impl ChunkMeshCpu {
     /// 顶点数（贪婪合并后）。
     pub fn vertex_count(&self) -> u32 {
-        self.vertices.len() as u32
+        self.vertices
+            .len()
+            .saturating_add(self.smooth_vertices.len()) as u32
     }
 
     /// 索引数（实际 draw_indexed 数量）。
     pub fn index_count(&self) -> u32 {
-        self.indices.len() as u32
+        self.indices.len().saturating_add(self.smooth_indices.len()) as u32
     }
 
     /// 贪婪前 Phase 2 朴素路径的等价顶点数：每个可见单位面 6 个顶点。
     pub fn phase2_vertex_count(&self) -> u32 {
         self.visible_faces.saturating_mul(6)
+    }
+}
+
+impl ChunkMeshCpu {
+    fn include_smooth_vertex(&mut self, p: Vec3) {
+        if self.bounds.min == Vec3::ZERO
+            && self.bounds.max == Vec3::ZERO
+            && self.vertex_count() == 0
+        {
+            self.bounds = Aabb::new(p, p);
+        } else {
+            self.bounds = Aabb::new(self.bounds.min.min(p), self.bounds.max.max(p));
+        }
     }
 }
 
@@ -131,6 +152,8 @@ impl MeshBuilder {
         ChunkMeshCpu {
             vertices: self.vertices,
             indices: self.indices,
+            smooth_vertices: Vec::new(),
+            smooth_indices: Vec::new(),
             transparent_vertices: Vec::new(),
             transparent_indices: Vec::new(),
             bounds,
@@ -144,6 +167,15 @@ struct MeshContext<'a> {
     origin_x: i32,
     origin_z: i32,
     get_block_world: &'a dyn Fn(i32, i32, i32) -> BlockID,
+}
+
+#[derive(Copy, Clone)]
+struct SmoothFaceInfo {
+    face_idx: usize,
+    lx: usize,
+    ly: usize,
+    lz: usize,
+    block: BlockID,
 }
 
 /// 生成一个 Chunk 的不透明网格顶点。
@@ -187,8 +219,134 @@ pub fn generate_with_neighbors(
     emit_neg_z(&ctx, &mut out);
 
     let mut mesh = out.finish();
+    emit_smooth_granular(&ctx, &mut mesh);
     emit_transparent(&ctx, &mut mesh);
     mesh
+}
+
+fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
+    for ly in 0..CHUNK_Y {
+        for lz in 0..CHUNK_Z {
+            for lx in 0..CHUNK_X {
+                let block = ctx.chunk.get(lx, ly, lz);
+                if !is_smooth_granular(block) {
+                    continue;
+                }
+                let wx = ctx.origin_x + lx as i32;
+                let wy = ly as i32;
+                let wz = ctx.origin_z + lz as i32;
+                for (face_idx, &(dx, dy, dz)) in FACE_NEIGHBORS.iter().enumerate() {
+                    let neighbor = (ctx.get_block_world)(wx + dx, wy + dy, wz + dz);
+                    if neighbor != BlockID::AIR && !properties(neighbor).transparent {
+                        continue;
+                    }
+                    emit_smooth_face(ctx, mesh, lx, ly, lz, face_idx, block);
+                }
+            }
+        }
+    }
+}
+
+fn emit_smooth_face(
+    ctx: &MeshContext<'_>,
+    mesh: &mut ChunkMeshCpu,
+    lx: usize,
+    ly: usize,
+    lz: usize,
+    face_idx: usize,
+    block: BlockID,
+) {
+    let tex = properties(block).texture_index;
+    let corners = smooth_face_corners(ctx, lx, ly, lz, face_idx, block);
+    push_smooth_quad(
+        ctx,
+        mesh,
+        corners,
+        tex,
+        SmoothFaceInfo {
+            face_idx,
+            lx,
+            ly,
+            lz,
+            block,
+        },
+    );
+}
+
+fn push_smooth_quad(
+    ctx: &MeshContext<'_>,
+    mesh: &mut ChunkMeshCpu,
+    corners: [Vec3; 4],
+    tex: u8,
+    info: SmoothFaceInfo,
+) {
+    let base = mesh.smooth_vertices.len() as u32;
+    let normal = if info.face_idx == Face::PosY as usize {
+        let wx = ctx.origin_x + info.lx as i32;
+        let wy = info.ly as i32;
+        let wz = ctx.origin_z + info.lz as i32;
+        smooth_height_normal(ctx.get_block_world, wx, wy, wz, info.block)
+    } else {
+        quad_normal(corners)
+    };
+    for p in corners {
+        mesh.include_smooth_vertex(p);
+        mesh.smooth_vertices.push(SmoothVertex::new(
+            [p.x, p.y, p.z],
+            [normal.x, normal.y, normal.z],
+            smooth_raw_uv(info.face_idx, p),
+            tex,
+        ));
+    }
+    mesh.smooth_indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn smooth_face_corners(
+    ctx: &MeshContext<'_>,
+    lx: usize,
+    ly: usize,
+    lz: usize,
+    face_idx: usize,
+    block: BlockID,
+) -> [Vec3; 4] {
+    let wx = ctx.origin_x + lx as i32;
+    let wy = ly as i32;
+    let wz = ctx.origin_z + lz as i32;
+    let top_is_open = {
+        let above = (ctx.get_block_world)(wx, wy + 1, wz);
+        is_open_for_surface(above)
+    };
+
+    FACE_CORNERS[face_idx].map(|(cx, cy, cz)| {
+        let x = lx as f32 + cx as f32;
+        let z = lz as f32 + cz as f32;
+        let mut y = ly as f32 + cy as f32;
+        if cy == 1 && top_is_open {
+            y = smooth_corner_height(
+                ctx.get_block_world,
+                wx + cx as i32,
+                wz + cz as i32,
+                wy,
+                block,
+            );
+        }
+        Vec3::new(x, y, z)
+    })
+}
+
+fn quad_normal(corners: [Vec3; 4]) -> Vec3 {
+    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0])
+        + (corners[2] - corners[0]).cross(corners[3] - corners[0]);
+    normal.try_normalize().unwrap_or(Vec3::Y)
+}
+
+fn smooth_raw_uv(face_idx: usize, p: Vec3) -> [f32; 2] {
+    match face_idx {
+        0 | 1 => [p.z, p.y],
+        2 | 3 => [p.x, p.z],
+        _ => [p.x, p.y],
+    }
 }
 
 fn emit_transparent(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
@@ -414,7 +572,10 @@ fn visible_cell(
     let wy = ly as i32;
     let wz = ctx.origin_z + lz as i32;
     let neighbor = (ctx.get_block_world)(wx + dx, wy + dy, wz + dz);
-    if neighbor != BlockID::AIR && !properties(neighbor).transparent {
+    if neighbor != BlockID::AIR
+        && !properties(neighbor).transparent
+        && !is_smooth_granular(neighbor)
+    {
         return None;
     }
 
@@ -534,7 +695,7 @@ fn vertex_ao(side1: bool, side2: bool, corner: bool) -> u8 {
 }
 
 fn is_opaque_render_block(block: BlockID) -> bool {
-    block != BlockID::AIR && !properties(block).transparent
+    block != BlockID::AIR && !properties(block).transparent && !is_smooth_granular(block)
 }
 
 fn blocks_ao(block: BlockID) -> bool {
@@ -585,7 +746,7 @@ mod tests {
         let mut chunk = Chunk::empty();
         for x in 0..CHUNK_X {
             for z in 0..CHUNK_Z {
-                chunk.set(x, 64, z, BlockID::GRASS);
+                chunk.set(x, 64, z, BlockID::STONE);
             }
         }
         let mesh = generate_opaque_mesh(&chunk);
@@ -594,6 +755,31 @@ mod tests {
             "greedy={} phase2={}",
             mesh.vertex_count(),
             mesh.phase2_vertex_count()
+        );
+    }
+
+    #[test]
+    fn smooth_granular_uses_float_mesh_not_blocky_mesh() {
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 64, 5, BlockID::SAND);
+        let mesh = generate_opaque_mesh(&chunk);
+        assert_eq!(mesh.vertices.len(), 0);
+        assert_eq!(mesh.indices.len(), 0);
+        assert_eq!(mesh.smooth_vertices.len(), 24);
+        assert_eq!(mesh.smooth_indices.len(), 36);
+    }
+
+    #[test]
+    fn smooth_granular_interpolates_top_heights() {
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 64, 5, BlockID::SAND);
+        chunk.set(6, 63, 5, BlockID::SAND);
+        let mesh = generate_opaque_mesh(&chunk);
+        assert!(
+            mesh.smooth_vertices
+                .iter()
+                .any(|v| v.position[1] > 64.35 && v.position[1] < 65.0),
+            "expected at least one interpolated corner height"
         );
     }
 
@@ -615,6 +801,19 @@ mod tests {
         });
         assert_eq!(with_n.vertex_count(), 20);
         assert_eq!(with_n.index_count(), 30);
+    }
+
+    #[test]
+    fn hard_face_remains_visible_against_smooth_neighbor() {
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 64, 5, BlockID::STONE);
+        chunk.set(6, 64, 5, BlockID::SAND);
+        let mesh = generate_opaque_mesh(&chunk);
+        assert!(
+            mesh.vertices.len() >= 24,
+            "hard block should keep visible faces when touching smooth material"
+        );
+        assert!(!mesh.smooth_vertices.is_empty());
     }
 
     #[test]

@@ -14,8 +14,10 @@ use wgpu::util::DeviceExt;
 #[derive(Copy, Clone, Pod, Zeroable, Default)]
 pub struct SelectionGlobals {
     pub view_proj: [[f32; 4]; 4],
-    /// 选中方块的世界坐标 min 角；w=0 padding
-    pub block_origin: [f32; 4],
+    /// 选中体积的世界坐标 min 角；w=0 padding
+    pub box_min: [f32; 4],
+    /// 选中体积的尺寸；w=0 padding
+    pub box_size: [f32; 4],
 }
 
 /// 单位立方体 12 条边的端点（24 个 vec3）。

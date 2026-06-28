@@ -13,7 +13,7 @@
 - 主循环（RAF + 固定 60Hz 逻辑帧累加器）
 - 输入（键盘/鼠标）、相机控制、本地物理预测、DDA 射线
 - UI（egui）— 大厅、HUD、暂停、聊天、玩家列表、名牌
-- OPFS 持久化的具体实现（`web_sys::FileSystemDirectoryHandle` + palette/RLE 压缩）
+- OPFS 持久化的具体实现（`web_sys::FileSystemDirectoryHandle` + FieldChunk column store 编码）
 - 网格化任务调度（mesh job queue）
 
 `client` crate 的 cargo crate-type 设为 `["cdylib", "rlib"]`，便于 wasm-bindgen 输出。
@@ -53,7 +53,7 @@ crates/client/src/
 ├── hotbar.rs           9 格快捷栏 + 方块标签
 ├── prediction.rs       输入历史、位置协调、挖放 PendingActions
 ├── interp.rs           远端玩家位置插值（PlayerInterp, 100ms 延迟）
-├── chunk_assembler.rs  ChunkSnapshot 分片接收与组装
+├── chunk_assembler.rs  FieldSnapshot 分片接收与组装
 ├── storage.rs          OPFS 异步包装（WorldStorage trait + OpfsStorage）
 └── ui/
     ├── mod.rs          UI 总入口（按 AppState 路由）
@@ -241,7 +241,7 @@ pub mod settings_storage {
 pub struct FrameClock { /* accumulator: f32, step: f32 */ }
 ```
 
-Local / Host 模式下 mesh 回调可直接借 `server.world.get_block_world`；Remote 模式的世界视图由 ChunkSnapshot 和 BlockUpdate 喂入，再交给同一套 mesh job 管线。
+Local / Host 模式下 mesh 回调可直接借 `server.world.get_block_world`；Remote 模式的世界视图由 FieldSnapshot、FieldDelta 和 FreeObjectProject 喂入，再交给同一套 mesh job 管线。
 
 ### 世界会话清理
 
@@ -274,7 +274,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
 
 专用于 `Connecting` 状态：
 1. `poll_net(app)` — 推进网络状态机（信令+WebRTC 协商）
-2. **drain Server→Client inbox** — Remote 端收 Welcome / ChunkSnapshot / BlockUpdate 等消息
+2. **drain Server→Client inbox** — Remote 端收 Welcome / FieldSnapshot / FieldDelta / FreeObjectProject 等消息
 3. **区块预载**：若 `preload_state.active`：
    - Host/Local：调 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成出生点周围 chunk 并入队网格化
    - Remote：仅运行 `mesh_jobs.run_until_budget(16ms)`（chunk 由上一步的 inbox drain 喂入）
@@ -300,7 +300,7 @@ fn render_frame(app: &Rc<RefCell<App>>) -> Result<(), String> {
 fn render_game_frame(app: &Rc<RefCell<App>>, dt: f32, cw: u32, ch: u32) -> Result<(), String> {
     // 1. drain Client→Server → Server.handle_message → 推回 outbox
     // 2. drain Server→Client → apply_server_message
-    //    （Welcome / ActionAck / BlockUpdate）
+    //    （Welcome / ActionAck / FieldDelta / FreeObjectProject）
 
     // 3. 输入 → 物理 + 动作
     //    - 鼠标 apply_mouse
@@ -504,10 +504,10 @@ pub fn priority_for_distance(pos: ChunkPos, center: ChunkPos) -> MeshPriority;
 > **借用顺序**：ChunkLoader.update 需要 `&mut Server`，mesh_jobs.run_until_budget 需要 `&Server`。两段按序执行，不重叠，主循环（[`crates/client/src/lib.rs`](../../crates/client/src/lib.rs)）严格遵守此顺序。
 
 ### 6.8 `physics.rs`（详见 [`features/physics.md`](../features/physics.md)）
-`LocalPhysics { feet_position, velocity, on_ground, mode }`—— Walk 模式：重力（−32 m/s²）、跳跃（8.4 m/s）、lerp 水平加速（HORIZ_ACC=12）、Y/X/Z 分轴碰撞、5cm 地面探测。Fly 模式：直接 `position += dir * FLY_SPEED * dt`。位置驱动 `camera.position = physics.eye_position()`。
+`LocalPhysics { feet_position, velocity, on_ground, mode }`—— Walk 模式：重力（−32 m/s²）、跳跃（8.4 m/s）、lerp 水平加速（HORIZ_ACC=12）、Y/X/Z 分轴碰撞、5cm 地面探测。Fly 模式：直接 `position += dir * FLY_SPEED * dt`。位置驱动 `camera.position = physics.eye_position()`。`SmoothGranular` 碰撞使用 `core::surface` 高度场：脚底下落时吸附到软坡面高度，AABB 与软材质的重叠按当前表面高度裁剪。
 
 ### 6.9 `raycast.rs`（详见 [`features/physics.md`](../features/physics.md)）
-Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, normal: IVec3, face: Face, distance }`——`Face` 复用 `render::vertex::Face`。命中条件 `block != AIR && properties(block).solid`。
+Amanatides & Woo DDA 网格步进，最大射程 6 格。`RaycastHit { pos, normal: IVec3, face: Face, distance, point, surface_normal }`——`Face` 复用 `render::vertex::Face`。硬材质按 solid 体素命中；`SmoothGranular` 只有射线实际碰到 `core::surface` 高度场时才命中，并返回精确命中点和斜坡法线。选中线框对硬材质使用整格 AABB，对软材质使用当前高度场 AABB。
 
 ### 6.10 `hotbar.rs`
 `Hotbar { items: [BlockID; 9], selected: usize }`，1-9 键切换（`InputState::hotbar_request` 边沿）。`block_label(id) -> &'static str` 供 HUD 显示。
@@ -558,7 +558,7 @@ pub struct OpfsStorage {
 }
 ```
 
-**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后回写主循环持有的 `Game`。当前新存档 key 为 `<created_at_s>__<seed>`；大厅选择已有存档时通过 `OpfsStorage::open_by_key(key)` 打开。chunk 字节流的 encode/decode 由 [`crates/core/src/chunk.rs`](../../crates/core/src/chunk.rs) 的 `encode` / `decode`（palette + RLE）负责，storage 层只处理原始字节。
+**调用模式**：所有方法返回 future。client 在合适时机用 `wasm_bindgen_futures::spawn_local(async move { ... })` 启动，完成后回写主循环持有的 `Game`。当前新存档 key 为 `<created_at_s>__<seed>`；大厅选择已有存档时通过 `OpfsStorage::open_by_key(key)` 打开。chunk 字节流的 encode/decode 由 [`crates/core/src/field.rs`](../../crates/core/src/field.rs) 的 `field::encode` / `field::decode` 负责，storage 层只处理原始字节。
 
 大厅通过 `storage_overview()` 同时读取 `navigator.storage.estimate()` 与世界列表，每个 `WorldSummary.used_bytes` 由 `world.json + chunks/*.bin` 文件大小求和得到。游戏内 HUD 不逐帧扫描 OPFS：启动时记录当前世界 chunk 文件大小表，周期保存成功后按本次 encoded chunk 字节数做增量修正。
 
@@ -608,17 +608,19 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
    - Local：跳过此步，直接进入区块预载
 5. **区块预载**：网络 Connected 后启动，加载出生点周围 `(2*render_distance+1)^2` 个 chunk：
    - Host/Local：本地 `chunk_loader.update(DEFAULT_SPAWN, ...)` 生成 + 入队，每帧 `mesh_jobs.run_until_budget(16ms)` 网格化
-   - Remote：先消费 Host bootstrap `ChunkSnapshot`；随后使用 `min(local_render_distance, host_render_distance)` 作为有效视距，若范围内还有缺失 chunk，则发送 `ClientMessage::ChunkRequest` 请求 Host 补齐，收到快照后入队网格化
+   - Remote：先消费 Host bootstrap `FieldSnapshot`；随后使用 `min(local_render_distance, host_render_distance)` 作为有效视距，若范围内还有缺失 chunk，则发送 `ClientMessage::FieldRequest` 请求 Host 补齐，收到快照后入队网格化
    - 完成条件：`received >= total && mesh_jobs.is_empty()` → `state = InGame`
 6. 进入 InGame 后请求指针锁
 
 ### Remote 区块流式同步
 
 Remote 模式不会本地生成地形。`ChunkLoader` 在 Remote 下维护两组集合：
-- `loaded`：已经收到完整 `ChunkSnapshot` 并写入本地 world 的 chunk
-- `requested`：已经通过 `ChunkRequest` 发给 Host、正在等待快照的 chunk
+- `loaded`：已经收到完整 `FieldSnapshot` 并写入本地 world 的 chunk
+- `requested`：已经通过 `FieldRequest` 发给 Host、正在等待快照的 chunk
 
-Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `ChunkRequest`。收到 `ChunkSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
+运行时单格编辑通过 `FieldDelta` 写入本地 world；硬材质小连通块坍落通过 `FreeObjectProject` 携带一组投影 delta，客户端应用这些 cell 变化并对受影响 chunk 入队重网格化。同时客户端会从 delta 中配对旧位置 / 新位置，生成约 320ms 的短时盒体下落动画；这不是权威刚体状态，只是投影事件的可见反馈。
+
+Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `FieldRequest`。收到 `FieldSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
 
 `Game::effective_render_distance()` 定义：
 - Local/Host：直接使用自己的 `settings.render_distance`

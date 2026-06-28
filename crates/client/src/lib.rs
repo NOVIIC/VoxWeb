@@ -36,10 +36,12 @@ use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
+use voxweb_core::{Aabb, is_smooth_granular, smooth_cell_top_height};
 use voxweb_render::{Renderer, VisualFrame};
 
 use crate::app::{
-    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
+    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, FreeObjectCellAnimation,
+    FreeObjectProjectionAnimation, Game, GameMode, PreloadState, RemotePlayerState,
 };
 use crate::browser::{
     now_ms, random_seed, read_query_param, set_room_in_url, signaling_url, sync_canvas_size,
@@ -52,7 +54,7 @@ use crate::mesh_jobs::MeshPriority;
 use crate::prediction::{
     PendingAction, PendingKind, ReconcileResult, apply_pending_position_correction, reconcile_self,
 };
-use crate::raycast::raycast;
+use crate::raycast::{RaycastHit, raycast};
 use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
@@ -68,6 +70,63 @@ const PING_INTERVAL_MS: f64 = 5000.0;
 /// 普通自动保存间隔（毫秒）。退出 / 手动保存有单独快路径。
 const AUTO_SAVE_INTERVAL_MS: f64 = 3000.0;
 const AUTO_SAVE_BATCH_CHUNKS: usize = 4;
+
+fn selection_aabb_for_hit(get_block: &dyn Fn(i32, i32, i32) -> BlockID, hit: RaycastHit) -> Aabb {
+    let min = glam::Vec3::new(hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32);
+    if is_smooth_granular(hit.block) {
+        let top = smooth_cell_top_height(get_block, hit.pos.x, hit.pos.y, hit.pos.z, hit.block);
+        return Aabb::new(
+            min,
+            glam::Vec3::new(min.x + 1.0, top.max(min.y + 0.05), min.z + 1.0),
+        );
+    }
+    Aabb::new(min, min + glam::Vec3::ONE)
+}
+
+fn block_animation_color(block: BlockID) -> [f32; 3] {
+    match block {
+        BlockID::STONE => [0.46, 0.48, 0.50],
+        BlockID::GRASS => [0.35, 0.58, 0.26],
+        BlockID::DIRT => [0.45, 0.30, 0.18],
+        BlockID::SAND => [0.78, 0.67, 0.38],
+        BlockID::WOOD => [0.50, 0.32, 0.18],
+        BlockID::GLASS => [0.55, 0.78, 0.90],
+        BlockID::STONE_BRICKS => [0.42, 0.43, 0.46],
+        _ => [0.65, 0.62, 0.58],
+    }
+}
+
+fn enqueue_free_object_animation(
+    game: &mut Game,
+    deltas: &[(Position, voxweb_core::MaterialCell)],
+    now_ms: f64,
+) {
+    let air_positions = deltas
+        .iter()
+        .filter_map(|(pos, cell)| cell.is_empty().then_some(*pos))
+        .collect::<Vec<_>>();
+    let material_positions = deltas
+        .iter()
+        .filter_map(|(pos, cell)| {
+            let block = cell.to_block_id();
+            (block != BlockID::AIR).then_some((*pos, block))
+        })
+        .collect::<Vec<_>>();
+    if air_positions.is_empty() || air_positions.len() != material_positions.len() {
+        return;
+    }
+    let cells = air_positions
+        .into_iter()
+        .zip(material_positions)
+        .map(|(from, (to, block))| FreeObjectCellAnimation { from, to, block })
+        .collect::<Vec<_>>();
+    game.free_object_animations
+        .push(FreeObjectProjectionAnimation {
+            started_at_ms: now_ms,
+            duration_ms: 320.0,
+            cells,
+        });
+}
 const SAVE_NOW_BATCH_CHUNKS: usize = 16;
 
 /// Pong 校时样本权重。Pong 带 RTT 信息，可信度高于裸 PlayerTick。
@@ -302,8 +361,8 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
         {
             let server_ref = server.borrow();
             for pos in &snapshot_positions {
-                if let Some(chunk) = server_ref.world.chunks.get(pos) {
-                    let bytes = voxweb_core::chunk::encode(chunk);
+                if let Some(field) = server_ref.world.field_chunks.get(pos) {
+                    let bytes = voxweb_core::field::encode(field);
                     encoded_sizes.push((*pos, bytes.len() as u64));
                     encoded.push((*pos, bytes));
                 }
@@ -899,8 +958,8 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
-                                Ok(chunk) => loaded.push((pos, chunk)),
+                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
+                                Ok(field) => loaded.push((pos, field)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -916,8 +975,10 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, chunk) in loaded {
-                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                    for (pos, field) in loaded {
+                        g.server
+                            .borrow_mut()
+                            .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -962,8 +1023,8 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
-                                Ok(chunk) => loaded.push((pos, chunk)),
+                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
+                                Ok(field) => loaded.push((pos, field)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -979,8 +1040,10 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, chunk) in loaded {
-                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                    for (pos, field) in loaded {
+                        g.server
+                            .borrow_mut()
+                            .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -1025,8 +1088,8 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                             continue;
                         }
                         match storage.load_chunk(pos).await {
-                            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
-                                Ok(chunk) => loaded.push((pos, chunk)),
+                            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
+                                Ok(field) => loaded.push((pos, field)),
                                 Err(e) => log::warn!("[storage] decode {pos:?} failed: {e:?}"),
                             },
                             Ok(None) => {}
@@ -1042,8 +1105,10 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                     return;
                 }
                 if let Some(g) = a.game.as_mut() {
-                    for (pos, chunk) in loaded {
-                        g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                    for (pos, field) in loaded {
+                        g.server
+                            .borrow_mut()
+                            .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
                     g.known_persisted = known_set;
@@ -1137,8 +1202,8 @@ fn spawn_persisted_chunk_load(
 ) {
     wasm_bindgen_futures::spawn_local(async move {
         let loaded = match storage.load_chunk(pos).await {
-            Ok(Some(bytes)) => match voxweb_core::chunk::decode(&bytes) {
-                Ok(chunk) => Some(Ok(chunk)),
+            Ok(Some(bytes)) => match voxweb_core::field::decode(&bytes) {
+                Ok(field) => Some(Ok(field)),
                 Err(e) => {
                     log::warn!("[storage] decode persisted chunk {pos:?} failed: {e:?}");
                     Some(Err(()))
@@ -1160,14 +1225,16 @@ fn spawn_persisted_chunk_load(
         };
         g.pending_persisted_loads.remove(&pos);
         match loaded {
-            Some(Ok(chunk)) => {
+            Some(Ok(field)) => {
                 let should_apply = {
                     let server = g.server.borrow();
                     !server.world.persistence.is_dirty_or_in_flight(pos)
                 };
                 g.loaded_persisted_chunks.insert(pos);
                 if should_apply {
-                    g.server.borrow_mut().load_chunk_from_storage(pos, chunk);
+                    g.server
+                        .borrow_mut()
+                        .load_field_chunk_from_storage(pos, field);
                     enqueue_chunk_and_neighbors(&mut g.mesh_jobs, pos, MeshPriority::High);
                 } else {
                     log::debug!(
@@ -1205,7 +1272,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
     // —— 1. 推进网络状态机（与 InGame 复用 poll_net 路径）——
     poll_net(app);
 
-    // —— 1b. drain Server→Client inbox（Remote 端收 ChunkSnapshot / Welcome 等）——
+    // —— 1b. drain Server→Client inbox（Remote 端收 FieldSnapshot / Welcome 等）——
     {
         let mut a = app.borrow_mut();
         if let Some(game) = a.game.as_mut() {
@@ -1258,7 +1325,7 @@ fn render_connecting_frame(app: &Rc<RefCell<App>>, cw: u32, ch: u32) -> Result<(
                 drop(server_mut);
                 if !requests.is_empty() {
                     log::debug!("[remote] request {} spawn preload chunks", requests.len());
-                    game.net.send_client_message(ClientMessage::ChunkRequest {
+                    game.net.send_client_message(ClientMessage::FieldRequest {
                         center: chunk_pos_of(voxweb_server::DEFAULT_SPAWN),
                         render_distance: game.chunk_loader.render_distance.max(0) as u32,
                         chunks: requests,
@@ -1797,7 +1864,7 @@ fn render_game_frame(
     let mut request_pointer_lock_after = false;
     let mut request_exit_pointer_lock = false;
 
-    let (camera_pos, view_proj, fps_display, mesh_budget, current_hit_pos) = {
+    let (camera_pos, view_proj, fps_display, mesh_budget, current_selection) = {
         let mut a = app.borrow_mut();
         let fps_display = a.fps_display;
         let input_rc = a.input.clone();
@@ -1901,15 +1968,17 @@ fn render_game_frame(
         }
 
         // DDA 射线检测（每帧）
-        let hit = {
+        let (hit, selection) = {
             let server_borrow = world_ref.borrow();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
-            raycast(
+            let hit = raycast(
                 game.camera.position,
                 game.camera.forward(),
                 MAX_REACH,
                 &getter,
-            )
+            );
+            let selection = hit.map(|h| selection_aabb_for_hit(&getter, h));
+            (hit, selection)
         };
         game.current_hit = hit;
 
@@ -1927,12 +1996,12 @@ fn render_game_frame(
             game.camera.vp_matrix(),
             fps_display,
             game.settings.mesh_budget_ms,
-            game.current_hit.map(|h| h.pos),
+            selection,
         )
     };
 
     // —— 5. ChunkLoader 滚动 ——
-    // Local/Host 直接生成；Remote 只请求缺失 chunk，由 Host 回 ChunkSnapshot。
+    // Local/Host 直接生成；Remote 只请求缺失 chunk，由 Host 回 FieldSnapshot。
     {
         let mut a = app.borrow_mut();
         let App {
@@ -1955,7 +2024,7 @@ fn render_game_frame(
                 drop(server_mut);
                 if !requests.is_empty() {
                     log::debug!("[remote] request {} chunks near camera", requests.len());
-                    game.net.send_client_message(ClientMessage::ChunkRequest {
+                    game.net.send_client_message(ClientMessage::FieldRequest {
                         center: chunk_pos_of(camera_pos),
                         render_distance: game.chunk_loader.render_distance.max(0) as u32,
                         chunks: requests,
@@ -2284,9 +2353,35 @@ fn render_game_frame(
                         && let Some(rp) = game.remote_players.get(&eid)
                     {
                         instances.push(voxweb_render::passes::player::PlayerInstance {
-                            position: pos.to_array(),
+                            position: [pos.x - 0.3, pos.y, pos.z - 0.3],
                             _pad0: 0.0,
+                            size: [0.6, 1.8, 0.6],
+                            _pad_size: 0.0,
                             color: rp.color_rgb,
+                            _pad1: 0.0,
+                        });
+                    }
+                }
+                game.free_object_animations
+                    .retain(|anim| !anim.is_finished(now));
+                for anim in &game.free_object_animations {
+                    let t = anim.progress(now);
+                    let eased = t * t * (3.0 - 2.0 * t);
+                    for cell in &anim.cells {
+                        let from = glam::Vec3::new(
+                            cell.from.x as f32,
+                            cell.from.y as f32,
+                            cell.from.z as f32,
+                        );
+                        let to =
+                            glam::Vec3::new(cell.to.x as f32, cell.to.y as f32, cell.to.z as f32);
+                        let p = from.lerp(to, eased);
+                        instances.push(voxweb_render::passes::player::PlayerInstance {
+                            position: p.to_array(),
+                            _pad0: 0.0,
+                            size: [1.0, 1.0, 1.0],
+                            _pad_size: 0.0,
+                            color: block_animation_color(cell.block),
                             _pad1: 0.0,
                         });
                     }
@@ -2305,7 +2400,7 @@ fn render_game_frame(
         // 选中方块线框（命中时）
         let selection_start = now_ms();
         a.renderer
-            .render_selection(&mut encoder, &view, view_proj, current_hit_pos);
+            .render_selection(&mut encoder, &view, view_proj, current_selection);
         let selection_pass_ms = (now_ms() - selection_start) as f32;
 
         // egui Pass
@@ -2445,8 +2540,8 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         {
             let server_ref = server.borrow();
             for pos in &positions {
-                if let Some(chunk) = server_ref.world.chunks.get(pos) {
-                    let bytes = voxweb_core::chunk::encode(chunk);
+                if let Some(field) = server_ref.world.field_chunks.get(pos) {
+                    let bytes = voxweb_core::field::encode(field);
                     encoded_sizes.push((*pos, bytes.len() as u64));
                     encoded.push((*pos, bytes));
                 }
@@ -2567,7 +2662,7 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         let input_tick = game.local_input_tick;
         let player_position = game.physics.feet_position;
         // Remote 的 server.world 只是本地世界视图，可以安全乐观修改；
-        // Local/Host 与权威 server 共享同一份 world，仍等 BlockUpdate，避免提前改世界干扰校验。
+        // Local/Host 与权威 server 共享同一份 world，仍等 FieldDelta，避免提前改世界干扰校验。
         if game.mode == GameMode::Remote {
             game.server
                 .borrow_mut()
@@ -2725,15 +2820,17 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     .or_insert_with(|| RemotePlayerState::new(display_name.clone(), ex_eid));
             }
             // Remote：清掉本地占位生成的 chunks（Phase 4 用 seed=0 生成了一个空世界），
-            // 后续 ChunkSnapshot 逐个填充 Host 的真实世界。
+            // 后续 FieldSnapshot 逐个填充 Host 的真实世界。
             if game.mode == GameMode::Remote {
-                game.server.borrow_mut().world.chunks.clear();
+                let mut server = game.server.borrow_mut();
+                server.world.chunks.clear();
+                server.world.field_chunks.clear();
             }
         }
         ServerMessage::HostSettings { render_distance } => {
             apply_host_render_distance(game, render_distance);
         }
-        ServerMessage::ChunkSnapshot {
+        ServerMessage::FieldSnapshot {
             pos,
             frag_index,
             frag_total,
@@ -2743,10 +2840,11 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 .chunk_assembler
                 .ingest(pos, frag_index, frag_total, payload)
             {
-                match voxweb_core::chunk::decode_chunk(&full) {
-                    Ok(blocks) => {
-                        let chunk = voxweb_core::chunk::Chunk { blocks };
-                        game.server.borrow_mut().world.chunks.insert(pos, chunk);
+                match voxweb_core::field::decode(&full) {
+                    Ok(field) => {
+                        game.server
+                            .borrow_mut()
+                            .load_field_chunk_from_storage(pos, field);
                         game.chunk_loader.mark_loaded(pos);
                         // 自己 + 相邻 8 个 chunk 都重 mesh
                         for dz in -1..=1i32 {
@@ -2759,12 +2857,13 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                         }
                     }
                     Err(e) => {
-                        log::warn!("[client] ChunkSnapshot {pos:?} decode failed: {e}");
+                        log::warn!("[client] FieldSnapshot {pos:?} decode failed: {e:?}");
                     }
                 }
             }
         }
-        ServerMessage::BlockUpdate { pos, block } => {
+        ServerMessage::FieldDelta { pos, cell } => {
+            let block = cell.to_block_id();
             // Remote：先写 world，再做 remesh（因为 Remote 的 server 不做本地 handle_message）
             if game.mode == GameMode::Remote {
                 game.server
@@ -2774,6 +2873,21 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             }
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
+            }
+        }
+        ServerMessage::FreeObjectProject { deltas, .. } => {
+            enqueue_free_object_animation(game, &deltas, now_ms());
+            for (pos, cell) in deltas {
+                let block = cell.to_block_id();
+                if game.mode == GameMode::Remote {
+                    game.server
+                        .borrow_mut()
+                        .world
+                        .set_block_untracked(pos, block);
+                }
+                for cp in affected_chunks(pos) {
+                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                }
             }
         }
         ServerMessage::ActionAck {

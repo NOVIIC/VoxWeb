@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
-use voxweb_core::chunk::Position;
 use voxweb_core::{Aabb, ChunkPos};
 
 use crate::chunk_mesh::ChunkMeshCpu;
@@ -180,6 +179,8 @@ impl Renderer {
             &self.device,
             &mesh.vertices,
             &mesh.indices,
+            &mesh.smooth_vertices,
+            &mesh.smooth_indices,
             world_bounds,
         ) {
             Some(gpu) => {
@@ -234,7 +235,7 @@ impl Renderer {
     pub fn uploaded_vertex_count(&self) -> u32 {
         self.chunk_meshes
             .values()
-            .map(|mesh| mesh.vertex_count)
+            .map(|mesh| mesh.vertex_count + mesh.smooth_vertex_count)
             .sum()
     }
 
@@ -328,11 +329,11 @@ impl Renderer {
         stats.culled_chunks = stats.total_chunks.saturating_sub(stats.visible_chunks);
         stats.drawn_vertices = entries
             .iter()
-            .map(|(_, mesh)| mesh.vertex_count)
+            .map(|(_, mesh)| mesh.vertex_count + mesh.smooth_vertex_count)
             .sum::<u32>();
         stats.drawn_indices = entries
             .iter()
-            .map(|(_, mesh)| mesh.index_count)
+            .map(|(_, mesh)| mesh.index_count + mesh.smooth_index_count)
             .sum::<u32>();
 
         for (pos, mesh) in &entries {
@@ -399,11 +400,36 @@ impl Renderer {
         });
         pass.set_pipeline(&self.opaque_pass.pipeline);
         pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
-        for (_, mesh) in entries {
+        for (_, mesh) in &entries {
+            if mesh.index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.index_buffer else {
+                continue;
+            };
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        pass.set_pipeline(&self.opaque_pass.smooth_pipeline);
+        for (_, mesh) in entries {
+            if mesh.smooth_index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.smooth_vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.smooth_index_buffer else {
+                continue;
+            };
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.smooth_index_count, 0, 0..1);
         }
         stats
     }
@@ -473,11 +499,36 @@ impl Renderer {
         });
         pass.set_pipeline(&self.opaque_pass.depth_pipeline);
         pass.set_bind_group(1, &self.texture_atlas.bind_group, &[]);
-        for (_, mesh) in entries {
+        for (_, mesh) in &entries {
+            if mesh.index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.index_buffer else {
+                continue;
+            };
             pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        pass.set_pipeline(&self.opaque_pass.smooth_depth_pipeline);
+        for (_, mesh) in entries {
+            if mesh.smooth_index_count == 0 {
+                continue;
+            }
+            let Some(vertex_buffer) = &mesh.smooth_vertex_buffer else {
+                continue;
+            };
+            let Some(index_buffer) = &mesh.smooth_index_buffer else {
+                continue;
+            };
+            pass.set_bind_group(0, &mesh.globals_bind_group, &[]);
+            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.smooth_index_count, 0, 0..1);
         }
     }
 
@@ -633,21 +684,23 @@ impl Renderer {
         }
     }
 
-    /// 渲染选中方块的线框。`block_pos = None` 时跳过（玩家未瞄准任何方块）。
+    /// 渲染选中体积的线框。`selection = None` 时跳过（玩家未瞄准任何方块）。
     /// 必须在 `render_world` 之后调用，共享同一份 depth view 但不写深度。
     pub fn render_selection(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
         view_proj: Mat4,
-        block_pos: Option<Position>,
+        selection: Option<Aabb>,
     ) {
-        let Some(pos) = block_pos else {
+        let Some(selection) = selection else {
             return;
         };
+        let size = selection.max - selection.min;
         let globals = SelectionGlobals {
             view_proj: view_proj.to_cols_array_2d(),
-            block_origin: [pos.x as f32, pos.y as f32, pos.z as f32, 0.0],
+            box_min: [selection.min.x, selection.min.y, selection.min.z, 0.0],
+            box_size: [size.x.max(0.02), size.y.max(0.02), size.z.max(0.02), 0.0],
         };
         self.queue.write_buffer(
             &self.selection_pass.globals_buffer,

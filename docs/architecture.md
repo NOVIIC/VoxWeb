@@ -48,7 +48,7 @@
 **关键观察**：
 - Caddy 静态站只负责把游戏代码送进浏览器；游戏开始后浏览器与静态站之间无任何长连接。
 - Cloudflare Workers 信令仅在 P2P 握手期短暂使用；连接建立后两个 Peer 直连，信令服务可下线不影响进行中的会话。
-- 所有游戏世界数据流（Chunk、BlockUpdate、PlayerTick）都走 P2P DataChannel，不经过任何中心服务器。
+- 所有游戏世界数据流（FieldSnapshot、FieldDelta、FreeObjectProject、PlayerTick）都走 P2P DataChannel，不经过任何中心服务器。
 - **兜底**：若某对 (Host, Remote) 的 WebRTC 直连失败（ICE 失败 / 15s 协商超时），Host 自动请求信令 Worker 把该对升级为「字节中继」——后续 bincode 字节走 WS 二进制帧由 DO 转发，其它直连 peer 不受影响。详见 [`networking/signaling.md`](networking/signaling.md) §九。
 
 ---
@@ -152,8 +152,9 @@ VoxWeb/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs          # 模块声明 + re-export
-│   │       ├── block.rs        # BlockID + 硬编码方块表
+│   │       ├── block.rs        # BlockID/MaterialID + 硬编码材质表
 │   │       ├── chunk.rs        # Chunk + Position + ChunkPos
+│   │       ├── field.rs        # FieldChunk + Column Store 原型
 │   │       ├── geometry.rs     # AABB + 玩家碰撞体工具
 │   │       └── protocol.rs     # ClientMessage / ServerMessage / RoomEvent
 │   ├── render/                 # WGPU 渲染（仅 WebGPU 后端）
@@ -273,11 +274,11 @@ VoxWeb/
                                                       （射程内？方块非空？）
                                                   6. 通过 → world.set_block(pos, AIR)
                                                   7. 标记 chunk dirty
-                                                  8. 广播 ServerMessage::BlockUpdate
+                                                  8. 广播 ServerMessage::FieldDelta
                                                      给所有 peer（含来源）
                                   ←────────       9. （reliable channel）
 
-10. 收到 BlockUpdate，commit 方块
+10. 收到 FieldDelta，commit cell
 11. 重新生成受影响 chunk 网格
    （通过 mesh job 异步入队，下个 frame budget 跑）
 12. 渲染下一帧呈现新世界

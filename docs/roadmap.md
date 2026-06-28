@@ -12,12 +12,13 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 - **启动与部署**：`trunk` 构建 WASM 客户端，Caddy 静态托管，`signaling/` 独立部署到 Cloudflare Workers + Durable Objects
 - **浏览器前置检测**：在加载 WASM 前检查 WebAssembly、WebGPU、OPFS、WebRTC、WebSocket、指针锁；移动/触屏设备默认展示不可用提示
 - **世界与交互**：Perlin 地形、动态 chunk 加载/卸载、玩家 AABB、Walk/Fly、跳跃、DDA 射线、挖放、hotbar、选中方块线框
-- **多人同步**：Local-Only / Host / Remote 三角色；Hello/Welcome 握手；ChunkSnapshot 分片；ChunkRequest；PlayerInput / PlayerTick；BlockUpdate；ActionAck；PeerJoined / PeerLeft
+- **材质物理**：软材质局部松弛；硬材质 `FloatingOnly` 小连通块提取为 FreeObject、整体下落并即时投影；客户端显示短时投影下落动画
+- **多人同步**：Local-Only / Host / Remote 三角色；Hello/Welcome 握手；FieldSnapshot 分片；FieldRequest；PlayerInput / PlayerTick；FieldDelta；FreeObjectProject；ActionAck；PeerJoined / PeerLeft
 - **网络兜底**：WebRTC 双 DataChannel 为主；ICE 失败或协商超时时，Host 可把指定 peer 对升级为 Cloudflare Worker WebSocket 字节中继
 - **UI**：大厅、连接进度、HUD、玩家列表、聊天、系统消息、名牌、暂停菜单、设置持久化、断线页面；统一 egui 主题和固定尺寸 HUD 控件
-- **渲染**：WebGPU 多 Pass 主路径，程序化天空、程序化方块纹理图集、自然距离雾、轻量 tone mapping、Depth Pre-Pass、实体方块、玩家实体、透明方块、选中线框、egui UI
+- **渲染**：WebGPU 多 Pass 主路径，程序化天空、程序化方块纹理图集、自然距离雾、轻量 tone mapping、Depth Pre-Pass、实体方块、`SmoothGranular` 高度场平滑提面、玩家/投影动画盒体、透明方块、选中线框、egui UI
 - **网格化与性能**：跨区块面剔除、贪婪网格化、AO、u32 顶点压缩、index buffer、视锥剔除、mesh 分帧预算和 HUD 统计
-- **持久化**：OPFS 存档、palette+RLE chunk 编码、周期 flush、手动保存、删档、配额 UI、LRU chunk cache、`storage_version` 校验和迁移框架
+- **持久化**：OPFS FieldChunk 存档、周期 flush、手动保存、删档、配额 UI、LRU chunk cache、`storage_version` 严格校验
 
 ---
 

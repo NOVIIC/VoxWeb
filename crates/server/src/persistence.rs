@@ -121,7 +121,7 @@ impl PersistenceManager {
         }
     }
 
-    /// 兼容旧调用：一次性取走所有 dirty。新路径优先用 snapshot/commit。
+    /// 一次性取走所有 dirty。主路径优先用 snapshot/commit。
     pub fn take_dirty(&mut self) -> Vec<ChunkPos> {
         self.dirty.drain().collect()
     }

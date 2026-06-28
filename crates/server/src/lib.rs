@@ -7,7 +7,7 @@
 //! - **Host**：与 Local 相同，额外接收来自远端 Peer 的 ClientMessage（由 [`voxweb_net::NetEndpoint`] 解码后调
 //!   `handle_message`）。`broadcast_tick` 把 PlayerTick 加进 outbox 由 net 层路由。
 //! - **Remote**：客户端仍持有一个 `Server` 实例**但仅作为方块数据宿主** — Phase 5 的取舍是不引入独立的
-//!   `WorldView`，而是让 ChunkSnapshot 直接写入 `server.world.chunks`。
+//!   `WorldView`，而是让 FieldSnapshot 直接写入 `server.world`。
 //!   Remote 模式下 `tick()` / `handle_message()` 不会被主循环驱动；任何对这两个方法的调用都意味着调用方搞错了。
 
 pub mod persistence;
@@ -19,9 +19,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use glam::Vec3;
 
+use voxweb_core::block::MaterialCell;
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Z, ChunkPos};
 use voxweb_core::protocol::{
-    CHUNK_SNAPSHOT_PAYLOAD_MAX, ClientMessage, EntityId, OutboundMessage, PlayerEntry,
+    ClientMessage, EntityId, FIELD_SNAPSHOT_PAYLOAD_MAX, OutboundMessage, PlayerEntry,
     PlayerSnapshot, Recipient, ServerMessage,
 };
 
@@ -111,7 +112,7 @@ pub const FIRST_ENTITY_ID: EntityId = 1;
 /// Phase 3 出生点（与 client::start_single_player 一致）。
 pub const DEFAULT_SPAWN: Vec3 = Vec3::new(8.0, 100.0, 8.0);
 
-/// 初始 ChunkSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
+/// 初始 FieldSnapshot 的半径（chunk 数）。Phase 5 固定值；后续随渲染距离动态调。
 pub const INITIAL_SNAPSHOT_RADIUS: i32 = 6;
 /// Host 默认视距（与 AppSettings 默认值保持一致）。
 pub const DEFAULT_HOST_RENDER_DISTANCE: u32 = INITIAL_SNAPSHOT_RADIUS as u32;
@@ -120,7 +121,7 @@ pub const DEFAULT_HOST_RENDER_DISTANCE: u32 = INITIAL_SNAPSHOT_RADIUS as u32;
 /// 512 能覆盖完整首包，同时避免恶意客户端单包塞入无限列表。
 const CHUNK_REQUEST_MAX_BATCH: usize = 512;
 /// Remote 请求中心最多允许领先服务端记录位置多少个 chunk。
-/// `ChunkRequest` 与 `PlayerInput` 分属 reliable/unreliable 通道，可能先后倒置；
+/// `FieldRequest` 与 `PlayerInput` 分属 reliable/unreliable 通道，可能先后倒置；
 /// 留 2 个 chunk 的余量避免刚跨边界时误拒合法请求。
 const CHUNK_REQUEST_CENTER_GRACE: i32 = 2;
 /// 绝对上限兜底，避免异常设置或恶意包请求过大半径。
@@ -192,7 +193,7 @@ impl Server {
     /// 加入一个玩家：分配 entity_id、入 players 表，并 enqueue 三类消息：
     /// - Welcome → `Recipient::One(eid)`
     /// - PeerJoined → `Recipient::Except(eid)`（其他在场玩家收到通告）
-    /// - ChunkSnapshot 分片 → `Recipient::One(eid)`（出生点周围 INITIAL_SNAPSHOT_RADIUS 内的所有 chunk）
+    /// - FieldSnapshot 分片 → `Recipient::One(eid)`（出生点周围 INITIAL_SNAPSHOT_RADIUS 内的所有 chunk）
     ///
     /// 返回新分配的 entity_id；Host 端 net 层用它建立 peer_id ↔ entity_id 映射。
     pub fn add_player(&mut self, display_name: String) -> EntityId {
@@ -281,9 +282,8 @@ impl Server {
         self.outbox.extend(msgs);
     }
 
-    /// Phase 8 持久化层用的占位。Phase 5 不消费，留方法签名以免后续 API churn。
-    pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: voxweb_core::chunk::Chunk) {
-        self.world.load_chunk_from_storage(pos, chunk);
+    pub fn load_field_chunk_from_storage(&mut self, pos: ChunkPos, field: voxweb_core::FieldChunk) {
+        self.world.load_field_chunk_from_storage(pos, field);
     }
 
     /// 处理一条来自 Client 的消息（本地或远程）。
@@ -317,12 +317,12 @@ impl Server {
                 player.pitch = pitch;
                 player.last_input_tick = tick;
             }
-            ClientMessage::ChunkRequest {
+            ClientMessage::FieldRequest {
                 center,
                 render_distance,
                 chunks,
             } => {
-                self.handle_chunk_request(entity_id, center, render_distance, chunks);
+                self.handle_field_request(entity_id, center, render_distance, chunks);
             }
             ClientMessage::Break {
                 pos,
@@ -335,6 +335,8 @@ impl Server {
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
+                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -343,13 +345,9 @@ impl Server {
                             reason,
                         },
                     );
-                    self.enqueue(
-                        Recipient::All,
-                        ServerMessage::BlockUpdate {
-                            pos,
-                            block: voxweb_core::BlockID::AIR,
-                        },
-                    );
+                    self.enqueue_field_delta(pos, voxweb_core::BlockID::AIR);
+                    self.enqueue_field_deltas(relaxed);
+                    self.enqueue_free_object_projections(collapsed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -373,6 +371,8 @@ impl Server {
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
+                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -381,7 +381,9 @@ impl Server {
                             reason,
                         },
                     );
-                    self.enqueue(Recipient::All, ServerMessage::BlockUpdate { pos, block });
+                    self.enqueue_field_delta(pos, block);
+                    self.enqueue_field_deltas(relaxed);
+                    self.enqueue_free_object_projections(collapsed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -500,13 +502,13 @@ impl Server {
         );
     }
 
-    /// 把出生点附近的 chunk 切片成 ChunkSnapshot 分片塞进 outbox（Recipient::One(eid)）。
+    /// 把出生点附近的 FieldChunk 切片成 FieldSnapshot 分片塞进 outbox（Recipient::One(eid)）。
     /// 半径 = chunk 数，覆盖 `(2*radius+1)^2` 个 chunk。未加载的 chunk 会先 `ensure_chunk_generated`。
     pub fn send_initial_snapshot(&mut self, recipient: EntityId, center: ChunkPos, radius: i32) {
         for dx in -radius..=radius {
             for dz in -radius..=radius {
                 let pos = ChunkPos::new(center.x + dx, center.z + dz);
-                self.send_chunk_snapshot(recipient, pos);
+                self.send_field_snapshot(recipient, pos);
             }
         }
     }
@@ -515,7 +517,7 @@ impl Server {
     ///
     /// 这里做两个轻量防护：单包处理数量上限，以及只能请求服务端记录位置附近的 chunk。
     /// 真正的可靠性仍由 DataChannel reliable 保证；客户端侧会记录 in-flight，避免每帧重复请求。
-    fn handle_chunk_request(
+    fn handle_field_request(
         &mut self,
         entity_id: EntityId,
         center: ChunkPos,
@@ -556,32 +558,26 @@ impl Server {
                 );
                 continue;
             }
-            self.send_chunk_snapshot(entity_id, pos);
+            self.send_field_snapshot(entity_id, pos);
             sent += 1;
         }
         log::debug!("[server] chunk request: eid={entity_id} processed={processed} sent={sent}");
     }
 
     /// 把单个 chunk 编码并分片发给指定玩家。未生成时会先按世界种子生成。
-    fn send_chunk_snapshot(&mut self, recipient: EntityId, pos: ChunkPos) {
+    fn send_field_snapshot(&mut self, recipient: EntityId, pos: ChunkPos) {
         self.world.ensure_chunk_generated(pos);
-        let Some(chunk) = self.world.chunks.get(&pos) else {
+        let Some(field) = self.world.field_chunks.get(&pos) else {
             return;
         };
-        let bytes = match voxweb_core::chunk::encode_chunk(&chunk.blocks) {
-            Ok(b) => b,
-            Err(e) => {
-                log::warn!("[server] encode chunk {pos:?} failed: {e}");
-                return;
-            }
-        };
+        let bytes = voxweb_core::field::encode(field);
         let total_len = bytes.len();
-        let frag_count = total_len.div_ceil(CHUNK_SNAPSHOT_PAYLOAD_MAX).max(1);
-        debug_assert!(frag_count <= u16::MAX as usize, "chunk too big");
-        for (i, chunk_bytes) in bytes.chunks(CHUNK_SNAPSHOT_PAYLOAD_MAX).enumerate() {
+        let frag_count = total_len.div_ceil(FIELD_SNAPSHOT_PAYLOAD_MAX).max(1);
+        debug_assert!(frag_count <= u16::MAX as usize, "field chunk too big");
+        for (i, chunk_bytes) in bytes.chunks(FIELD_SNAPSHOT_PAYLOAD_MAX).enumerate() {
             self.enqueue(
                 Recipient::One(recipient),
-                ServerMessage::ChunkSnapshot {
+                ServerMessage::FieldSnapshot {
                     pos,
                     frag_index: i as u16,
                     frag_total: frag_count as u16,
@@ -595,6 +591,41 @@ impl Server {
     fn enqueue(&mut self, recipient: Recipient, message: ServerMessage) {
         self.outbox
             .push_back(OutboundMessage { recipient, message });
+    }
+
+    fn enqueue_field_delta(&mut self, pos: voxweb_core::Position, block: voxweb_core::BlockID) {
+        self.enqueue(
+            Recipient::All,
+            ServerMessage::FieldDelta {
+                pos,
+                cell: MaterialCell::from_block_id(block),
+            },
+        );
+    }
+
+    fn enqueue_field_deltas(
+        &mut self,
+        updates: Vec<(voxweb_core::Position, voxweb_core::BlockID)>,
+    ) {
+        for (pos, block) in updates {
+            self.enqueue_field_delta(pos, block);
+        }
+    }
+
+    fn enqueue_free_object_projections(&mut self, projections: Vec<physics::FreeObjectProjection>) {
+        for projection in projections {
+            self.enqueue(
+                Recipient::All,
+                ServerMessage::FreeObjectProject {
+                    object_id: projection.object_id,
+                    deltas: projection
+                        .deltas
+                        .into_iter()
+                        .map(|(pos, block)| (pos, MaterialCell::from_block_id(block)))
+                        .collect(),
+                },
+            );
+        }
     }
 
     /// 内部：聊天速率限制滑窗判定。

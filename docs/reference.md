@@ -163,7 +163,7 @@ const missing = required.filter(k => !checks[k]());
 
 - **NAT 穿透成功率**：ICE only-STUN ≈ 80-85%，加 TURN 中继可达 ~99%
 - **MTU**：DataChannel 单消息 ≤ 16 KiB（不同浏览器实现，保守 14 KiB）
-- **bufferedAmount**：Host 发 ChunkSnapshot 时必须监控，避免无限堆积
+- **bufferedAmount**：Host 发 FieldSnapshot 时必须监控，避免无限堆积
 - **ICE candidate 收集**：可能持续数秒；UI 显示进度
 - **Trickle ICE**：本项目使用 trickle（边收集边发），不等 `iceGatheringState == complete`
 - **DataChannel 双通道顺序**：Host 必须先 `createDataChannel("reliable")` 再 `createDataChannel("unreliable")`，Remote 通过 `ondatachannel` 按顺序接收（依赖此顺序识别通道）
@@ -340,7 +340,7 @@ trunk 在 release 模式下默认不带 sourcemap（节省体积）。debug 模�
 | OPFS 写入失败 / `pagehide` 未完成 flush | 中 | 3s 周期 flush + 回大厅 / pagehide best-effort 兜底；Variant B（Worker + sync handle）作为升级路径 |
 | 浏览器后台 Tab 时间漂移 | 低 | dt 上限 + 跳过过大逻辑步 |
 | egui 中文字体嵌入体积 | 中 | 用 subset font 仅嵌入常用字 |
-| 协议版本不兼容 | 中 | `world.json.storage_version` 校验 + migrations 数组（详见 [`features/persistence.md`](features/persistence.md) §十） |
+| 协议版本不兼容 | 中 | `Hello.version` 严格匹配；`world.json.storage_version` 不匹配时拒绝打开并让玩家删档或新建世界 |
 | Cloudflare Workers 配额 | 低 | 信令通量极小，难以触顶 |
 | 主机退出导致房间销毁 | 中 | 文档说明，v2 stretch goal 实现迁移 |
 

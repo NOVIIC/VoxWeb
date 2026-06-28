@@ -299,7 +299,7 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 ### 选中方块线框
 
-不在 egui 内画，由 `render::passes::opaque` 在画完世界后画一组线（或单独 Wireframe Pass）。线框的位置 = `app.current_hit.block_pos` 的方块 AABB 顶点。颜色：`vec4(0,0,0,0.6)`，深度测试 `LessEqual`，深度写入 `false`。
+不在 egui 内画，由 Selection Pass 在画完世界后画一组线。硬方块线框使用整格 AABB；`SmoothGranular` 使用 `core::surface` 高度场 AABB，避免框住完整立方体。颜色：`vec4(0,0,0,0.6)`，深度测试 `LessEqual`，深度写入 `false`。
 
 ### 左下角：聊天历史（最近消息）
 
@@ -307,7 +307,7 @@ pub fn draw_crosshair(ctx: &egui::Context) {
 
 ### 屏幕底部中央：Hotbar（9 格）
 
-横向 9 格，每格 58×42，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格左上显示材质色块，中部显示槽位号 1-9，底部显示方块标签（`STONE` / `DIRT` / ...）；选中格使用暖金底 + 2px 描边，非选中格使用深色半透明底 + 1px 低对比边框。
+横向 9 格，每格 58×42，底部居中（屏幕 anchor `CENTER_BOTTOM` + (0, -16)）。每格左上显示材质色块，中部显示槽位号 1-9，底部显示方块标签（`STONE` / `DIRT` / ... / `BRICK`）；默认顺序是 STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER / STONE_BRICKS。选中格使用暖金底 + 2px 描边，非选中格使用深色半透明底 + 1px 低对比边框。
 
 ```rust
 egui::Area::new(egui::Id::new("hud_hotbar"))

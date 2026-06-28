@@ -14,7 +14,7 @@ pub struct Hotbar {
 
 impl Default for Hotbar {
     fn default() -> Self {
-        // 9 个常用方块默认排布；1-8 是常规材质，9 暂时也给 STONE
+        // 9 个常用材质默认排布；基岩不进入创造模式热栏。
         Self {
             items: [
                 BlockID::STONE,
@@ -25,7 +25,7 @@ impl Default for Hotbar {
                 BlockID::LEAVES,
                 BlockID::GLASS,
                 BlockID::WATER,
-                BlockID::STONE,
+                BlockID::STONE_BRICKS,
             ],
             selected: 0,
         }
@@ -64,6 +64,8 @@ pub fn block_label(id: BlockID) -> &'static str {
         BlockID::LEAVES => "LEAVES",
         BlockID::GLASS => "GLASS",
         BlockID::WATER => "WATER",
+        BlockID::STONE_BRICKS => "BRICK",
+        BlockID::BEDROCK => "BEDROCK",
         _ => "???",
     }
 }
@@ -86,6 +88,8 @@ mod tests {
         assert_eq!(h.current(), BlockID::GRASS);
         h.select(6);
         assert_eq!(h.current(), BlockID::GLASS);
+        h.select(8);
+        assert_eq!(h.current(), BlockID::STONE_BRICKS);
     }
 
     #[test]
