@@ -90,7 +90,7 @@ pub enum NetEndpoint {
         /// 后续 server→peer 字节走信令 WS 二进制帧。
         relayed_peers: HashSet<u32>,
         /// 每个中继 peer 的本地发送限速器。
-        /// Worker 仍是最终裁决者；这里提前节流，避免高视距 FieldSnapshot
+        /// Worker 仍是最终裁决者；这里提前节流，避免高视距 ChunkSnapshot
         /// 在一帧内打爆 DO 的 `rate_limit`。
         relay_rate_limiters: HashMap<u32, RelayRateLimiter>,
         /// 已经发出 relay_request 但还在等服务端 RelayActive 的 peer。

@@ -25,7 +25,7 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 | 渲染后端 | 仅 WebGPU | 主流浏览器已支持；不实现 WebGL2 兜底以减少代码复杂度 |
 | 项目结构 | 多 Crate workspace | 模块边界清晰，便于单独测试 |
 | 线程模型 | 单线程 async（`wasm-bindgen-futures`） | 避开 SharedArrayBuffer / Web Worker 调试复杂度，重 CPU 任务用分帧调度兜底 |
-| 存档 | OPFS（Host / Local-Only 写入） | 浏览器内多 GB 容量；FieldChunk column store；LRU 控制内存；详见 [`docs/features/persistence.md`](docs/features/persistence.md) |
+| 存档 | OPFS（Host / Local-Only 写入） | 浏览器内多 GB 容量；palette+RLE 压缩；LRU 控制内存；详见 [`docs/features/persistence.md`](docs/features/persistence.md) |
 | 序列化 | `bincode`（little-endian、定长配置） | 与 DataChannel 二进制传输契合，体积比 JSON 小一个数量级 |
 | 构建工具 | `trunk`（首选）或 `wasm-pack` | trunk 集成 HTML 模板与资源管线，开箱即用 |
 | P2P 兜底 | CF Worker 应用层字节中继 | ICE 失败 / 协商超时自动切换；无需部署 TURN；详见 [`docs/networking/signaling.md`](docs/networking/signaling.md) |
@@ -38,15 +38,11 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 已落地：
 
 - 浏览器能力前置检测：WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；触屏设备默认拦截
-- 单机与 Host 共用 `server` 权威逻辑；Remote 通过 FieldSnapshot、FieldDelta、FreeObjectProject、PlayerTick 同步
-- `core::field` 的 `FieldChunk` 已用于 OPFS 存档和网络快照；`core::chunk` 仍作为当前渲染/碰撞适配格式
-- `core::block` 已有 MaterialID/MaterialProperties 过渡层；`core::field` 已有 FieldChunk/Column/Span 原型和 Chunk 双向转换，`server::World` 会同步维护 `field_chunks`
-- 石砖进入第 9 格 hotbar，世界最低层生成不可破坏基岩
-- `ImmediateRelaxation` 软材质已有局部松弛原型：沙/土/草在挖放后由 Host / Local-Only 立即下落或滑落，并通过多条 FieldDelta 同步
-- `FloatingOnly` 硬材质已有第一版稳定性：完全浮空的小连通块会提取为 FreeObject、整体下落并投影回静态场
+- 单机与 Host 共用 `server` 权威逻辑；Remote 通过快照、BlockUpdate、PlayerTick 同步
+- `core::chunk` 使用 palette+RLE 压缩，服务网络快照和 OPFS 存档
 - 渲染主路径为 Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI
 - 网格化使用跨区块面剔除、贪婪合并、AO、index buffer、视锥剔除和分帧任务队列
-- OPFS Variant A：主线程 async 存取、周期 flush、手动保存、删档、配额 UI 和严格版本校验
+- OPFS Variant A：主线程 async 存取、周期 flush、手动保存、删档、配额 UI、版本校验和迁移框架
 
 仍需关注：
 
@@ -92,8 +88,8 @@ docs/
 | **Chunk / ChunkPos** | 16×256×16 = 65536 个方块的存储单元；`(x, z)` 区块坐标支持负数 |
 | **Host / Remote / Local-Only** | 房主（跑权威 Server）/ 非房主玩家 / 单人模式（无网络） |
 | **OPFS** | Origin Private File System，浏览器内置“源专属”虚拟文件系统，本项目存档底层 |
-| **FieldChunk** | 统一体素存档/网络快照单元，内部为 16×16 column store，可在 span 与 dense cell 列之间切换 |
-| **DataChannel** | WebRTC 字节流通道。本项目用两条：`reliable`（FieldSnapshot/FieldDelta/FreeObjectProject/Chat/Join/Leave）与 `unreliable`（60Hz PlayerTick） |
+| **palette + RLE** | Chunk 序列化方案：唯一 BlockID 形成 palette，再对 index 做 run-length 编码 |
+| **DataChannel** | WebRTC 字节流通道。本项目用两条：`reliable`（ChunkSync/BlockUpdate/Chat/Join/Leave）与 `unreliable`（60Hz PlayerTick） |
 | **Tick / Snapshot** | 服务端 60Hz 逻辑步长 / 新玩家加入时的世界全量快照（分片传输） |
 | **Render Graph / Pass** | 多 Pass 渲染调度框架；Pass 即一次 GPU 渲染编码（Depth Pre / Opaque / Skybox / Transparent / UI） |
 | **AABB / DDA / AO** | 玩家碰撞体（0.6×1.8）/ 体素射线检测算法 / 顶点级 4 等级环境光遮蔽 |

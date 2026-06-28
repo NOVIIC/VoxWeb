@@ -108,7 +108,7 @@ impl ChunkLoader {
     /// Remote 模式的区块滚动加载。
     ///
     /// Remote 没有权威地形生成权，只维护本地缓存集合：缺失 chunk 通过
-    /// `ClientMessage::FieldRequest` 向 Host 请求；Host 回传 `FieldSnapshot` 后，
+    /// `ClientMessage::ChunkRequest` 向 Host 请求；Host 回传 `ChunkSnapshot` 后，
     /// 调用 [`ChunkLoader::mark_loaded`] 把它从 in-flight 集合移到 loaded 集合。
     pub fn update_remote(
         &mut self,

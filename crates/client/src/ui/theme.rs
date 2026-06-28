@@ -118,8 +118,6 @@ pub fn block_swatch(id: BlockID) -> egui::Color32 {
         BlockID::LEAVES => egui::Color32::from_rgb(58, 124, 62),
         BlockID::GLASS => egui::Color32::from_rgb(164, 208, 224),
         BlockID::WATER => egui::Color32::from_rgb(58, 125, 172),
-        BlockID::STONE_BRICKS => egui::Color32::from_rgb(112, 118, 116),
-        BlockID::BEDROCK => egui::Color32::from_rgb(48, 52, 56),
         _ => egui::Color32::from_rgb(200, 52, 196),
     }
 }

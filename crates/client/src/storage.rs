@@ -1,7 +1,7 @@
 //! OPFS（Origin Private File System）异步读写包装。
 //!
-//! Phase 8 默认走 Variant A：主线程 async OPFS。这里不保存运行时对象本体，
-//! 只保存 `voxweb_core::field::encode` 产出的 FieldChunk 字节，调用方负责 encode/decode。
+//! Phase 8 默认走 Variant A：主线程 async OPFS。这里不保存 `Chunk` 本体，
+//! 只保存 `voxweb_core::chunk::encode` 产出的字节，调用方负责 encode/decode。
 
 use std::collections::HashMap;
 
@@ -121,7 +121,7 @@ impl OpfsStorage {
 
         let now = now_ms() as u64;
         let record = match load_world_record(&root).await? {
-            Some(record) if record.storage_version != STORAGE_VERSION => {
+            Some(record) if record.storage_version > STORAGE_VERSION => {
                 return Err(StorageError::NeedsUpgrade {
                     found: record.storage_version,
                     supported: STORAGE_VERSION,
@@ -437,6 +437,11 @@ pub fn format_creation_time(key: &str) -> String {
     )
 }
 
+/// 旧版兼容：从 room_id + seed 生成 key（用于迁移或兼容）
+pub fn make_world_key_legacy(room_id: &str, seed: u64) -> String {
+    format!("{}__{seed}", sanitize_key(room_id))
+}
+
 pub fn chunk_filename(pos: ChunkPos) -> String {
     format!("{}_{}.bin", coord_part(pos.x), coord_part(pos.z))
 }
@@ -461,6 +466,20 @@ fn parse_coord_part(s: &str) -> Option<i32> {
     } else {
         s.parse().ok()
     }
+}
+
+fn sanitize_key(s: &str) -> String {
+    let trimmed = s.trim();
+    let base = if trimmed.is_empty() { "local" } else { trimmed };
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 async fn get_dir(

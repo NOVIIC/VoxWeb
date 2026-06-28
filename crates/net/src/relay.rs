@@ -63,7 +63,7 @@ pub fn plan_route(
 }
 
 /// Worker 中继按"消息条数"做令牌桶限流。Host 高视距会在一帧内产生上百个
-/// FieldSnapshot；本地先按服务端下发的 `max_rate` 留出余量发送，避免触发
+/// ChunkSnapshot；本地先按服务端下发的 `max_rate` 留出余量发送，避免触发
 /// `relay_closed{reason:"rate_limit"}`。
 #[derive(Clone, Debug)]
 pub struct RelayRateLimiter {

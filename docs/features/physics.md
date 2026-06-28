@@ -354,12 +354,6 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 完整时序见 [`networking/protocol.md` 6.2 章节](../networking/protocol.md#62-方块挖放reliable--ack)；本文重点是客户端体验。
 
-服务端仲裁按材质属性执行额外规则：y=0 永远视为世界底部边界；`properties(block).breakable == false` 的材质不可挖（当前为 BEDROCK）；放置请求只能使用 `appears_in_hotbar == true` 的材质，防止客户端通过协议放置 AIR / BEDROCK 等非创造模式材料。
-
-`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote。
-
-`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就记录一个 `FreeObject`，整体下落到最近支撑面，并立即投影回 `MaterialField`。当前不做可见刚体飞行、碰撞反弹或碎裂，结果通过可靠通道上的 `FreeObjectProject` 同步。
-
 ### 8.1 视觉反馈
 
 每渲染帧：
@@ -380,8 +374,7 @@ fn on_left_click(&mut self) {
 
     let request_id = self.prediction.next_request_id();
 
-    // 乐观更新（仅 Remote 角色；Local-Only 等服务端 FieldDelta）
-    // 软材质后续滑落以 Host 返回的额外 FieldDelta 为准。
+    // 乐观更新（仅 Remote 角色；Local-Only 等服务端 BlockUpdate）
     if matches!(self.role, Role::Remote) {
         let backup = self.world_view.get_block(hit.block_pos);
         self.prediction.pending_actions.insert(request_id, PendingAction {
@@ -483,8 +476,7 @@ fn handle_action_input(&mut self) {
 
 简化版：
 - 1-9 键切换当前手持方块
-- 内置可选方块：STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER / STONE_BRICKS
-- BEDROCK 是世界底部边界材质，不进 hotbar，不能挖掘或放置
+- 内置可选方块：STONE / DIRT / GRASS / SAND / WOOD / LEAVES / GLASS / WATER（数字 1-8；9 留空）
 - HUD 底部居中显示当前选中方块图标（v2）
 
 ```rust

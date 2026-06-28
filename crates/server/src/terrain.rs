@@ -33,10 +33,8 @@ impl TerrainGenerator {
                 let height = ((noise_val + 1.0) * 0.5 * (CHUNK_Y as f64 * 0.4)) as usize;
 
                 for ly in 0..CHUNK_Y {
-                    // ly == 0 强制 BEDROCK 兜底；height 极小时 height-3 会下溢，故用 ly + 3 < height 等价判断。
-                    let block = if ly == 0 {
-                        BlockID::BEDROCK
-                    } else if ly + 3 < height {
+                    // ly == 0 强制 STONE 兜底（height 极小时 height-3 会下溢，故用 ly + 3 < height 等价判断）
+                    let block = if ly == 0 || ly + 3 < height {
                         BlockID::STONE
                     } else if ly < height {
                         BlockID::DIRT

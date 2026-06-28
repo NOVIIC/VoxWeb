@@ -113,7 +113,7 @@ wasm-pack test --headless --chrome -p voxweb-client
 > - `?signaling=ws://host:port`：覆盖 `<meta name="signaling-url">`，**仅当 query 缺失时才回退到 meta**。
 > - `?room=<id>`：进入 Lobby 时自动填入 Room ID 输入框；房主点 Create Room 后也会通过 `history.replaceState` 写回这个参数。
 
-预期：双方都进入 InGame，HUD 出现 `RTT xx.x ms`；`chrome://webrtc-internals` 可见双 DC `open`。Remote 能看到 Host 推送的初始地形、玩家列表和 FieldDelta。
+预期：双方都进入 InGame，HUD 出现 `RTT xx.x ms`；`chrome://webrtc-internals` 可见双 DC `open`。Remote 能看到 Host 推送的初始地形、玩家列表和 BlockUpdate。
 
 ---
 
