@@ -335,6 +335,7 @@ impl Server {
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
+                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -350,6 +351,7 @@ impl Server {
                             block: voxweb_core::BlockID::AIR,
                         },
                     );
+                    self.enqueue_block_updates(relaxed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -373,6 +375,7 @@ impl Server {
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
+                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -382,6 +385,7 @@ impl Server {
                         },
                     );
                     self.enqueue(Recipient::All, ServerMessage::BlockUpdate { pos, block });
+                    self.enqueue_block_updates(relaxed);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -595,6 +599,15 @@ impl Server {
     fn enqueue(&mut self, recipient: Recipient, message: ServerMessage) {
         self.outbox
             .push_back(OutboundMessage { recipient, message });
+    }
+
+    fn enqueue_block_updates(
+        &mut self,
+        updates: Vec<(voxweb_core::Position, voxweb_core::BlockID)>,
+    ) {
+        for (pos, block) in updates {
+            self.enqueue(Recipient::All, ServerMessage::BlockUpdate { pos, block });
+        }
     }
 
     /// 内部：聊天速率限制滑窗判定。

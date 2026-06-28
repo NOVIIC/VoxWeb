@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：原型部分落地。已实现 `MaterialID`/`MaterialProperties` 兼容层、`MaterialCell` 原型、石砖/基岩材质、基岩托底和基于材质属性的基础挖放仲裁；`FieldChunk`、颗粒松弛、FreeObject 生命周期和真实流体尚未实现。
+> **状态**：原型部分落地。已实现 `MaterialID`/`MaterialProperties` 兼容层、`MaterialCell` 原型、`FieldChunk`/`Column`/`Span` 存储原型、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁，以及 `ImmediateRelaxation` 软材质局部下落/滑落；FreeObject 生命周期和真实流体尚未实现。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -87,10 +87,11 @@
 | crate / 模块 | 当前职责 | 对统一体素方案的自然归属 |
 |---|---|---|
 | `core::block` | `BlockID` + 编译期 `BlockProperties`；已新增 `MaterialID`/`MaterialProperties` 兼容别名、`MaterialCell` 原型和 `MaterialRegistry` 查询入口 | 后续迁移为独立 `MaterialRegistry` 与 FieldChunk schema |
-| `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标、palette+RLE | 扩展为 `FieldChunk`、列存储、field snapshot 编码 |
+| `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标、palette+RLE | 继续作为网络/渲染兼容格式，后续由 FieldSnapshot 替换 |
+| `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护 | 后续接入 OPFS 和网络 field snapshot 编码 |
 | `core::protocol` | bincode 消息、ChunkSnapshot、BlockUpdate | 扩展为 field snapshot、operation delta、FreeObject 状态 |
-| `server::world` | `HashMap<ChunkPos, Chunk>`、地形、dirty、LRU | 持有权威 MaterialField、FreeObject 和模拟队列 |
-| `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验 | 权威操作仲裁、质量守恒、kernel 应用、稳定性触发 |
+| `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为网络/存档主格式，并持有 FreeObject 和模拟队列 |
+| `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 材质局部下落/滑落原型 | 权威操作仲裁、质量守恒、kernel 应用、稳定性触发 |
 | `render::chunk_mesh` | 方块贪婪网格化、透明方块网格 | 变成 extractor 集合：blocky / smooth / fluid / object mesh |
 | `client::physics` | 玩家 AABB 分轴碰撞、本地预测 | 保留角色控制器，查询统一世界碰撞代理 |
 | `client::raycast` | DDA 命中 solid 方块 | 硬材质 DDA + 平滑材质 field ray query |
@@ -750,9 +751,9 @@ struct FieldChunkRecord {
    - 明确 overflow、混合和拒绝规则。
 
 4. **颗粒松弛**
-   - 沙/土放置后立刻按休止角局部再平衡。
-   - 只处理小范围 dirty region。
-   - 加滞后阈值避免抖动。
+   - 已有 BlockID 兼容原型：沙/土/草放置或被挖空下方支撑后，会在 Host / Local-Only 权威侧按小预算局部下落或向斜下滑落。
+   - 当前通过多条 `BlockUpdate` 同步结果；尚未迁移到 FieldDelta。
+   - 后续加滞后阈值和更真实的休止角模型避免抖动。
 
 5. **FreeObject 生命周期**
    - 小石块或沙团从静态提取。

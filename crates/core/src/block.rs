@@ -132,6 +132,22 @@ impl MaterialCell {
     pub const fn is_empty(self) -> bool {
         self.occupancy == 0 || self.primary.0 == 0
     }
+
+    pub const fn from_block_id(block: BlockID) -> Self {
+        if block.0 == 0 {
+            Self::EMPTY
+        } else {
+            Self::full(block)
+        }
+    }
+
+    pub const fn to_block_id(self) -> BlockID {
+        if self.is_empty() {
+            BlockID::AIR
+        } else {
+            self.primary
+        }
+    }
 }
 
 /// 方块的静态属性，用于碰撞检测、渲染 Pass 选择、纹理索引。
@@ -499,6 +515,14 @@ mod tests {
         assert_eq!(cell.occupancy, u8::MAX);
         assert_eq!(cell.primary, BlockID::SAND);
         assert!(!cell.is_empty());
+        assert_eq!(
+            MaterialCell::from_block_id(BlockID::AIR),
+            MaterialCell::EMPTY
+        );
+        assert_eq!(
+            MaterialCell::from_block_id(BlockID::SAND).to_block_id(),
+            BlockID::SAND
+        );
     }
 
     #[test]

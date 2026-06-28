@@ -6,8 +6,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use voxweb_core::block::BlockID;
+use voxweb_core::block::{BlockID, MaterialCell};
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
+use voxweb_core::field::FieldChunk;
 
 use crate::persistence::PersistenceManager;
 use crate::terrain::TerrainGenerator;
@@ -19,6 +20,8 @@ pub const DEFAULT_CHUNK_CACHE_CAPACITY: usize = 4096;
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
+    /// MaterialField 兼容镜像。当前网络/渲染仍使用 `chunks`，但权威写入会同步维护这里。
+    pub field_chunks: HashMap<ChunkPos, FieldChunk>,
     pub terrain: TerrainGenerator,
     /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
     pub tick_count: u64,
@@ -38,6 +41,7 @@ impl World {
         Self {
             seed,
             chunks: HashMap::new(),
+            field_chunks: HashMap::new(),
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
             dirty_chunks: HashSet::new(),
@@ -52,11 +56,18 @@ impl World {
     /// Phase 2 的 chunk 入口点（由 client::chunk_loader 调用）。
     pub fn ensure_chunk_generated(&mut self, pos: ChunkPos) {
         if self.chunks.contains_key(&pos) {
+            if !self.field_chunks.contains_key(&pos)
+                && let Some(chunk) = self.chunks.get(&pos)
+            {
+                self.field_chunks.insert(pos, FieldChunk::from_chunk(chunk));
+            }
             self.touch_chunk(pos);
             return;
         }
         let chunk = self.terrain.generate_chunk(pos);
+        let field = FieldChunk::from_chunk(&chunk);
         self.chunks.insert(pos, chunk);
+        self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
         self.evict_if_needed();
     }
@@ -65,6 +76,7 @@ impl World {
     pub fn unload_chunk(&mut self, pos: ChunkPos) {
         if !self.persistence.is_dirty_or_in_flight(pos) {
             self.chunks.remove(&pos);
+            self.field_chunks.remove(&pos);
             self.lru_order.retain(|p| *p != pos);
         }
     }
@@ -108,6 +120,11 @@ impl World {
                 return;
             }
             chunk.blocks[idx] = block;
+            let lx = pos.x.rem_euclid(CHUNK_X as i32) as usize;
+            let lz = pos.z.rem_euclid(CHUNK_Z as i32) as usize;
+            if let Some(field) = self.field_chunks.get_mut(&cp) {
+                field.set(lx, pos.y as usize, lz, MaterialCell::from_block_id(block));
+            }
             if track_dirty {
                 self.dirty_chunks.insert(cp);
                 self.persistence.mark_dirty(cp);
@@ -172,7 +189,9 @@ impl World {
 
     /// 直接载入持久化层读出的 chunk，不标 dirty。
     pub fn load_chunk_from_storage(&mut self, pos: ChunkPos, chunk: Chunk) {
+        let field = FieldChunk::from_chunk(&chunk);
         self.chunks.insert(pos, chunk);
+        self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
         self.evict_if_needed();
     }
@@ -220,6 +239,7 @@ impl World {
                 continue;
             }
             self.chunks.remove(&candidate);
+            self.field_chunks.remove(&candidate);
         }
     }
 }
@@ -238,6 +258,7 @@ mod tests {
         // 首次生成
         world.ensure_chunk_generated(pos);
         assert!(world.chunks.contains_key(&pos));
+        assert!(world.field_chunks.contains_key(&pos));
         let snapshot: Vec<BlockID> = world.chunks[&pos].blocks.clone();
         // Perlin 地形：至少应有非 AIR 方块（基岩 + 一层地形）
         assert!(
@@ -248,6 +269,7 @@ mod tests {
         // 第二次调用：不应覆盖（同 blocks）
         world.ensure_chunk_generated(pos);
         assert_eq!(world.chunks[&pos].blocks, snapshot);
+        assert_eq!(world.field_chunks[&pos].to_chunk().blocks, snapshot);
     }
 
     #[test]
@@ -278,6 +300,7 @@ mod tests {
         assert!(world.chunks.contains_key(&pos));
         world.unload_chunk(pos);
         assert!(!world.chunks.contains_key(&pos));
+        assert!(!world.field_chunks.contains_key(&pos));
     }
 
     #[test]
@@ -286,6 +309,12 @@ mod tests {
         world.ensure_chunk_generated(ChunkPos::new(0, 0));
         world.set_block(Position::new(5, 100, 7), BlockID::STONE);
         assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
+        assert_eq!(
+            world.field_chunks[&ChunkPos::new(0, 0)]
+                .get(5, 100, 7)
+                .to_block_id(),
+            BlockID::STONE
+        );
     }
 
     #[test]
@@ -345,6 +374,10 @@ mod tests {
 
         world.set_block_untracked(Position::new(5, 100, 7), BlockID::STONE);
         assert_eq!(world.get_block(Position::new(5, 100, 7)), BlockID::STONE);
+        assert_eq!(
+            world.field_chunks[&cp].get(5, 100, 7).to_block_id(),
+            BlockID::STONE
+        );
         assert!(world.dirty_chunks.is_empty());
         assert_eq!(world.persistence.dirty_len(), 0);
     }

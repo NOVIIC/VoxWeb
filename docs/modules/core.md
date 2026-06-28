@@ -28,6 +28,7 @@ crates/core/
     ├── lib.rs          模块声明 + 公开 re-export
     ├── block.rs        BlockID/MaterialID 兼容层 + 硬编码材质属性表
     ├── chunk.rs        Chunk + Position + ChunkPos
+    ├── field.rs        FieldChunk + Column + Span 原型
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
 ```
 
@@ -99,6 +100,30 @@ pub struct MaterialCell {
 ```
 
 当前运行时 chunk 仍保存 `Vec<BlockID>`，`MaterialCell` 先作为 FieldChunk / FieldDelta / FreeObject 后续迁移的公开数据结构原型。
+
+### `field.rs` — FieldChunk 原型
+
+统一体素方案的存储底座已经有独立数据结构，但还未替换运行时 `Chunk`：
+
+```rust
+pub struct FieldChunk {
+    pub columns: Box<[Column]>,          // 逻辑长度恒为 16 * 16
+    pub free_object_refs: Vec<ObjectID>,
+}
+
+pub enum Column {
+    Spans(Vec<Span>),
+    Dense(Box<[MaterialCell]>),          // 逻辑长度恒为 256
+}
+
+pub struct Span {
+    pub y_start: u16,
+    pub length: u16,
+    pub cell: MaterialCell,
+}
+```
+
+`FieldChunk::from_chunk` / `to_chunk` 提供与现有 `Chunk<Vec<BlockID>>` 的双向转换。自然地形列会压成 `Span`；编辑过的列通过 `Column::set` 自动退化为 `Dense`。这里使用 boxed slice 而不是 `[Column; 256]` / `[MaterialCell; 256]`，是为了当前 serde 版本能直接序列化 256 长度集合。
 
 实现方式：编译期 `const` 数组按 `BlockID.0` 索引。新增方块时在数组追加一行。
 
@@ -302,11 +327,13 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::De
 ```rust
 pub mod block;
 pub mod chunk;
+pub mod field;
 pub mod geometry;
 pub mod protocol;
 
 pub use block::{BlockID, BlockProperties, MaterialCell, MaterialID, properties};
 pub use chunk::{CHUNK_SIZE, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
+pub use field::{Column, FieldChunk, ObjectID, Span};
 pub use geometry::{Aabb, PLAYER_EYE_OFFSET, PLAYER_HEIGHT, PLAYER_WIDTH, player_aabb};
 pub use protocol::{AckReason, ClientMessage, PlayerSnapshot, RoomEvent, ServerMessage, encode};
 ```

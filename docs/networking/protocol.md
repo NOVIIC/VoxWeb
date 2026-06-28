@@ -225,8 +225,10 @@ Remote                          Host
                                           physics::validate_break →
                                           OK：
                                             world.set_block AIR
+                                            relaxed = relax_after_edit(pos)
                                             outbox: ActionAck{42, accepted=true}
                                             outbox: BlockUpdate{(10,64,5), AIR}（广播）
+                                            outbox: relaxed BlockUpdate...（广播）
                                           NG：
                                             outbox: ActionAck{42, accepted=false, reason}
    ◀── (reliable) ActionAck{42, accepted=true}
@@ -235,6 +237,8 @@ Remote                          Host
    client.world_view.set_block AIR
    mesh_jobs.enqueue(chunk_pos)
 ```
+
+若被挖放的材质或其邻近材质触发 `ImmediateRelaxation`，Host 会在同一可靠通道继续广播一串普通 `BlockUpdate`。Remote 不独立决定最终滑落位置，只把这些更新按顺序写入本地世界并重网格化受影响 chunk。
 
 ```
 若 ActionAck.accepted=false：

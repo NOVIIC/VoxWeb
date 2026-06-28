@@ -40,7 +40,9 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 - 浏览器能力前置检测：WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；触屏设备默认拦截
 - 单机与 Host 共用 `server` 权威逻辑；Remote 通过快照、BlockUpdate、PlayerTick 同步
 - `core::chunk` 使用 palette+RLE 压缩，服务网络快照和 OPFS 存档
-- `core::block` 已有 MaterialID/MaterialProperties 兼容层；石砖进入第 9 格 hotbar，世界最低层生成不可破坏基岩
+- `core::block` 已有 MaterialID/MaterialProperties 兼容层；`core::field` 已有 FieldChunk/Column/Span 原型和 Chunk 双向转换，`server::World` 会同步维护 `field_chunks`
+- 石砖进入第 9 格 hotbar，世界最低层生成不可破坏基岩
+- `ImmediateRelaxation` 软材质已有局部松弛原型：沙/土/草在挖放后由 Host / Local-Only 立即下落或滑落，并通过多条 BlockUpdate 同步
 - 渲染主路径为 Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI
 - 网格化使用跨区块面剔除、贪婪合并、AO、index buffer、视锥剔除和分帧任务队列
 - OPFS Variant A：主线程 async 存取、周期 flush、手动保存、删档、配额 UI、版本校验和迁移框架

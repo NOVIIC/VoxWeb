@@ -1,11 +1,13 @@
-//! 物理仲裁：服务端权威的挖放验证。
+//! 物理仲裁：服务端权威的挖放验证与局部材质松弛。
 //!
 //! Phase 3：检查射程（≤ MAX_REACH）、目标方块状态、放置位置不与玩家 AABB 重叠。
 //! Phase 5 引入完整玩家表后，多人挖放的范围/重叠校验复用同一套函数。
 
+use std::collections::VecDeque;
+
 use glam::Vec3;
 
-use voxweb_core::block::{BlockID, properties};
+use voxweb_core::block::{BlockID, StabilityPolicy, properties};
 use voxweb_core::chunk::{CHUNK_Y, Position};
 use voxweb_core::geometry::{Aabb, PLAYER_EYE_OFFSET, player_aabb};
 use voxweb_core::protocol::AckReason;
@@ -14,6 +16,10 @@ use super::world::World;
 
 /// 玩家操作距离上限（眼睛到方块中心，单位：方块/米）。
 pub const MAX_REACH: f32 = 6.0;
+/// 单次挖放后最多执行多少个颗粒移动，避免一次编辑卡住主线程。
+const RELAXATION_MOVE_BUDGET: usize = 64;
+/// 单次挖放后最多检查多少个候选 cell，限制局部松弛范围。
+const RELAXATION_VISIT_BUDGET: usize = 256;
 
 /// 验证一次挖掘操作。
 /// `player_feet` 是玩家脚底世界坐标；眼睛位置 = `player_feet + Y * PLAYER_EYE_OFFSET`。
@@ -71,6 +77,112 @@ fn distance_to_block_center(player_feet: Vec3, pos: Position) -> f32 {
     let eye = player_feet + Vec3::Y * PLAYER_EYE_OFFSET;
     let block_center = Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5);
     (block_center - eye).length()
+}
+
+/// 挖放后立即运行一小段局部颗粒松弛。
+///
+/// 当前仍基于 `BlockID` dense chunk 做兼容实现：`ImmediateRelaxation` 材质会优先竖直下落，
+/// 受阻后尝试向斜下方滑落。返回值是需要广播给客户端的权威 `BlockUpdate` 序列。
+pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
+    let mut updates = Vec::new();
+    let mut queue = VecDeque::new();
+
+    enqueue_relaxation_region(&mut queue, origin);
+
+    let mut visited = 0usize;
+    let mut moves = 0usize;
+    while let Some(pos) = queue.pop_front() {
+        if visited >= RELAXATION_VISIT_BUDGET || moves >= RELAXATION_MOVE_BUDGET {
+            break;
+        }
+        visited += 1;
+
+        let Some((from, to, block)) = try_relax_one(world, pos) else {
+            continue;
+        };
+        moves += 1;
+        world.set_block(from, BlockID::AIR);
+        world.set_block(to, block);
+        updates.push((from, BlockID::AIR));
+        updates.push((to, block));
+
+        enqueue_relaxation_region(&mut queue, from);
+        enqueue_relaxation_region(&mut queue, to);
+    }
+
+    updates
+}
+
+fn enqueue_relaxation_region(queue: &mut VecDeque<Position>, origin: Position) {
+    for (dx, dy, dz) in [
+        (0, 0, 0),
+        (0, 1, 0),
+        (1, 0, 0),
+        (-1, 0, 0),
+        (0, 0, 1),
+        (0, 0, -1),
+        (1, 1, 0),
+        (-1, 1, 0),
+        (0, 1, 1),
+        (0, 1, -1),
+    ] {
+        queue.push_back(Position::new(origin.x + dx, origin.y + dy, origin.z + dz));
+    }
+}
+
+fn try_relax_one(world: &World, pos: Position) -> Option<(Position, Position, BlockID)> {
+    if pos.y <= 1 || pos.y >= CHUNK_Y as i32 {
+        return None;
+    }
+    if !chunk_loaded(world, pos) {
+        return None;
+    }
+
+    let block = world.get_block(pos);
+    if properties(block).stability != StabilityPolicy::ImmediateRelaxation {
+        return None;
+    }
+
+    let down = Position::new(pos.x, pos.y - 1, pos.z);
+    if can_receive_granular(world, down) {
+        return Some((pos, down, block));
+    }
+
+    for (dx, dz) in ordered_slide_dirs(pos, block) {
+        let side = Position::new(pos.x + dx, pos.y, pos.z + dz);
+        let target = Position::new(pos.x + dx, pos.y - 1, pos.z + dz);
+        if can_receive_granular(world, side) && can_receive_granular(world, target) {
+            return Some((pos, target, block));
+        }
+    }
+
+    None
+}
+
+fn can_receive_granular(world: &World, pos: Position) -> bool {
+    pos.y > 0
+        && pos.y < CHUNK_Y as i32
+        && chunk_loaded(world, pos)
+        && world.get_block(pos) == BlockID::AIR
+}
+
+fn chunk_loaded(world: &World, pos: Position) -> bool {
+    world.chunks.contains_key(&pos.to_chunk_pos())
+}
+
+fn ordered_slide_dirs(pos: Position, block: BlockID) -> [(i32, i32); 4] {
+    const DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    let start = ((pos.x as u32)
+        .wrapping_mul(17)
+        .wrapping_add((pos.z as u32).wrapping_mul(31))
+        .wrapping_add(block.0 as u32)
+        % 4) as usize;
+    [
+        DIRS[start],
+        DIRS[(start + 1) % 4],
+        DIRS[(start + 2) % 4],
+        DIRS[(start + 3) % 4],
+    ]
 }
 
 #[cfg(test)]
@@ -229,5 +341,78 @@ mod tests {
             validate_place(&w, Position::new(3, 65, 3), BlockID::STONE, player),
             AckReason::Overlap
         );
+    }
+
+    #[test]
+    fn sand_falls_to_nearest_support_after_edit() {
+        let mut w = world_with_stone_chunk();
+        let x = 4;
+        let z = 4;
+        for y in 61..=70 {
+            w.set_block(Position::new(x, y, z), BlockID::AIR);
+        }
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                w.set_block(Position::new(x + dx, 60, z + dz), BlockID::STONE);
+            }
+        }
+        w.set_block(Position::new(x, 65, z), BlockID::SAND);
+
+        let updates = relax_after_edit(&mut w, Position::new(x, 65, z));
+
+        assert_eq!(w.get_block(Position::new(x, 65, z)), BlockID::AIR);
+        assert_eq!(w.get_block(Position::new(x, 61, z)), BlockID::SAND);
+        assert!(updates.contains(&(Position::new(x, 65, z), BlockID::AIR)));
+        assert!(updates.contains(&(Position::new(x, 61, z), BlockID::SAND)));
+    }
+
+    #[test]
+    fn granular_block_above_broken_cell_falls_down() {
+        let mut w = world_with_stone_chunk();
+        let x = 6;
+        let z = 6;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                w.set_block(Position::new(x + dx, 60, z + dz), BlockID::STONE);
+            }
+        }
+        w.set_block(Position::new(x, 61, z), BlockID::AIR);
+        w.set_block(Position::new(x, 62, z), BlockID::DIRT);
+
+        let updates = relax_after_edit(&mut w, Position::new(x, 61, z));
+
+        assert_eq!(w.get_block(Position::new(x, 62, z)), BlockID::AIR);
+        assert_eq!(w.get_block(Position::new(x, 61, z)), BlockID::DIRT);
+        assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
+    fn granular_block_slides_diagonally_when_supported_below() {
+        let mut w = world_with_stone_chunk();
+        let from = Position::new(8, 65, 8);
+        let target = ordered_slide_dirs(from, BlockID::SAND)
+            .into_iter()
+            .map(|(dx, dz)| Position::new(from.x + dx, from.y - 1, from.z + dz))
+            .next()
+            .unwrap();
+        w.set_block(Position::new(from.x, from.y - 1, from.z), BlockID::STONE);
+        w.set_block(from, BlockID::SAND);
+        w.set_block(Position::new(target.x, from.y, target.z), BlockID::AIR);
+        w.set_block(target, BlockID::AIR);
+        w.set_block(
+            Position::new(target.x, target.y - 1, target.z),
+            BlockID::STONE,
+        );
+        for (dx, dz) in ordered_slide_dirs(target, BlockID::SAND) {
+            w.set_block(
+                Position::new(target.x + dx, target.y - 1, target.z + dz),
+                BlockID::STONE,
+            );
+        }
+
+        relax_after_edit(&mut w, from);
+
+        assert_eq!(w.get_block(from), BlockID::AIR);
+        assert_eq!(w.get_block(target), BlockID::SAND);
     }
 }

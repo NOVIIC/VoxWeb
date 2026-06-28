@@ -339,6 +339,50 @@ fn handle_message_place_overlap_rejected_and_no_blockupdate() {
 }
 
 #[test]
+fn handle_message_place_granular_broadcasts_relaxed_updates() {
+    let (mut server, eid) = prepare_world();
+    let placed = Position::new(5, 66, 3);
+    let settled = Position::new(5, 65, 3);
+    server.world.set_block(placed, voxweb_core::BlockID::AIR);
+    server.world.set_block(settled, voxweb_core::BlockID::AIR);
+
+    server.handle_message(
+        eid,
+        ClientMessage::Place {
+            pos: placed,
+            block: voxweb_core::BlockID::SAND,
+            request_id: 99,
+            input_tick: 6,
+            player_position: Vec3::new(3.5, 65.0, 3.5),
+        },
+    );
+
+    assert_eq!(server.world.get_block(placed), voxweb_core::BlockID::AIR);
+    assert_eq!(server.world.get_block(settled), voxweb_core::BlockID::SAND);
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::BlockUpdate { pos, block }
+                if pos == placed && block == voxweb_core::BlockID::SAND
+        )
+    }));
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::BlockUpdate { pos, block }
+                if pos == placed && block == voxweb_core::BlockID::AIR
+        )
+    }));
+    assert!(server.outbox.iter().any(|m| {
+        matches!(
+            m.message,
+            ServerMessage::BlockUpdate { pos, block }
+                if pos == settled && block == voxweb_core::BlockID::SAND
+        )
+    }));
+}
+
+#[test]
 fn handle_message_break_uses_action_position_when_player_input_lags() {
     let (mut server, eid) = prepare_world();
     server.players.get_mut(&eid).unwrap().position = Vec3::new(30.0, 65.0, 30.0);

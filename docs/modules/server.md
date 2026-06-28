@@ -26,8 +26,9 @@
 当前 server crate 覆盖完整权威世界循环：
 
 - `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
+- `World::field_chunks` 同步维护 `FieldChunk` MaterialField 镜像；当前渲染/网络仍从 `chunks` 兼容读取
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
-- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性
+- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`relax_after_edit` 对 `ImmediateRelaxation` 材质做局部下落/滑落
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
 - `Server` 通过 `handle_message` 消费 Local / Host / Remote 输入，向 outbox 写入点对点或广播消息
 - `send_initial_snapshot` 与 `ChunkRequest` 负责 Remote 初始和运行时 chunk 同步
@@ -42,7 +43,7 @@ crates/server/src/
 ├── lib.rs              World + Server 主结构 + 公开 API
 ├── world.rs            ChunkStore + EntityTable + Tick
 ├── terrain.rs          Perlin 地形生成
-├── physics.rs          物理仲裁（位置合法性、挖放校验）
+├── physics.rs          物理仲裁（位置合法性、挖放校验、局部颗粒松弛）
 ├── persistence.rs      PersistenceManager + LRU 卸载（具体存储读写在 client::storage）
 └── handle_message_tests.rs  Server 消息处理单元测试
 ```
@@ -57,6 +58,7 @@ crates/server/src/
 pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
+    pub field_chunks: HashMap<ChunkPos, FieldChunk>, // MaterialField 兼容镜像
     pub terrain: TerrainGenerator,           // Perlin 高度图
     pub tick_count: u64,                     // tick 累加器；驱动玩家广播
     pub dirty_chunks: HashSet<ChunkPos>,     // 需要持久化的 chunk
@@ -74,7 +76,8 @@ impl World {
     /// 卸载 chunk（移除 chunks 表）。调用方需要先处理 dirty flush / pinned 约束。
     pub fn unload_chunk(&mut self, pos: ChunkPos);
 
-    /// 直接读写方块；`set_block` 会标记 dirty，chunk 未加载或 local_index 越界时静默忽略。
+    /// 直接读写方块；`set_block` 会同步更新 chunks + field_chunks 并标记 dirty。
+    /// chunk 未加载或 local_index 越界时静默忽略。
     pub fn get_block(&self, pos: Position) -> BlockID;
     pub fn set_block(&mut self, pos: Position, block: BlockID);
 
@@ -283,6 +286,20 @@ pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet:
 
 玩家位置由 `Server::players: HashMap<u32, Vec3>` 提供（Hello 插入初始 spawn，PlayerInput 60Hz 更新）。`validate_break/place` 的签名接受显式 `player_feet` 参数（而非 entity_id），便于测试时直接注入位置。
 
+### 局部颗粒松弛
+
+```rust
+pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
+    // 1) 从 origin 及其上方/四邻域入队
+    // 2) 只处理 properties(block).stability == ImmediateRelaxation 的材质
+    // 3) 优先竖直下落；受阻后按确定性方向尝试斜下滑落
+    // 4) 单次挖放受 RELAXATION_MOVE_BUDGET / RELAXATION_VISIT_BUDGET 限流
+    // 5) 返回每个 cell 的权威 BlockUpdate 序列
+}
+```
+
+当前这是 `BlockID` dense chunk 上的兼容原型，不做质量拆分和多材质混合；它保证 Host / Local-Only 立即给玩家软材质反馈，同时不新增网络消息类型。
+
 ---
 
 ## 七、`tick()` 流程
@@ -329,8 +346,11 @@ match msg {
         match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
-                self.world.dirty_chunks.insert(pos.to_chunk_pos());
+                let relaxed = physics::relax_after_edit(&mut self.world, pos);
                 self.outbox.push_back(broadcast(BlockUpdate { pos, block: BlockID::AIR }));
+                for (pos, block) in relaxed {
+                    self.outbox.push_back(broadcast(BlockUpdate { pos, block }));
+                }
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
             }
             Err(reason) => {
@@ -340,7 +360,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠 */
+        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠；成功后 set_block + relax_after_edit + 多条 BlockUpdate */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));
@@ -447,6 +467,7 @@ impl PersistenceManager {
 **Physics / message dispatch**：
 - `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / 底层边界 / AIR / 不可破坏材质 → BlockNotEmpty
 - `physics::validate_place`：y 越界 / 射程 / 底层边界 / 非热栏材质 / BlockNotEmpty / AABB Overlap
+- `physics::relax_after_edit`：沙/土/草竖直下落、破坏支撑后补落、受阻后斜下滑落、单次预算限制
 - `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
 - 全部 10 个单元测试通过 `cargo test -p voxweb-server --lib`
 

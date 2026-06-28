@@ -152,8 +152,9 @@ VoxWeb/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs          # 模块声明 + re-export
-│   │       ├── block.rs        # BlockID + 硬编码方块表
+│   │       ├── block.rs        # BlockID/MaterialID + 硬编码材质表
 │   │       ├── chunk.rs        # Chunk + Position + ChunkPos
+│   │       ├── field.rs        # FieldChunk + Column Store 原型
 │   │       ├── geometry.rs     # AABB + 玩家碰撞体工具
 │   │       └── protocol.rs     # ClientMessage / ServerMessage / RoomEvent
 │   ├── render/                 # WGPU 渲染（仅 WebGPU 后端）
