@@ -6,12 +6,17 @@
 //! - "_held" 后缀：键当前按下状态（持续，与 keydown/keyup 配对）
 //! - "_just_pressed" 后缀：边沿事件，仅当此帧按下时为 true，帧末 `reset_delta` 清零
 //! - `hotbar_request`: 1-9 键产生的 hotbar 切换请求（0..=8 索引）
+//! - `hotbar_scroll`: 鼠标滚轮累积值，超过阈值时在 main loop 切换 hotbar 选中格
 //! - `fly_toggle_pending`: 双击空格检测出来的飞行模式切换请求
 
 use winit::keyboard::KeyCode;
 
 /// 双击空格判定时间窗口（毫秒）。
 const DOUBLE_TAP_WINDOW_MS: f64 = 250.0;
+
+/// 鼠标滚轮累积切换 hotbar 的阈值（像素）。
+/// 低于此值不切换，避免触控板轻微滑动误触发。
+pub const HOTBAR_SCROLL_THRESHOLD: f32 = 30.0;
 
 /// 单帧的输入快照。
 #[derive(Clone)]
@@ -44,6 +49,8 @@ pub struct InputState {
     // —— 边沿事件 ——
     /// 1-9 数字键：选 hotbar 第 i 格（0..=8）
     pub hotbar_request: Option<u8>,
+    /// 鼠标滚轮累积值（正=向下滚→下一格，负=向上滚→上一格）
+    pub hotbar_scroll: f32,
     /// 双击空格触发的飞行模式切换
     pub fly_toggle_pending: bool,
     /// 打开聊天（Phase 6 用）
@@ -78,6 +85,7 @@ impl Default for InputState {
             place_held: false,
             place_just_pressed: false,
             hotbar_request: None,
+            hotbar_scroll: 0.0,
             fly_toggle_pending: false,
             chat_open: false,
             esc_menu: false,
@@ -120,6 +128,7 @@ impl InputState {
         self.break_just_pressed = false;
         self.place_held = false;
         self.place_just_pressed = false;
+        self.hotbar_scroll = 0.0;
         self.last_space_press_at_ms = None;
     }
 
@@ -208,6 +217,12 @@ impl InputState {
     pub fn on_mouse_move(&mut self, dx: f32, dy: f32) {
         self.mouse_dx += dx;
         self.mouse_dy += dy;
+    }
+
+    /// 累积鼠标滚轮增量（正=向下滚，负=向上滚）。
+    /// 主循环每帧检查累积值，超过阈值时切换 hotbar 并清零。
+    pub fn on_mouse_wheel(&mut self, delta_y: f64) {
+        self.hotbar_scroll += delta_y as f32;
     }
 }
 

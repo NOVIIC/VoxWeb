@@ -1908,9 +1908,17 @@ fn render_game_frame(
             );
         }
 
-        // Hotbar 切换（仅活跃游戏）
+        // Hotbar 切换（仅活跃游戏）—— 数字键
         if active_play && let Some(idx) = input.hotbar_request.take() {
             game.hotbar.select(idx);
+        }
+
+        // Hotbar 切换 —— 鼠标滚轮
+        if active_play && input.hotbar_scroll.abs() >= crate::input::HOTBAR_SCROLL_THRESHOLD {
+            let dir: i32 = if input.hotbar_scroll > 0.0 { 1 } else { -1 };
+            let new_idx = (game.hotbar.selected as i32 + dir).rem_euclid(9) as usize;
+            game.hotbar.selected = new_idx;
+            input.hotbar_scroll = 0.0;
         }
 
         // 双击空格切换 Fly/Walk（仅活跃游戏）
