@@ -268,6 +268,27 @@ pub(super) fn install_event_listeners(
         on_contextmenu.forget();
     }
 
+    // —— 鼠标滚轮：指针锁定时切换 hotbar ——
+    {
+        let input_clone = input.clone();
+        let app_clone = app.clone();
+        let on_wheel = Closure::<dyn FnMut(_)>::new(move |e: web_sys::WheelEvent| {
+            let is_ingame_active = matches!(
+                app_clone.borrow().state,
+                AppState::InGame {
+                    paused: false,
+                    chat_open: false
+                }
+            );
+            if is_ingame_active {
+                input_clone.borrow_mut().on_mouse_wheel(e.delta_y());
+                e.prevent_default();
+            }
+        });
+        canvas.add_event_listener_with_callback("wheel", on_wheel.as_ref().unchecked_ref())?;
+        on_wheel.forget();
+    }
+
     // —— 页面离开 / 进入 BFCache 前尽力保存剩余 dirty chunk ——
     if let Some(window) = web_sys::window() {
         let app_clone = app.clone();
