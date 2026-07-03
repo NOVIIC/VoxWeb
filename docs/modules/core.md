@@ -101,7 +101,7 @@ pub struct MaterialCell {
 }
 ```
 
-当前运行时 chunk 仍保存 `Vec<BlockID>` 作为渲染/碰撞适配视图；`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta` 和后续 FreeObject 迁移。`surface.rs` 提供 `SmoothGranular` 高度场查询，确保渲染提面、DDA raycast、选中框和客户端玩家碰撞使用同一套软材质表面规则。
+当前 `server::World` 已提供 `get_cell_world` / `set_cell` 运行时读写入口；dense `Chunk<Vec<BlockID>>` 仍同步维护为渲染/碰撞适配视图。`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta`、OPFS 存档和 FreeObject 迁移。`surface.rs` 提供 `SmoothGranular` 高度场查询，确保渲染提面、DDA raycast、选中框和客户端玩家碰撞使用同一套软材质表面规则。
 
 ### `object.rs` — FreeObject
 
@@ -119,11 +119,11 @@ pub struct FreeObject {
 }
 ```
 
-第一版 FreeObject 用于硬材质浮空连通块的“提取 → active 动态体 → 投影”生命周期。服务器把小型 `FloatingOnly` 连通块从静态场移除后创建 `FreeObjectState::Dynamic` 对象；对象以平移 AABB 形式按 tick 下落，`FreeObject::aabb()` / `aabb_at()` 提供碰撞代理，`cells_at_current_position()` / `cells_at_position()` 用于最终投影。网络上用 `FreeObjectSpawn` 创建 active 对象、`FreeObjectState` 同步 transform / velocity、`FreeObjectProject` 结束生命周期并写回静态场。
+第一版 FreeObject 用于硬材质浮空连通块的“提取 → active 动态体 → 投影”生命周期。服务器把小型 `FloatingOnly` 连通块从静态场移除后创建 `FreeObjectState::Dynamic` 对象；对象以平移 AABB 形式按 tick 下落，`FreeObject::aabb()` / `aabb_at()` 提供碰撞代理，`cells_at_current_position()` / `cells_at_position()` 用于最终投影。`ObjectSample` 保存完整 `MaterialCell`，同时保留旧 `material/mass` 字段用于旧 `world.json.active_free_objects` 兼容和现有渲染快捷读取。网络上用 `FreeObjectSpawn` 创建 active 对象、`FreeObjectState` 同步 transform / velocity、`FreeObjectProject` 结束生命周期并写回静态场。
 
 ### `field.rs` — FieldChunk 原型
 
-统一体素方案的存储和网络快照底座已经有独立数据结构；运行时 dense `Chunk` 仍作为当前渲染/碰撞适配视图：
+统一体素方案的存储、网络快照和运行时 MaterialCell 读写已经有独立数据结构；运行时 dense `Chunk` 仍作为当前渲染/碰撞适配视图：
 
 ```rust
 pub struct FieldChunk {
@@ -143,7 +143,7 @@ pub struct Span {
 }
 ```
 
-`FieldChunk::from_chunk` / `to_chunk` 提供与现有 `Chunk<Vec<BlockID>>` 的双向转换。自然地形列会压成 `Span`；编辑过的列通过 `Column::set` 自动退化为 `Dense`。这里使用 boxed slice 而不是 `[Column; 256]` / `[MaterialCell; 256]`，是为了当前 serde 版本能直接序列化 256 长度集合。
+`FieldChunk::from_chunk` / `to_chunk` 提供与现有 `Chunk<Vec<BlockID>>` 的双向转换。自然地形列会压成 `Span`；编辑过的列通过 `Column::set` 自动退化为 `Dense`。`free_object_refs` 是运行时 active FreeObject 引用缓存，加载持久化 chunk 时会清除旧 refs 并由 `server::World` 根据 active object AABB 重建。这里使用 boxed slice 而不是 `[Column; 256]` / `[MaterialCell; 256]`，是为了当前 serde 版本能直接序列化 256 长度集合。
 
 实现方式：编译期 `const` 数组按 `BlockID.0` 索引。新增方块时在数组追加一行。
 

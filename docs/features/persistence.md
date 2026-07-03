@@ -5,7 +5,7 @@
 >
 > **当前状态**：Variant A 已落地。`field::encode/decode`、`OpfsStorage`、`WorldStorage` trait、
 > `PersistenceManager` snapshot/commit/failure、启动 prime、运行时按需 OPFS 覆盖、3s 周期 flush、
-> `pagehide` / 回大厅 best-effort flush、LRU/pinned、配额 UI、`storage_version` 不匹配拒绝与大厅删档入口已实现。
+> `pagehide` / 回大厅 best-effort flush、active FreeObject 的 world.json 持久化、LRU/pinned、配额 UI、`storage_version` 不匹配拒绝与大厅删档入口已实现。
 > Worker sync handle 作为可选升级路径保留在 §十二。
 
 ---
@@ -65,7 +65,8 @@ opfs:/voxweb/
   "created_at_ms": 1746000000000,
   "updated_at_ms": 1746000060000,
   "storage_version": 2,                 // 见第十节存储版本策略
-  "protocol_version": 1                 // 写入时的 ClientMessage 协议版本
+  "protocol_version": 9,                 // 写入时的协议版本
+  "active_free_objects": []              // 正在下落/运动的 FreeObject；旧存档缺省为空
 }
 ```
 
@@ -88,8 +89,8 @@ opfs:/voxweb/
 
 ## 四、FieldChunk 存储格式
 
-> OPFS 磁盘存储与网络 `FieldSnapshot` 均使用 `FieldChunk` 编码。运行时仍维护 dense `Chunk` 作为当前渲染/碰撞适配视图。
-> 当前 `FloatingOnly` 硬材质 FreeObject 会在同一权威步骤投影回 `FieldChunk`，因此 OPFS 只保存投影后的静态场；后续引入跨帧 active FreeObject 后再扩展 `world.json` / object record。
+> OPFS chunk 文件与网络 `FieldSnapshot` 均使用 `FieldChunk` 编码。运行时仍维护 dense `Chunk` 作为当前渲染/碰撞适配视图。
+> `FloatingOnly` 硬材质的 active FreeObject 是跨 tick 权威对象：静态 cell 移出后写入 chunk 文件，active 对象本体写入 `world.json.active_free_objects`，静止投影后再从 world record 移除并写回 FieldChunk。FreeObject sample 保存完整 `MaterialCell`；旧 world record 若只有 `material/mass` 字段，加载时会回退重建 cell。
 
 `FieldChunk` 是统一体素方案的存档底座：每个 chunk 由 16×16 个 column 组成，column 可以是 span 压缩，也可以在高熵编辑后退化为 dense cell 列。
 
@@ -104,7 +105,7 @@ struct StoredFieldChunk {
 
 struct FieldChunk {
     columns: Box<[Column]>,  // 逻辑长度恒为 16 * 16
-    free_object_refs: Vec<ObjectID>,
+    free_object_refs: Vec<ObjectID>, // 运行时重建的 active object 引用；存档加载时会清掉旧 refs 再重建
 }
 
 enum Column {
@@ -312,7 +313,7 @@ fn maybe_flush_persistence(&mut self) {
 }
 ```
 
-`OpfsStorage::save_chunks` 写完 chunk 后会 touch `world.json` / `_meta.json` 的 `updated_at_ms`，保证大厅列表排序跟随最近保存时间。
+主路径使用 `OpfsStorage::save_world_state(encoded_chunks, active_free_objects)`：先写 dirty chunk 文件，再把 active FreeObject 列表和 `updated_at_ms` 写入 `world.json` / `_meta.json`。旧的 `save_chunks` trait 方法保留为轻量兼容入口。
 
 ### 6.4 退出 flush（`pagehide` / 回大厅）
 

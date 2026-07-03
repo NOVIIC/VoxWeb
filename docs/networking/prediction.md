@@ -120,7 +120,7 @@ fn apply_pending_correction(&mut self, dt: f32) {
 pub struct PendingAction {
     pub request_id: u32,
     pub kind: PendingActionKind,
-    pub backup: BlockID,           // 修改前的方块（rollback 用）
+    pub backup: MaterialCell,      // 修改前的完整 cell（rollback 用）
     pub pos: Position,
     pub input_tick: u32,           // 点击时本地输入序号
     pub since_tick: u32,
@@ -137,13 +137,13 @@ pub enum PendingActionKind {
 ```rust
 fn handle_break_input(&mut self, hit: RaycastHit) {
     let request_id = self.prediction.next_request_id();
-    let backup = self.world_view.get_block(hit.pos);
+    let backup = self.world_view.get_cell(hit.pos);
     let input_tick = self.local_input_tick;
     let player_position = self.physics.feet_position;
 
     // 本地立即修改（仅 Remote 视角；Local/Host 与 server 共享世界，仍等权威 FieldDelta）
     if matches!(self.role, Role::Remote) {
-        self.world_view.set_block(hit.pos, BlockID::AIR);
+        self.world_view.set_cell(hit.pos, MaterialCell::EMPTY);
         self.mesh_jobs.enqueue(hit.pos.to_chunk_pos(), Priority::High);
     }
 
@@ -175,7 +175,7 @@ fn handle_action_ack(&mut self, ack: ActionAck) {
         // 等 FieldDelta 真正 commit；这里仅留作日志（也可以直接什么都不做）
     } else {
         // 回滚
-        self.world_view.set_block(action.pos, action.backup);
+        self.world_view.set_cell(action.pos, action.backup);
         self.mesh_jobs.enqueue(action.pos.to_chunk_pos(), Priority::High);
         self.ui.toast(format!("操作被拒绝：{:?}", ack.reason));
     }
@@ -186,7 +186,7 @@ fn handle_action_ack(&mut self, ack: ActionAck) {
 
 ```rust
 fn handle_field_delta(&mut self, update: FieldDelta) {
-    self.world_view.set_block(update.pos, update.cell.to_block_id());
+    self.world_view.set_cell(update.pos, update.cell);
     self.mesh_jobs.enqueue(update.pos.to_chunk_pos(), Priority::High);
 }
 ```

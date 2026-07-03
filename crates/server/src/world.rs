@@ -87,61 +87,99 @@ impl World {
         }
     }
 
-    /// 世界坐标方块查询；chunk 未加载或 y 越界一律返回 AIR。
-    /// 供 chunk_mesh::generate_with_neighbors 的回调使用。
-    pub fn get_block_world(&self, wx: i32, wy: i32, wz: i32) -> BlockID {
+    /// 世界坐标 MaterialCell 查询；chunk 未加载或 y 越界一律返回 EMPTY。
+    pub fn get_cell_world(&self, wx: i32, wy: i32, wz: i32) -> MaterialCell {
         if wy < 0 || wy >= CHUNK_Y as i32 {
-            return BlockID::AIR;
+            return MaterialCell::EMPTY;
         }
         let cp = Position::new(wx, wy, wz).to_chunk_pos();
-        let Some(chunk) = self.chunks.get(&cp) else {
-            return BlockID::AIR;
-        };
         // local 坐标计算（rem_euclid 保证负坐标正确折算）
         let lx = wx.rem_euclid(CHUNK_X as i32) as usize;
         let lz = wz.rem_euclid(CHUNK_Z as i32) as usize;
         let ly = wy as usize;
-        chunk.get(lx, ly, lz)
+        if let Some(field) = self.field_chunks.get(&cp) {
+            return field.get(lx, ly, lz);
+        }
+        self.chunks
+            .get(&cp)
+            .map(|chunk| MaterialCell::from_block_id(chunk.get(lx, ly, lz)))
+            .unwrap_or(MaterialCell::EMPTY)
+    }
+
+    /// 世界坐标方块查询；chunk 未加载或 y 越界一律返回 AIR。
+    /// 供 chunk_mesh::generate_with_neighbors 的回调使用。
+    pub fn get_block_world(&self, wx: i32, wy: i32, wz: i32) -> BlockID {
+        self.get_cell_world(wx, wy, wz).to_block_id()
+    }
+
+    /// 在世界坐标处写入一个 MaterialCell（若 chunk 未加载则忽略）。
+    /// 成功写入会把该 chunk 标记为 dirty。
+    pub fn set_cell(&mut self, pos: Position, cell: MaterialCell) {
+        self.set_cell_inner(pos, cell, true);
+    }
+
+    /// 写入本地世界视图但不标记 dirty。Remote 客户端接收 Host 快照 / 乐观预测时使用。
+    pub fn set_cell_untracked(&mut self, pos: Position, cell: MaterialCell) {
+        self.set_cell_inner(pos, cell, false);
     }
 
     /// 在世界坐标处放置一个方块（若 chunk 未加载则忽略）。
-    /// Phase 5 起：成功写入会把该 chunk 标记为 dirty。
+    /// 保留给旧 `BlockID` 调用方；内部转为 MaterialCell 写入。
     pub fn set_block(&mut self, pos: Position, block: BlockID) {
-        self.set_block_inner(pos, block, true);
+        self.set_cell(pos, MaterialCell::from_block_id(block));
     }
 
     /// 写入本地世界视图但不标记 dirty。Remote 客户端接收 Host 快照 / 乐观预测时使用。
     pub fn set_block_untracked(&mut self, pos: Position, block: BlockID) {
-        self.set_block_inner(pos, block, false);
+        self.set_cell_untracked(pos, MaterialCell::from_block_id(block));
     }
 
-    fn set_block_inner(&mut self, pos: Position, block: BlockID, track_dirty: bool) {
+    fn set_cell_inner(&mut self, pos: Position, cell: MaterialCell, track_dirty: bool) {
         let cp = pos.to_chunk_pos();
-        let Some(chunk) = self.chunks.get_mut(&cp) else {
+        if !self.chunks.contains_key(&cp) {
+            return;
+        }
+        let Some(idx) = pos.local_index() else {
             return;
         };
-        if let Some(idx) = pos.local_index() {
-            if chunk.blocks[idx] == block {
-                self.touch_chunk(cp);
-                return;
-            }
-            chunk.blocks[idx] = block;
-            let lx = pos.x.rem_euclid(CHUNK_X as i32) as usize;
-            let lz = pos.z.rem_euclid(CHUNK_Z as i32) as usize;
-            if let Some(field) = self.field_chunks.get_mut(&cp) {
-                field.set(lx, pos.y as usize, lz, MaterialCell::from_block_id(block));
-            }
-            if track_dirty {
-                self.dirty_chunks.insert(cp);
-                self.persistence.mark_dirty(cp);
-            }
-            self.touch_chunk(cp);
+        if !self.field_chunks.contains_key(&cp)
+            && let Some(chunk) = self.chunks.get(&cp)
+        {
+            self.field_chunks.insert(cp, FieldChunk::from_chunk(chunk));
         }
+
+        let lx = pos.x.rem_euclid(CHUNK_X as i32) as usize;
+        let lz = pos.z.rem_euclid(CHUNK_Z as i32) as usize;
+        let ly = pos.y as usize;
+        if self
+            .field_chunks
+            .get(&cp)
+            .is_some_and(|field| field.get(lx, ly, lz) == cell)
+        {
+            self.touch_chunk(cp);
+            return;
+        }
+        if let Some(field) = self.field_chunks.get_mut(&cp) {
+            field.set(lx, ly, lz, cell);
+        }
+        if let Some(chunk) = self.chunks.get_mut(&cp) {
+            chunk.blocks[idx] = cell.to_block_id();
+        }
+        if track_dirty {
+            self.dirty_chunks.insert(cp);
+            self.persistence.mark_dirty(cp);
+        }
+        self.touch_chunk(cp);
     }
 
     /// 读取世界坐标处的方块。chunk 未加载返回 AIR（与 get_block_world 等价的 Position 接口）。
     pub fn get_block(&self, pos: Position) -> BlockID {
         self.get_block_world(pos.x, pos.y, pos.z)
+    }
+
+    /// 读取世界坐标处的 MaterialCell。chunk 未加载返回 EMPTY。
+    pub fn get_cell(&self, pos: Position) -> MaterialCell {
+        self.get_cell_world(pos.x, pos.y, pos.z)
     }
 
     /// Phase 5：取出当前 dirty chunk 列表并清空集合。
@@ -195,16 +233,20 @@ impl World {
 
     /// 直接载入持久化层读出的 FieldChunk，不标 dirty。
     pub fn load_field_chunk_from_storage(&mut self, pos: ChunkPos, field: FieldChunk) {
+        let mut field = field;
+        // active FreeObject 的 refs 由运行时对象表重建，避免把旧存档中的过期 refs 带进世界。
+        field.free_object_refs.clear();
         let chunk = field.to_chunk();
         self.chunks.insert(pos, chunk);
         self.field_chunks.insert(pos, field);
         self.touch_chunk(pos);
+        self.rebuild_free_object_refs();
         self.evict_if_needed();
     }
 
     pub fn record_projected_free_object(
         &mut self,
-        cells: &[(Position, BlockID)],
+        cells: &[(Position, MaterialCell)],
         final_offset_y: i32,
     ) -> Option<ObjectID> {
         let id = self.next_object_id;
@@ -213,46 +255,67 @@ impl World {
         } else {
             self.next_object_id + 1
         };
-        let materials = cells
-            .iter()
-            .map(|(pos, block)| (*pos, *block))
-            .collect::<Vec<_>>();
-        let object = FreeObject::projected_from_cells(id, &materials, final_offset_y)?;
+        let object = FreeObject::projected_from_cells(id, cells, final_offset_y)?;
         self.free_objects.insert(id, object);
         Some(id)
     }
 
-    pub fn spawn_dynamic_free_object(&mut self, cells: &[(Position, BlockID)]) -> Option<ObjectID> {
+    pub fn spawn_dynamic_free_object(
+        &mut self,
+        cells: &[(Position, MaterialCell)],
+    ) -> Option<ObjectID> {
         let id = self.next_object_id;
         self.next_object_id = if self.next_object_id == ObjectID::MAX {
             1
         } else {
             self.next_object_id + 1
         };
-        let materials = cells
-            .iter()
-            .map(|(pos, block)| (*pos, *block))
-            .collect::<Vec<_>>();
-        let object = FreeObject::dynamic_from_cells(id, &materials)?;
+        let object = FreeObject::dynamic_from_cells(id, cells)?;
         self.free_objects.insert(id, object);
+        self.rebuild_free_object_refs();
         Some(id)
     }
 
     pub fn insert_dynamic_free_object(
         &mut self,
         id: ObjectID,
-        cells: &[(Position, BlockID)],
+        cells: &[(Position, MaterialCell)],
     ) -> Option<()> {
-        let materials = cells
-            .iter()
-            .map(|(pos, block)| (*pos, *block))
-            .collect::<Vec<_>>();
-        let object = FreeObject::dynamic_from_cells(id, &materials)?;
+        let object = FreeObject::dynamic_from_cells(id, cells)?;
         self.free_objects.insert(id, object);
         if self.next_object_id <= id {
             self.next_object_id = id.saturating_add(1).max(1);
         }
+        self.rebuild_free_object_refs();
         Some(())
+    }
+
+    /// 从存档恢复 active FreeObject。若存档中的 id 与当前运行时对象冲突，会分配新 id。
+    pub fn load_active_free_objects(&mut self, objects: Vec<FreeObject>) {
+        for mut object in objects {
+            if object.state != FreeObjectState::Dynamic || object.samples.is_empty() {
+                continue;
+            }
+            if self.free_objects.contains_key(&object.id) {
+                object.id = self.allocate_object_id();
+            } else if self.next_object_id <= object.id {
+                self.next_object_id = object.id.saturating_add(1).max(1);
+            }
+            self.free_objects.insert(object.id, object);
+        }
+        self.rebuild_free_object_refs();
+    }
+
+    /// 返回需要持久化到 world.json 的 active objects。排序保证 JSON 输出稳定。
+    pub fn active_free_objects(&self) -> Vec<FreeObject> {
+        let mut objects = self
+            .free_objects
+            .values()
+            .filter(|object| object.state == FreeObjectState::Dynamic)
+            .cloned()
+            .collect::<Vec<_>>();
+        objects.sort_by_key(|object| object.id);
+        objects
     }
 
     pub fn dynamic_object_aabbs(&self) -> Vec<voxweb_core::Aabb> {
@@ -261,6 +324,32 @@ impl World {
             .filter(|object| object.state == FreeObjectState::Dynamic)
             .map(FreeObject::aabb)
             .collect()
+    }
+
+    pub fn rebuild_free_object_refs(&mut self) {
+        for field in self.field_chunks.values_mut() {
+            field.free_object_refs.clear();
+        }
+
+        let refs = self
+            .free_objects
+            .values()
+            .filter(|object| object.state == FreeObjectState::Dynamic)
+            .flat_map(|object| {
+                chunk_refs_for_object(object)
+                    .into_iter()
+                    .map(move |pos| (pos, object.id))
+            })
+            .collect::<Vec<_>>();
+
+        for (pos, object_id) in refs {
+            let Some(field) = self.field_chunks.get_mut(&pos) else {
+                continue;
+            };
+            if !field.free_object_refs.contains(&object_id) {
+                field.free_object_refs.push(object_id);
+            }
+        }
     }
 
     pub fn set_chunk_cache_capacity(&mut self, capacity: usize) {
@@ -309,6 +398,40 @@ impl World {
             self.field_chunks.remove(&candidate);
         }
     }
+
+    fn allocate_object_id(&mut self) -> ObjectID {
+        loop {
+            let id = self.next_object_id;
+            self.next_object_id = if self.next_object_id == ObjectID::MAX {
+                1
+            } else {
+                self.next_object_id + 1
+            };
+            if !self.free_objects.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+}
+
+fn chunk_refs_for_object(object: &FreeObject) -> Vec<ChunkPos> {
+    let aabb = object.aabb();
+    let min_x = aabb.min.x.floor() as i32;
+    let max_x = (aabb.max.x - f32::EPSILON).floor().max(aabb.min.x.floor()) as i32;
+    let min_z = aabb.min.z.floor() as i32;
+    let max_z = (aabb.max.z - f32::EPSILON).floor().max(aabb.min.z.floor()) as i32;
+    let min_cx = min_x.div_euclid(CHUNK_X as i32);
+    let max_cx = max_x.div_euclid(CHUNK_X as i32);
+    let min_cz = min_z.div_euclid(CHUNK_Z as i32);
+    let max_cz = max_z.div_euclid(CHUNK_Z as i32);
+
+    let mut refs = Vec::new();
+    for cz in min_cz..=max_cz {
+        for cx in min_cx..=max_cx {
+            refs.push(ChunkPos::new(cx, cz));
+        }
+    }
+    refs
 }
 
 #[cfg(test)]
@@ -385,6 +508,52 @@ mod tests {
     }
 
     #[test]
+    fn set_cell_preserves_material_cell_and_updates_chunk_mirror() {
+        let mut world = World::new(0);
+        let cp = ChunkPos::new(0, 0);
+        let pos = Position::new(5, 100, 7);
+        let cell = MaterialCell {
+            occupancy: 128,
+            primary: BlockID::SAND,
+            secondary: None,
+            flags: voxweb_core::CellFlags::empty(),
+        };
+        world.ensure_chunk_generated(cp);
+
+        world.set_cell(pos, cell);
+
+        assert_eq!(world.get_cell(pos), cell);
+        assert_eq!(world.get_block(pos), BlockID::SAND);
+        assert_eq!(world.chunks[&cp].get(5, 100, 7), BlockID::SAND);
+        assert!(world.dirty_chunks.contains(&cp));
+    }
+
+    #[test]
+    fn dynamic_free_object_preserves_material_cell() {
+        let mut world = World::new(0);
+        world.ensure_chunk_generated(ChunkPos::new(0, 0));
+        let pos = Position::new(5, 100, 7);
+        let cell = MaterialCell {
+            occupancy: 180,
+            primary: BlockID::SAND,
+            secondary: Some(voxweb_core::block::MixSlot {
+                material: BlockID::DIRT,
+                occupancy: 40,
+            }),
+            flags: voxweb_core::block::CellFlags(voxweb_core::block::CellFlags::DIRTY),
+        };
+
+        let object_id = world
+            .spawn_dynamic_free_object(&[(pos, cell)])
+            .expect("spawn dynamic object");
+        let object = world.free_objects.get(&object_id).unwrap();
+
+        assert_eq!(object.cells_at_current_position(), vec![(pos, cell)]);
+        assert_eq!(object.samples[0].cell(), cell);
+        assert_eq!(object.material_summary.total_mass, 220);
+    }
+
+    #[test]
     fn set_block_marks_world_dirty() {
         // Phase 5：set_block 成功写入应把该 chunk 加进 dirty_chunks。
         let mut world = World::new(0);
@@ -455,6 +624,63 @@ mod tests {
         let mut world = World::new(0);
         world.set_block(Position::new(0, 64, 0), BlockID::STONE);
         assert!(world.dirty_chunks.is_empty());
+    }
+
+    #[test]
+    fn dynamic_free_object_refs_track_overlapped_chunks() {
+        let mut world = World::new(0);
+        let left = ChunkPos::new(0, 0);
+        let right = ChunkPos::new(1, 0);
+        world.ensure_chunk_generated(left);
+        world.ensure_chunk_generated(right);
+
+        let object_id = world
+            .spawn_dynamic_free_object(&[
+                (
+                    Position::new(15, 5, 1),
+                    MaterialCell::from_block_id(BlockID::STONE_BRICKS),
+                ),
+                (
+                    Position::new(16, 5, 1),
+                    MaterialCell::from_block_id(BlockID::STONE_BRICKS),
+                ),
+            ])
+            .expect("spawn dynamic object");
+
+        assert!(
+            world.field_chunks[&left]
+                .free_object_refs
+                .contains(&object_id)
+        );
+        assert!(
+            world.field_chunks[&right]
+                .free_object_refs
+                .contains(&object_id)
+        );
+        assert_eq!(world.active_free_objects().len(), 1);
+    }
+
+    #[test]
+    fn load_field_chunk_clears_stale_refs_and_rebuilds_active_refs() {
+        let mut source = World::new(0);
+        source.ensure_chunk_generated(ChunkPos::new(0, 0));
+        let object_id = source
+            .spawn_dynamic_free_object(&[(
+                Position::new(1, 5, 1),
+                MaterialCell::from_block_id(BlockID::STONE_BRICKS),
+            )])
+            .expect("spawn dynamic object");
+        let active = source.active_free_objects();
+        let mut stored = source.field_chunks[&ChunkPos::new(0, 0)].clone();
+        stored.free_object_refs.push(ObjectID::MAX);
+
+        let mut world = World::new(0);
+        world.load_active_free_objects(active);
+        world.load_field_chunk_from_storage(ChunkPos::new(0, 0), stored);
+
+        let refs = &world.field_chunks[&ChunkPos::new(0, 0)].free_object_refs;
+        assert!(refs.contains(&object_id));
+        assert!(!refs.contains(&ObjectID::MAX));
     }
 
     #[test]

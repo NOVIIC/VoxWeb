@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// 方块标识，u16 保证可扩展至 65535 种方块。
 /// 0 = 空气（AIR），不参与渲染和碰撞。
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct BlockID(pub u16);
 
 /// 第一版统一体素方案中，MaterialID 暂时复用现有 BlockID 编号。
@@ -104,7 +104,7 @@ impl CellFlags {
 
 /// 统一体素方案的权威 cell 原型。当前 Chunk 仍保存 BlockID；
 /// 这个类型先服务协议/存档演进和后续 FieldChunk 原型。
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct MaterialCell {
     pub occupancy: u8,
     pub primary: MaterialID,

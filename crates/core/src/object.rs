@@ -3,7 +3,7 @@
 use glam::{Vec3, i16vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::block::MaterialID;
+use crate::block::{MaterialCell, MaterialID};
 use crate::chunk::Position;
 use crate::geometry::Aabb;
 
@@ -31,7 +31,13 @@ pub struct Transform {
 pub struct ObjectSample {
     /// 相对 `transform.position` 的 cell 偏移。第一版只提取整格材质。
     pub local_pos: [i16; 3],
+    /// 提取时的完整 MaterialCell。旧存档若没有该字段，会由 `material/mass` 回退重建。
+    #[serde(default)]
+    pub cell: MaterialCell,
+    /// 兼容旧 active_free_objects JSON，并保留给现有渲染快捷读取。
+    #[serde(default)]
     pub material: MaterialID,
+    #[serde(default)]
     pub mass: u8,
 }
 
@@ -56,13 +62,13 @@ pub enum FreeObjectState {
 }
 
 impl FreeObject {
-    pub fn dynamic_from_cells(id: ObjectID, cells: &[(Position, MaterialID)]) -> Option<Self> {
+    pub fn dynamic_from_cells(id: ObjectID, cells: &[(Position, MaterialCell)]) -> Option<Self> {
         Self::from_cells(id, cells, 0, FreeObjectState::Dynamic, Vec3::ZERO)
     }
 
     pub fn projected_from_cells(
         id: ObjectID,
-        cells: &[(Position, MaterialID)],
+        cells: &[(Position, MaterialCell)],
         final_offset_y: i32,
     ) -> Option<Self> {
         Self::from_cells(
@@ -76,7 +82,7 @@ impl FreeObject {
 
     fn from_cells(
         id: ObjectID,
-        cells: &[(Position, MaterialID)],
+        cells: &[(Position, MaterialCell)],
         final_offset_y: i32,
         state: FreeObjectState,
         velocity: Vec3,
@@ -86,20 +92,23 @@ impl FreeObject {
         let mut max = first.0;
         let mut total_mass = 0u32;
 
-        for (pos, material) in cells {
+        for (pos, cell) in cells {
             min.x = min.x.min(pos.x);
             min.y = min.y.min(pos.y);
             min.z = min.z.min(pos.z);
             max.x = max.x.max(pos.x);
             max.y = max.y.max(pos.y);
             max.z = max.z.max(pos.z);
-            total_mass += u32::from(crate::block::MaterialCell::full(*material).occupancy);
+            total_mass += u32::from(cell.occupancy);
+            if let Some(secondary) = cell.secondary {
+                total_mass += u32::from(secondary.occupancy);
+            }
         }
 
         let origin = Position::new(min.x, min.y + final_offset_y, min.z);
         let samples = cells
             .iter()
-            .map(|(pos, material)| {
+            .map(|(pos, cell)| {
                 let local = i16vec3(
                     (pos.x - min.x) as i16,
                     (pos.y - min.y) as i16,
@@ -107,8 +116,9 @@ impl FreeObject {
                 );
                 ObjectSample {
                     local_pos: local.to_array(),
-                    material: *material,
-                    mass: u8::MAX,
+                    cell: *cell,
+                    material: cell.primary,
+                    mass: cell.occupancy,
                 }
             })
             .collect::<Vec<_>>();
@@ -121,7 +131,15 @@ impl FreeObject {
         );
         let mass = cells
             .iter()
-            .map(|(_, material)| crate::block::properties(*material).density_kg_m3)
+            .map(|(_, cell)| {
+                let mut mass = crate::block::properties(cell.primary).density_kg_m3
+                    * (f32::from(cell.occupancy) / f32::from(u8::MAX));
+                if let Some(secondary) = cell.secondary {
+                    mass += crate::block::properties(secondary.material).density_kg_m3
+                        * (f32::from(secondary.occupancy) / f32::from(u8::MAX));
+                }
+                mass
+            })
             .sum();
 
         Some(Self {
@@ -133,7 +151,7 @@ impl FreeObject {
             angular_velocity: Vec3::ZERO,
             samples,
             material_summary: MaterialSummary {
-                dominant: first.1,
+                dominant: first.1.primary,
                 sample_count: cells.len() as u32,
                 total_mass,
             },
@@ -173,7 +191,7 @@ impl FreeObject {
         )
     }
 
-    pub fn cells_at_position(&self, position: Vec3) -> Vec<(Position, MaterialID)> {
+    pub fn cells_at_position(&self, position: Vec3) -> Vec<(Position, MaterialCell)> {
         let base = Position::new(
             position.x.round() as i32,
             position.y.round() as i32,
@@ -188,13 +206,30 @@ impl FreeObject {
                         base.y + sample.local_pos[1] as i32,
                         base.z + sample.local_pos[2] as i32,
                     ),
-                    sample.material,
+                    sample.cell(),
                 )
             })
             .collect()
     }
 
-    pub fn cells_at_current_position(&self) -> Vec<(Position, MaterialID)> {
+    pub fn cells_at_current_position(&self) -> Vec<(Position, MaterialCell)> {
         self.cells_at_position(self.transform.position)
+    }
+}
+
+impl ObjectSample {
+    pub fn cell(&self) -> MaterialCell {
+        if !self.cell.is_empty() {
+            self.cell
+        } else if self.material != crate::block::BlockID::AIR && self.mass > 0 {
+            MaterialCell {
+                occupancy: self.mass,
+                primary: self.material,
+                secondary: None,
+                flags: crate::block::CellFlags::empty(),
+            }
+        } else {
+            MaterialCell::EMPTY
+        }
     }
 }

@@ -272,7 +272,7 @@ VoxWeb/
 4. 发 ClientMessage::Break {pos:(10,64,5), input_tick, player_position}
    通过 reliable DataChannel              ────→    5. 收到消息，server.physics 校验
                                                       （射程内？方块非空？）
-                                                  6. 通过 → world.set_block(pos, AIR)
+                                                  6. 通过 → world.set_cell(pos, MaterialCell::EMPTY)
                                                   7. 标记 chunk dirty
                                                   8. 广播 ServerMessage::FieldDelta
                                                      给所有 peer（含来源）

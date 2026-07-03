@@ -345,7 +345,7 @@ pub fn run_until_budget(
 
 ### Remote
 - 收到 `FieldSnapshot` → assembler 组装完成 → `world.load_field_chunk_from_storage(pos, field)` → 入队
-- 收到 `FieldDelta` → `world.set_block_untracked(pos, cell.to_block_id())` → 该 chunk + 6 邻居（如果方块在边界）入队
+- 收到 `FieldDelta` → `world.set_cell_untracked(pos, cell)` → 该 chunk + 6 邻居（如果方块在边界）入队
 
 ### 边界方块更新
 方块在 `lx == 0` / `lx == 15` 等边界时，邻居 chunk 也需重网格化（因为跨区块剔除可能改变）。

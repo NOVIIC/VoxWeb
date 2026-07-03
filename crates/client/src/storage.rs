@@ -16,6 +16,7 @@ use web_sys::{
 };
 
 use voxweb_core::chunk::{self, ChunkPos, STORAGE_VERSION};
+use voxweb_core::object::FreeObject;
 use voxweb_core::protocol::PROTOCOL_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,8 @@ pub struct WorldRecord {
     pub updated_at_ms: u64,
     pub storage_version: u8,
     pub protocol_version: u32,
+    #[serde(default)]
+    pub active_free_objects: Vec<FreeObject>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -143,6 +146,7 @@ impl OpfsStorage {
                     updated_at_ms: now,
                     storage_version: STORAGE_VERSION,
                     protocol_version: PROTOCOL_VERSION,
+                    active_free_objects: Vec::new(),
                 }
             }
         };
@@ -191,6 +195,68 @@ impl OpfsStorage {
         load_world_record(&root).await.ok().flatten()
     }
 
+    pub async fn load_active_free_objects(&self) -> Result<Vec<FreeObject>, StorageError> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await?;
+        Ok(load_world_record(&root)
+            .await?
+            .map(|record| record.active_free_objects)
+            .unwrap_or_default())
+    }
+
+    pub async fn save_world_state(
+        &self,
+        chunks: Vec<(ChunkPos, Vec<u8>)>,
+        active_free_objects: Vec<FreeObject>,
+    ) -> Result<(), StorageError> {
+        for (pos, bytes) in chunks {
+            write_bytes_file(&self.chunks_dir, &chunk_filename(pos), &bytes).await?;
+        }
+        self.save_active_free_objects(&active_free_objects).await
+    }
+
+    pub async fn save_active_free_objects(
+        &self,
+        active_free_objects: &[FreeObject],
+    ) -> Result<(), StorageError> {
+        let root = get_dir(&self.worlds_root, &self.world_key, &{
+            let opts = FileSystemGetDirectoryOptions::new();
+            opts.set_create(false);
+            opts
+        })
+        .await?;
+        let now = now_ms() as u64;
+        let mut record = load_world_record(&root).await?.unwrap_or_else(|| {
+            let seed = seed_from_key(&self.world_key).unwrap_or(0);
+            WorldRecord {
+                key: self.world_key.clone(),
+                room_id: "local".to_string(),
+                seed: seed.to_string(),
+                display_name: "Unknown".to_string(),
+                created_at_ms: parse_world_key(&self.world_key)
+                    .map(|(ts, _)| ts * 1000)
+                    .unwrap_or(now),
+                updated_at_ms: now,
+                storage_version: STORAGE_VERSION,
+                protocol_version: PROTOCOL_VERSION,
+                active_free_objects: Vec::new(),
+            }
+        });
+        record.updated_at_ms = now;
+        record.active_free_objects = active_free_objects.to_vec();
+        write_text_file(
+            &root,
+            "world.json",
+            &serde_json::to_string_pretty(&record).unwrap(),
+        )
+        .await?;
+        update_meta(&self.worlds_root, &record).await
+    }
+
     /// 获取当前世界每个 chunk 文件的持久化大小，供 HUD 增量维护世界占用。
     pub async fn chunk_file_sizes(&self) -> Result<HashMap<ChunkPos, u64>, StorageError> {
         chunk_file_sizes(&self.chunks_dir).await
@@ -233,6 +299,7 @@ impl OpfsStorage {
                 updated_at_ms: now,
                 storage_version: STORAGE_VERSION,
                 protocol_version: PROTOCOL_VERSION,
+                active_free_objects: Vec::new(),
             }
         });
         record.updated_at_ms = now;

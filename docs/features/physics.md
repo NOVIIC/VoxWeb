@@ -356,9 +356,11 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 服务端仲裁按材质属性执行额外规则：y=0 永远视为世界底部边界；`properties(block).breakable == false` 的材质不可挖（当前为 BEDROCK）；放置请求只能使用 `appears_in_hotbar == true` 的材质，防止客户端通过协议放置 AIR / BEDROCK 等非创造模式材料。
 
-`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote。
+`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote；移动和广播都保留完整 `MaterialCell`，不会把 occupancy / secondary 退化成单纯 `BlockID`。
 
-`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就从静态场提取为 active `FreeObject` 并广播 `FreeObjectSpawn`。Host / Local-Only 在 60Hz tick 中按重力推进 AABB 动态体，通过 `FreeObjectState` 同步当前位置和速度；客户端渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验。对象静止后再通过 `FreeObjectProject` 投影回 `MaterialField`。当前不做旋转、碰撞反弹或碎裂。
+`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就从静态场提取为 active `FreeObject` 并广播 `FreeObjectSpawn`。Host / Local-Only 在 60Hz tick 中按重力推进 AABB 动态体，通过 `FreeObjectState` 同步当前位置和速度；客户端渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验。对象静止后再通过 `FreeObjectProject` 投影回 `MaterialField`。`FreeObject` sample、Spawn 和 Project 都携带完整 `MaterialCell`。当前不做旋转、碰撞反弹或碎裂。
+
+Host / Local-Only 保存世界时会把 active `FreeObject` 列表写入 `world.json.active_free_objects`，并把已从静态场移除的 cell 留在 chunk 文件中。重进存档后，服务端恢复 active object 表并重建 `FieldChunk.free_object_refs`，避免正在下落的硬材质对象丢失或被提前投影。
 
 ### 8.1 视觉反馈
 
@@ -383,12 +385,12 @@ fn on_left_click(&mut self) {
     // 乐观更新（仅 Remote 角色；Local-Only 等服务端 FieldDelta）
     // 软材质后续滑落以 Host 返回的额外 FieldDelta 为准。
     if matches!(self.role, Role::Remote) {
-        let backup = self.world_view.get_block(hit.block_pos);
+        let backup = self.world_view.get_cell(hit.block_pos);
         self.prediction.pending_actions.insert(request_id, PendingAction {
             request_id, kind: PendingActionKind::Break,
             backup, pos: hit.block_pos, since_tick: self.current_tick,
         });
-        self.world_view.set_block(hit.block_pos, BlockID::AIR);
+        self.world_view.set_cell(hit.block_pos, MaterialCell::EMPTY);
         self.mesh_jobs.enqueue_with_neighbors(hit.block_pos, Priority::High);
     }
 
@@ -422,12 +424,12 @@ fn on_right_click(&mut self) {
     let request_id = self.prediction.next_request_id();
 
     if matches!(self.role, Role::Remote) {
-        let backup = self.world_view.get_block(neighbor_pos);
+        let backup = self.world_view.get_cell(neighbor_pos);
         self.prediction.pending_actions.insert(request_id, PendingAction {
             request_id, kind: PendingActionKind::Place(block_to_place),
             backup, pos: neighbor_pos, since_tick: self.current_tick,
         });
-        self.world_view.set_block(neighbor_pos, block_to_place);
+        self.world_view.set_cell(neighbor_pos, MaterialCell::from_block_id(block_to_place));
         self.mesh_jobs.enqueue_with_neighbors(neighbor_pos, Priority::High);
     }
 

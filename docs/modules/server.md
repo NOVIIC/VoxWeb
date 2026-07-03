@@ -26,8 +26,9 @@
 当前 server crate 覆盖完整权威世界循环：
 
 - `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
-- `World::field_chunks` 同步维护 `FieldChunk` MaterialField 镜像；当前渲染/碰撞仍从 `chunks` 适配读取，网络快照直接发送 FieldChunk
-- `World::free_objects` 记录第一版 FreeObject 生命周期结果：小型 `FloatingOnly` 连通块会被提取、整体下落并投影回静态场
+- `World::get_cell_world` / `set_cell` 是运行时 MaterialCell 读写入口；`get_block_world` / `set_block` 是当前渲染、碰撞和旧调用方的 `BlockID` 适配包装
+- `World::field_chunks` 维护 `FieldChunk` MaterialField；当前渲染/碰撞仍从同步更新的 dense `chunks` 镜像读取，网络快照直接发送 FieldChunk
+- `World::free_objects` 记录第一版 active FreeObject 生命周期：小型 `FloatingOnly` 连通块会被提取、整体下落、按 `FieldChunk.free_object_refs` 建立运行时引用，静止后投影回静态场；FreeObject sample 保留完整 `MaterialCell`，Host / Local-Only 的 OPFS 加载会从 `world.json.active_free_objects` 恢复这些对象
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
 - `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`relax_after_edit` 对 `ImmediateRelaxation` 材质做局部下落/滑落
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
@@ -60,7 +61,7 @@ pub struct World {
     pub seed: u64,
     pub chunks: HashMap<ChunkPos, Chunk>,
     pub field_chunks: HashMap<ChunkPos, FieldChunk>, // MaterialField 镜像
-    pub free_objects: HashMap<ObjectID, FreeObject>, // 已提取/投影的材质团记录
+    pub free_objects: HashMap<ObjectID, FreeObject>, // active 动态材质团
     pub terrain: TerrainGenerator,           // Perlin 高度图
     pub tick_count: u64,                     // tick 累加器；驱动玩家广播
     pub dirty_chunks: HashSet<ChunkPos>,     // 需要持久化的 chunk
@@ -78,7 +79,11 @@ impl World {
     /// 卸载 chunk（移除 chunks 表）。调用方需要先处理 dirty flush / pinned 约束。
     pub fn unload_chunk(&mut self, pos: ChunkPos);
 
-    /// 直接读写方块；`set_block` 会同步更新 chunks + field_chunks 并标记 dirty。
+    /// 直接读写 MaterialCell；`set_cell` 会同步更新 field_chunks + chunks 镜像并标记 dirty。
+    pub fn get_cell(&self, pos: Position) -> MaterialCell;
+    pub fn set_cell(&mut self, pos: Position, cell: MaterialCell);
+
+    /// BlockID 适配层；供当前渲染/碰撞、热栏和旧调用方使用。
     /// chunk 未加载或 local_index 越界时静默忽略。
     pub fn get_block(&self, pos: Position) -> BlockID;
     pub fn set_block(&mut self, pos: Position, block: BlockID);
@@ -131,7 +136,7 @@ impl Server {
 
     /// 处理来自客户端的消息（Local 或 Remote）。
     /// Hello → 插入 players 表 + Welcome；PlayerInput → 更新 players 表；
-    /// Break/Place → 调 validate → Ok 则 set_block + ActionAck + FieldDelta；失败仅 ActionAck。
+    /// Break/Place → 调 validate → Ok 则 set_cell + ActionAck + FieldDelta；失败仅 ActionAck。
     pub fn handle_message(&mut self, sender: u32, msg: ClientMessage) -> Vec<ServerMessage>;
 
     /// 推进一个逻辑帧（60Hz 调用）。
@@ -292,7 +297,7 @@ pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet:
 ### 局部颗粒松弛与硬材质浮空
 
 ```rust
-pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
+pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, MaterialCell)> {
     // 1) 从 origin 及其上方/四邻域入队
     // 2) 只处理 properties(block).stability == ImmediateRelaxation 的材质
     // 3) 优先竖直下落；受阻后按确定性方向尝试斜下滑落
@@ -315,8 +320,8 @@ pub fn tick_free_objects(world: &mut World) -> FreeObjectTickEvents {
 }
 ```
 
-当前这是 `BlockID` dense chunk 上的过渡原型，不做质量拆分和多材质混合；它保证 Host / Local-Only 立即给玩家软材质反馈，并通过 `FieldDelta` 同步结果。
-硬材质第一版是平移 AABB 动态体：没有旋转、反弹或碎裂，但下落过程是服务端 tick 推进的权威状态，客户端渲染和碰撞查询都读取 active FreeObject。
+当前这是 `MaterialCell` 运行时路径上的第一版局部 solver：查询和写入走 `World::get_cell/set_cell`，同时维护 dense `Chunk` 镜像给渲染/碰撞适配层使用。它保证 Host / Local-Only 立即给玩家软材质反馈，并通过 `FieldDelta { cell }` 同步完整 cell。
+硬材质第一版是平移 AABB 动态体：没有旋转、反弹或碎裂，但下落过程是服务端 tick 推进的权威状态，客户端渲染和碰撞查询都读取 active FreeObject。FreeObject spawn/project 事件同样携带完整 `MaterialCell`。
 
 ---
 
@@ -363,12 +368,12 @@ match msg {
         let feet = self.action_player_position(sender, input_tick, player_position);
         match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
-                self.world.set_block(pos, BlockID::AIR);
+                self.world.set_cell(pos, MaterialCell::EMPTY);
                 let relaxed = physics::relax_after_edit(&mut self.world, pos);
                 let spawns = physics::resolve_floating_after_edit(&mut self.world, pos);
                 self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::EMPTY }));
-                for (pos, block) in relaxed {
-                    self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::from_block_id(block) }));
+                for (pos, cell) in relaxed {
+                    self.outbox.push_back(broadcast(FieldDelta { pos, cell }));
                 }
                 self.enqueue_free_object_spawns(spawns);
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
@@ -380,7 +385,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围、玩家 AABB 和 active FreeObject AABB；成功后 set_block + relax_after_edit + FieldDelta，并用 FreeObjectSpawn/State/Project 同步硬材质动态生命周期 */
+        /* 同上：按点击时 feet 校验范围、玩家 AABB 和 active FreeObject AABB；成功后 set_cell + relax_after_edit + FieldDelta，并用 FreeObjectSpawn/State/Project 同步硬材质动态生命周期 */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));

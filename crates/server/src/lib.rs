@@ -338,7 +338,7 @@ impl Server {
                     self.action_player_position(entity_id, input_tick, player_position);
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
-                    self.world.set_block(pos, voxweb_core::BlockID::AIR);
+                    self.world.set_cell(pos, MaterialCell::EMPTY);
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
                     let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
@@ -349,7 +349,7 @@ impl Server {
                             reason,
                         },
                     );
-                    self.enqueue_field_delta(pos, voxweb_core::BlockID::AIR);
+                    self.enqueue_field_delta(pos, MaterialCell::EMPTY);
                     self.enqueue_field_deltas(relaxed);
                     self.enqueue_free_object_spawns(spawned);
                 } else {
@@ -374,7 +374,7 @@ impl Server {
                     self.action_player_position(entity_id, input_tick, player_position);
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
-                    self.world.set_block(pos, block);
+                    self.world.set_cell(pos, MaterialCell::from_block_id(block));
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
                     let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
@@ -385,7 +385,7 @@ impl Server {
                             reason,
                         },
                     );
-                    self.enqueue_field_delta(pos, block);
+                    self.enqueue_field_delta(pos, MaterialCell::from_block_id(block));
                     self.enqueue_field_deltas(relaxed);
                     self.enqueue_free_object_spawns(spawned);
                 } else {
@@ -526,11 +526,7 @@ impl Server {
             .map(|object| {
                 (
                     object.id,
-                    object
-                        .cells_at_current_position()
-                        .into_iter()
-                        .map(|(pos, material)| (pos, MaterialCell::from_block_id(material)))
-                        .collect::<Vec<_>>(),
+                    object.cells_at_current_position(),
                     object.transform.position,
                     object.velocity,
                 )
@@ -632,39 +628,26 @@ impl Server {
             .push_back(OutboundMessage { recipient, message });
     }
 
-    fn enqueue_field_delta(&mut self, pos: voxweb_core::Position, block: voxweb_core::BlockID) {
-        self.enqueue(
-            Recipient::All,
-            ServerMessage::FieldDelta {
-                pos,
-                cell: MaterialCell::from_block_id(block),
-            },
-        );
+    fn enqueue_field_delta(&mut self, pos: voxweb_core::Position, cell: MaterialCell) {
+        self.enqueue(Recipient::All, ServerMessage::FieldDelta { pos, cell });
     }
 
-    fn enqueue_field_deltas(
-        &mut self,
-        updates: Vec<(voxweb_core::Position, voxweb_core::BlockID)>,
-    ) {
-        for (pos, block) in updates {
-            self.enqueue_field_delta(pos, block);
+    fn enqueue_field_deltas(&mut self, updates: Vec<(voxweb_core::Position, MaterialCell)>) {
+        for (pos, cell) in updates {
+            self.enqueue_field_delta(pos, cell);
         }
     }
 
     fn enqueue_free_object_spawns(&mut self, spawns: Vec<physics::FreeObjectSpawn>) {
         for spawn in spawns {
             for (pos, _) in &spawn.cells {
-                self.enqueue_field_delta(*pos, voxweb_core::BlockID::AIR);
+                self.enqueue_field_delta(*pos, MaterialCell::EMPTY);
             }
             self.enqueue(
                 Recipient::All,
                 ServerMessage::FreeObjectSpawn {
                     object_id: spawn.object_id,
-                    cells: spawn
-                        .cells
-                        .into_iter()
-                        .map(|(pos, block)| (pos, MaterialCell::from_block_id(block)))
-                        .collect(),
+                    cells: spawn.cells,
                 },
             );
         }
@@ -689,11 +672,7 @@ impl Server {
                 Recipient::All,
                 ServerMessage::FreeObjectProject {
                     object_id: projection.object_id,
-                    deltas: projection
-                        .deltas
-                        .into_iter()
-                        .map(|(pos, block)| (pos, MaterialCell::from_block_id(block)))
-                        .collect(),
+                    deltas: projection.deltas,
                 },
             );
         }
