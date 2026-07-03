@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 
 /// 单位 box 顶点（36 个，12 个三角形）。
 /// 实际尺寸由 instance.size 控制。玩家实例传入 0.6×1.8×0.6；
-/// FreeObject 投影动画传入 1×1×1。
+/// active FreeObject sample cube 传入 1×1×1。
 const CUBE_VERTICES: &[[f32; 3]] = &[
     // +Y (top, y=1) — CCW from +Y
     [0.0, 1.0, 1.0],
@@ -128,7 +128,7 @@ impl PlayerPass {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // 预留 1024 个实例，远端玩家和短时 FreeObject 投影动画共用。
+        // 预留 1024 个实例，远端玩家和 active FreeObject sample cube 共用。
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("player.ibuf"),
             size: MAX_INSTANCE_COUNT as u64 * std::mem::size_of::<PlayerInstance>() as u64,

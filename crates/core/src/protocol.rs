@@ -13,8 +13,8 @@ use crate::object::ObjectID;
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
-/// v8：硬材质 FreeObject 即时投影事件接入网络语义。
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9：FreeObject 升级为 Spawn/State/Project 动态生命周期。
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// FieldSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -135,7 +135,18 @@ pub enum ServerMessage {
     },
     /// 单 cell 更新（挖放结果广播）
     FieldDelta { pos: Position, cell: MaterialCell },
-    /// FreeObject 投影回静态场。当前用于 FloatingOnly 硬材质小连通块即时坍落。
+    /// 从静态场提取出的动态材质团。Host 已经把这些 cell 从 MaterialField 移除。
+    FreeObjectSpawn {
+        object_id: ObjectID,
+        cells: Vec<(Position, MaterialCell)>,
+    },
+    /// 动态 FreeObject 的权威状态。Remote 只应用 Host 状态，不决定最终落点。
+    FreeObjectState {
+        object_id: ObjectID,
+        position: Vec3,
+        velocity: Vec3,
+    },
+    /// FreeObject 静止后投影回静态场。
     FreeObjectProject {
         object_id: ObjectID,
         deltas: Vec<(Position, MaterialCell)>,
@@ -342,9 +353,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eight() {
-        // FreeObjectProject 网络语义为 v8；破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 8);
+    fn protocol_version_is_nine() {
+        // FreeObject 动态生命周期网络语义为 v9；破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -392,6 +403,22 @@ mod tests {
                 Position::new(1, 2, 3),
                 MaterialCell::from_block_id(BlockID::STONE_BRICKS),
             )],
+        });
+    }
+
+    #[test]
+    fn roundtrip_free_object_spawn_and_state() {
+        roundtrip(&ServerMessage::FreeObjectSpawn {
+            object_id: 7,
+            cells: vec![(
+                Position::new(1, 2, 3),
+                MaterialCell::from_block_id(BlockID::STONE_BRICKS),
+            )],
+        });
+        roundtrip(&ServerMessage::FreeObjectState {
+            object_id: 7,
+            position: Vec3::new(1.0, 2.0, 3.0),
+            velocity: Vec3::new(0.0, -3.0, 0.0),
         });
     }
 

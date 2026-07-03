@@ -1,6 +1,6 @@
 # 统一体素设计
 
-> **状态**：第一版核心闭环部分落地。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、整体下落和即时投影，客户端投影短动画，以及 `SmoothGranular` 的第一版高度场平滑提面 / raycast / 选中 / 客户端碰撞共用查询；真实流体、完整 Surface Nets / Marching Cubes 和权威可见刚体飞行尚未实现。
+> **状态**：第一版核心闭环已落地到 cell 保真路径。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、active FreeObject world.json 持久化、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、active AABB 动态下落、`FreeObjectSpawn/State/Project` 同步、客户端动态碰撞/raycast 查询，以及 `SmoothGranular` 的扩邻域高度场平滑提面 / raycast / 选中 / 客户端碰撞共用查询；运行时预测回滚、颗粒松弛、FreeObject sample 和 project delta 均保留完整 `MaterialCell`。真实流体、完整 Surface Nets / Marching Cubes、旋转刚体、碰撞反弹和碎裂尚未实现，作为固体/颗粒闭环之后的增强项。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -87,17 +87,17 @@
 | crate / 模块 | 当前职责 | 对统一体素方案的自然归属 |
 |---|---|---|
 | `core::block` | `BlockID` + 编译期 `BlockProperties`；已新增 `MaterialID`/`MaterialProperties` 过渡别名、`MaterialCell` 原型和 `MaterialRegistry` 查询入口 | 后续迁移为独立 `MaterialRegistry` 与 FieldChunk schema |
-| `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标 | 继续作为当前渲染/碰撞适配格式，网络和存档已由 FieldChunk 承担 |
-| `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护；OPFS 和网络快照均使用 FieldChunk 编码 | 后续扩展 column delta、active FreeObject refs 和 region hash |
-| `core::object` | `FreeObject`、`ObjectSample`、`MaterialSummary`、`CollisionProxy` 与 `FreeObjectState` | 后续接入权威可见刚体飞行、网络状态和持久化 active object |
+| `core::chunk` | 16×256×16 `Vec<BlockID>`、坐标 | 继续作为当前渲染/碰撞适配镜像，网络、存档和运行时 MaterialCell 读写已由 FieldChunk 承担 |
+| `core::field` | 已新增 `FieldChunk`、`Column::{Spans,Dense}`、`Span` 与 `Chunk` 双向转换，并由 `server::World` 同步维护；OPFS、网络快照和 `World::get_cell_world/set_cell` 均使用 FieldChunk / MaterialCell 语义；`free_object_refs` 由运行时 active object 表重建 | 后续扩展 column delta 和 region hash |
+| `core::object` | `FreeObject`、`ObjectSample`、`MaterialSummary`、`CollisionProxy` 与 `FreeObjectState`；`ObjectSample` 保存完整 `MaterialCell`，并保留旧 `material/mass` 字段兼容 active object 存档 | 后续扩展旋转、碰撞代理和碎裂/降级状态 |
 | `core::protocol` | bincode 消息、FieldRequest、FieldSnapshot、FieldDelta、BlockID 操作请求 | 扩展为 ApplyKernel、FreeObject 状态和投影事件 |
-| `server::world` | `HashMap<ChunkPos, Chunk>`、`field_chunks` MaterialField 镜像、`free_objects` 投影记录、地形、dirty、LRU | 后续让 FieldChunk 替代 Chunk 成为运行时主格式，并持有 active FreeObject 模拟队列 |
+| `server::world` | `field_chunks` MaterialField、同步 dense `chunks` 镜像、active `free_objects`、地形、dirty、LRU；运行时读写入口已是 `get_cell_world/set_cell` | 后续进一步减少旧 BlockID 调用面，并细化 active FreeObject 模拟队列 |
 | `server::physics` | 挖放范围、方块状态、玩家 AABB 重叠校验；已实现 `ImmediateRelaxation` 软材质局部下落/滑落和 `FloatingOnly` 小硬材质连通块即时提取/投影 | 后续扩展质量守恒 kernel、可见刚体运动和更细支撑图 |
 | `render::chunk_mesh` | 硬方块贪婪网格化、透明方块网格、`SmoothGranular` 高度场平滑提面 | 后续扩展为更完整 extractor 集合：blocky / smooth Surface Nets 或 Marching Cubes / fluid / object mesh |
 | `client::physics` | 玩家 AABB 分轴碰撞、本地预测；`SmoothGranular` 使用共享高度场做客户端碰撞 | 保留角色控制器，后续查询更完整统一世界碰撞代理 |
 | `client::raycast` | DDA 命中 solid 方块；`SmoothGranular` 使用共享高度场做精确命中 | 后续扩展为更完整平滑材质 field ray query |
 | `client::mesh_jobs` | 分帧 chunk mesh 任务队列 | 继续承载各 extractor 的分帧预算 |
-| `client::storage` | OPFS chunk 读写 | 存储 FieldChunk、FreeObject、schema 版本 |
+| `client::storage` | OPFS chunk 读写；`world.json.active_free_objects` 保存跨 tick active FreeObject | 后续扩展 schema 迁移、对象压缩和损坏修复 |
 | `net` | WebRTC / WS 中继字节通道 | 仍只负责传输，不理解世界语义 |
 
 这个结构支持“统一世界层在 `core`/`server`，表现层在 `render`，编排和预测在 `client`”的分层方式。方案需要重写数据模型，但不需要打破 crate 的所有权边界。
@@ -435,6 +435,18 @@ resolution:
   impulse / friction / damping / fragmentation
 ```
 
+**重要约束**：FreeObject 的动画必须来自同一个权威动态状态，不能是已经投影后的纯视觉补间。也就是说，渲染位置、碰撞箱、raycast 命中、玩家碰撞和最终投影都要读取同一个 `FreeObject.transform` / `collision_proxy`。
+
+第一版升级路径不需要一步到位做完整刚体，可以先做“可见 AABB 动态体”：
+
+1. `FreeObjectSpawn`：支撑失败时，从 `MaterialField` 移除 component，生成 active `FreeObject`，广播样本 cell、初始 transform、AABB、速度和材质摘要。
+2. `FreeObjectState`：Host / Local-Only 每个逻辑 tick 推进动态对象；Remote 应用权威状态，不自己决定落点。
+3. **碰撞箱真实存在**：玩家 AABB、raycast、放置校验和其它 FreeObject broadphase 都把 active FreeObject AABB 纳入查询；客户端预测可提前显示，但最终以 Host 状态为准。
+4. **静止判定**：速度低于阈值、接触稳定面且一段时间内不再移动后，进入 `Settled`，再执行投影。
+5. `FreeObjectProject`：只在动态物体真正静止后发送；投影 delta 是生命周期结束事件，而不是动画的起点。
+
+这样“动画”只是动态物体状态随时间变化的可见结果。下落、滑动、撞击、反弹、碎裂都应从模拟层产生；如果某一类效果还没有模拟，就不要用无碰撞的视觉特效假装已经存在。
+
 凝聚力控制碎裂：
 
 | 凝聚力 | 动态行为 |
@@ -450,9 +462,9 @@ resolution:
 FreeObject 静止后不能简单“写入最近格点”，否则会产生穿插、质量丢失和体积漂移。投影必须是一个明确算法：
 
 1. 根据 transform 把 sample 转到世界空间。
-2. 使用 splatting 权重分配到附近 cell。
-3. 检查每个目标 cell 的剩余容量。
-4. 与硬材质冲突时优先反弹、滑落或寻找邻近空位，不直接覆盖。
+2. 第一版整格 sample 使用 round 后目标 cell，并在附近 Y 偏移内寻找可投影空位；后续更细颗粒/碎裂再使用 splatting 权重分配到附近 cell。
+3. 检查每个目标 cell 的剩余容量；第一版要求目标 cell 为空，不覆盖已有静态场。
+4. 与硬材质冲突时优先保留 active object 等待下一 tick，后续可扩展为反弹、滑落或碎裂。
 5. 写入后对局部区域运行松弛和稳定性检查。
 6. 若仍有无法容纳的质量，保留为小 FreeObject 或拒绝静止。
 
@@ -533,7 +545,7 @@ struct StabilityComponent {
 |---|---|---|
 | HardBlocky | blocky greedy / face meshing | 保留笔直方块、锐边、低成本 |
 | SmoothGranular | 当前共享高度场平滑提面 / raycast / 选中 / 客户端碰撞；后续 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
-| RigidBreakable FreeObject | 当前客户端投影短动画；后续 local mesh cache + transform | 动态岩块、碎块 |
+| RigidBreakable FreeObject | 当前 active AABB sample cube 渲染；后续 local mesh cache + transform | 动态岩块、碎块 |
 | Fluid | future fluid surface extractor + transparent pass | 水面、透明排序、波动；第一版水只做静态透明占位 |
 | Mixed boundary | priority / blend / seam resolver | 处理硬软交界 |
 
@@ -561,6 +573,75 @@ struct StabilityComponent {
 | 稳定性 | cell graph / support graph |
 
 这样既保留玩法稳定性，也不牺牲统一世界语义。
+
+### 9.4 FreeObject 的碰撞与渲染一致性
+
+当前代码中的硬材质坍落已从“服务端立即投影 + 客户端短动画”升级为 active AABB 动态体。运动中的石块会挡住玩家、可被 raycast 命中，并且放置校验不会允许新方块写入 active object 当前体积。当前第一版仍只做平移、重力、静态场接触和最终投影，不做旋转、反弹或碎裂。active FreeObject 纳入世界查询：
+
+```rust
+struct WorldQuery {
+    static_field: MaterialField,
+    active_objects: SpatialIndex<ObjectID, Aabb>,
+}
+
+enum QueryHit {
+    StaticCell(Position),
+    FreeObject(ObjectID),
+}
+```
+
+查询规则：
+
+- 玩家移动先做静态场碰撞，再查询 active FreeObject AABB；若碰到正在下落的硬对象，按动态对象表面吸附或推开。
+- raycast 先比较静态 cell 命中距离和 FreeObject AABB / hull 命中距离，返回最近命中。
+- 放置校验不能把方块放进 active FreeObject 当前占用体积。
+- 投影前的 FreeObject 不应同时存在于静态场中，否则会出现“看见一个在动的块，但碰撞在终点”的双重真相。
+
+第一版可接受的简化：
+
+- FreeObject 只有平移，没有旋转。
+- 碰撞代理先用 component AABB 或 sample-cloud AABB，不做 convex hull。
+- 只处理重力、地面接触、简单滑动和阻尼；反弹、碎裂延后。
+- 每 tick 限制 active object 数和 sample 数；超预算对象可以直接走静态沉积近似，但必须明确标记为降级路径。
+
+### 9.5 软材质平滑度与自然地形
+
+草、土、沙看起来不够平滑有两个不同原因：
+
+1. **自然地形高度太陡**：当前地形是单通道 Perlin 直接映射高度，缺少坡度限制、侵蚀感和平原/丘陵分区。即使平滑 extractor 工作正常，相邻列高度差过大时仍会产生台阶和陡墙。
+2. **当前 SmoothGranular 仍以满格 cell 为输入**：高度场只在可见顶部做插值，底层质量仍是 1m 整格；没有半格 occupancy、column mass 或真正的 Surface Nets，因此在侧面、硬软交界和悬崖处仍会暴露格子结构。
+
+地形生成应先降低“格子台阶”的输入压力：
+
+- 使用低频 fBm 叠加，而不是单一 Perlin 高度；高频项只做小幅细节。
+- 对高度图做局部坡度限制或轻量 thermal erosion，让草/土列之间的高度差更常落在 0..1m。
+- 生成平原、丘陵、山地分区；默认出生点附近偏平缓，山地放到远处或特定 biome。
+- 草不应作为整格体积独立堆叠；更合理的是“泥土主体 + 顶部草层/表面材质”，草面只影响纹理、颜色和 raycast 命中材质。
+
+提面层再继续升级：
+
+- 以 column top height / occupancy cache 作为 SmoothGranular 输入，而不是只看 `BlockID` 是否存在。
+- 顶面跨 cell 合并生成连续三角网，侧面使用 skirt 或 seam resolver 接硬材质。
+- 法线从邻域高度梯度计算，并做材质相关平滑；土/草可以更圆润，沙可保留略尖的堆积脊。
+- 纹理和颜色加入低频宏观变化，避免每个 1m cell 的图案重复暴露网格。
+
+### 9.6 “仍然像一格一格方块”是不是问题
+
+这不是单一的是/否问题。统一体素方案应区分**权威原子**和**视觉原子**：
+
+- 对石头、石砖、木头、玻璃等建筑硬材质，方块感是产品特性。玩家需要清楚的 1m 模数、可预测放置和可靠建筑边界。
+- 对草、土、沙、雪、水和自然地形，明显的一格一格视觉通常是问题。它会削弱“软材质”和“自然地貌”的可信度。
+- 对交互和网络，cell 仍然是合理权威单位。消除视觉网格不等于取消 cell；它意味着 extractor、碰撞代理和材质贴图不再把 cell 边界原样暴露出来。
+
+因此目标不是“全世界都不再像体素”，而是：
+
+| 区域 | 应保留方块感 | 应隐藏方块感 |
+|---|---|---|
+| 玩家建筑、硬材质、选中框、快捷栏预期 | 是 | 否 |
+| 自然草地、土坡、沙堆、未来水面 | 否 | 是 |
+| 地下石层、人工挖掘断面 | 部分保留 | 只在软材质断面弱化 |
+
+如果后续发现自然地形仍强烈读成“每格一个方块”，优先调地形坡度、软材质 occupancy 和提面/贴图，而不是把硬建筑也强行改成 Marching Cubes。
 
 ---
 
@@ -628,7 +709,7 @@ struct FluidCell {
 | StabilityEvent | 坍塌、提取、沉积等权威事件 |
 | FreeObjectSpawn | 创建动态材质团 |
 | FreeObjectState | 低频权威状态、位置、速度、旋转 |
-| FreeObjectProject | 动态物体投影回静态场；第一版已用于硬材质小连通块即时投影同步 |
+| FreeObjectProject | 动态物体静止后投影回静态场 |
 
 ### 12.2 量化
 
@@ -682,7 +763,7 @@ struct FieldChunkRecord {
 
 - `MaterialID` 的稳定编号和迁移规则。
 - FieldChunk 编码版本。
-- FreeObject 是否必须立即落盘，还是可在保存时强制投影。
+- active FreeObject 当前保存为 `world.json.active_free_objects`，chunk 文件保存移除动态对象后的静态场；sample 保存完整 `MaterialCell`，保存时不强制投影。
 - 未来流体 cell 是否保存完整状态，还是从 volume 重新求解 velocity。
 - 存档加载后是否需要重新运行稳定性检查。
 
@@ -744,23 +825,25 @@ struct FieldChunkRecord {
 
 2. **单 chunk extractor 原型**
    - 已有 blocky extractor 和 `SmoothGranular` 高度场平滑提面并存。
-   - 后续把高度场提面升级为 Surface Nets / Marching Cubes，并测量 CPU 时间、mesh 大小、边界缝。
-   - 重点测试硬软交界。
+   - 先把自然地形高度输入调平缓：低频 fBm、坡度限制、出生点平缓区和轻量 erosion；否则 extractor 再平滑也会被陡峭高度场逼出台阶。
+   - 后续把高度场提面升级为 column height / occupancy 驱动的连续提面，再评估 Surface Nets / Marching Cubes 是否必要，并测量 CPU 时间、mesh 大小、边界缝。
+   - 重点测试硬软交界、草层作为表面材质而不是整格体积、以及远处自然地形是否仍暴露 1m 网格。
 
 3. **创造模式编辑**
    - 放置 kernel、挖掘 kernel、外部无限材料源/汇。
    - 明确 overflow、混合和拒绝规则。
 
 4. **颗粒松弛**
-   - 已有 BlockID 过渡原型：沙/土/草放置或被挖空下方支撑后，会在 Host / Local-Only 权威侧按小预算局部下落或向斜下滑落。
-   - 当前通过多条 `FieldDelta` 同步结果；后续加 column delta / region hash 纠偏。
+   - 已有 MaterialCell 路径：沙/土/草放置或被挖空下方支撑后，会在 Host / Local-Only 权威侧按小预算局部下落或向斜下滑落。
+   - 当前通过多条 `FieldDelta` 同步完整 cell；后续加 column delta / region hash 纠偏。
    - 后续加滞后阈值和更真实的休止角模型避免抖动。
 
 5. **FreeObject 生命周期**
-   - 已有第一版：小型 `FloatingOnly` 硬材质连通块失去支撑后，从静态场提取为 `FreeObject` 记录，整体下落到最近支撑面，并在同一权威步骤投影回 `MaterialField`。
-   - 投影结果通过 `FreeObjectProject { object_id, deltas }` 广播；客户端应用 delta、重网格化受影响 chunk，并从 delta 配对旧/新位置播放约 320ms 的短时下落动画。
-   - 尚未实现权威可见刚体飞行、碰撞反弹、碎裂和低频 FreeObject 网络状态。
-   - 后续把即时投影替换为分帧动态过程。
+   - 已有第一版：小型 `FloatingOnly` 硬材质连通块失去支撑后，从静态场提取为 active `FreeObject`。
+   - `FreeObjectSpawn` 移除静态 cell，`FreeObjectState` 同步动态 transform / velocity / AABB，`FreeObjectProject` 只在静止后发送；Spawn/Project 携带完整 `MaterialCell`。
+   - 客户端直接渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验；不再播放投影后的假下落动画。
+   - OPFS 保存 active object 本体到 `world.json`，加载时恢复 `World::free_objects` 并重建 `FieldChunk.free_object_refs`。
+   - 第一版动态体只做平移 AABB、重力、地面接触和最终投影；碰撞反弹、旋转、碎裂后续扩展。
 
 6. **结构完整性**
    - 局部 support graph。
@@ -768,7 +851,7 @@ struct FieldChunkRecord {
    - 崩塌事件可重复、可同步。
 
 7. **多人同步语义**
-   - 已有操作 ack、FieldSnapshot、FieldDelta 和 FreeObjectProject。
+   - 已有操作 ack、FieldSnapshot、FieldDelta 和 FreeObjectSpawn/State/Project；Remote 预测备份和回滚使用完整 `MaterialCell`。
    - Host 仲裁坍塌、提取和投影。
    - Remote 预测和回滚。
 
@@ -783,11 +866,15 @@ struct FieldChunkRecord {
 1. **MaterialCell 的通道数量**：`primary + secondary` 是否足够？是否需要 per-cell small palette？
 2. **硬软交界提面**：blocky mesh 与 smooth mesh 如何无缝连接？
 3. **支撑图成本**：局部 component 分析在大建筑或大山体上如何限流？
-4. **投影质量守恒**：当前硬材质即时投影只处理整格且目标可容纳的下落；后续 FreeObject 静止后无法完全写入时如何处理？
-5. **混合材质规则**：未来沙 + 水、土 + 水、岩石 + 矿物如何表达？
-6. **存档版本**：MaterialID 变化后旧世界如何迁移？
-7. **网络纠偏**：FieldDelta 丢失或乱序时如何用 region hash 修复？
-8. **性能预算**：单线程 WASM 下 extractor、稳定性、颗粒松弛如何分帧？
+4. **动态 FreeObject 成本**：active object 数量、sample 数和状态同步频率如何限流？超预算时如何降级但不破坏质量守恒？
+5. **动态碰撞查询**：玩家碰撞、raycast、放置校验和稳定性检查如何统一查询静态场 + active FreeObject？
+6. **投影质量守恒**：当前 active FreeObject 静止后仍只处理整格且目标可容纳的投影；后续 FreeObject 无法完全写入时如何处理？
+7. **自然地形平滑度**：地形生成器、软材质 occupancy 和 extractor 哪一层负责消除草/土/沙的 1m 台阶感？
+8. **视觉方块感边界**：哪些材质必须保留清晰格子，哪些材质必须隐藏格子，混合区域如何过渡？
+9. **混合材质规则**：未来沙 + 水、土 + 水、岩石 + 矿物如何表达？
+10. **存档版本**：MaterialID 变化后旧世界如何迁移？
+11. **网络纠偏**：FieldDelta / FreeObjectState 丢失或乱序时如何用 region hash 修复？
+12. **性能预算**：单线程 WASM 下 extractor、稳定性、颗粒松弛和动态对象如何分帧？
 
 ---
 

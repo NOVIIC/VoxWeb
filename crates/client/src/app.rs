@@ -14,8 +14,6 @@ use std::rc::Rc;
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
-use voxweb_core::block::BlockID;
-use voxweb_core::chunk::Position;
 use voxweb_core::protocol::EntityId;
 use voxweb_net::{NetEndpoint, NetError, ServerInbox};
 use voxweb_server::Server;
@@ -43,30 +41,6 @@ pub struct PreloadState {
     pub meshed: usize,
     /// 预载阶段是否进行中。
     pub active: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct FreeObjectCellAnimation {
-    pub from: Position,
-    pub to: Position,
-    pub block: BlockID,
-}
-
-#[derive(Clone, Debug)]
-pub struct FreeObjectProjectionAnimation {
-    pub started_at_ms: f64,
-    pub duration_ms: f64,
-    pub cells: Vec<FreeObjectCellAnimation>,
-}
-
-impl FreeObjectProjectionAnimation {
-    pub fn progress(&self, now_ms: f64) -> f32 {
-        ((now_ms - self.started_at_ms) / self.duration_ms).clamp(0.0, 1.0) as f32
-    }
-
-    pub fn is_finished(&self, now_ms: f64) -> bool {
-        self.progress(now_ms) >= 1.0
-    }
 }
 
 /// 应用全局状态。
@@ -330,8 +304,6 @@ pub struct Game {
     pub remote_players: HashMap<EntityId, RemotePlayerState>,
     /// 远端玩家位置插值器（PlayerTick 摄入，每渲染帧 advance）。
     pub interp: PlayerInterp,
-    /// FreeObjectProject 的短时可见下落动画。权威结果仍是 Host 的投影 delta。
-    pub free_object_animations: Vec<FreeObjectProjectionAnimation>,
     /// Chunk 快照接收组装器（Remote 端用，Host/Local 闲置）。
     pub chunk_assembler: ChunkAssembler,
     /// 本地生成的 PlayerInput 序号。Remote 模式也独立递增，不能借用本地 dummy server tick。
@@ -507,7 +479,6 @@ impl Game {
             // Phase 5
             remote_players: HashMap::new(),
             interp,
-            free_object_animations: Vec::new(),
             chunk_assembler: ChunkAssembler::new(),
             local_input_tick: 0,
             input_history: InputHistory::new(120),

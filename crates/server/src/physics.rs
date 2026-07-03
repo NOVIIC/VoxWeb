@@ -7,9 +7,10 @@ use std::collections::{HashSet, VecDeque};
 
 use glam::Vec3;
 
-use voxweb_core::block::{BlockID, StabilityPolicy, properties};
+use voxweb_core::block::{BlockID, MaterialCell, StabilityPolicy, properties};
 use voxweb_core::chunk::{CHUNK_Y, Position};
 use voxweb_core::geometry::{Aabb, PLAYER_EYE_OFFSET, player_aabb};
+use voxweb_core::object::FreeObjectState;
 use voxweb_core::protocol::AckReason;
 
 use super::world::World;
@@ -22,11 +23,33 @@ const RELAXATION_MOVE_BUDGET: usize = 64;
 const RELAXATION_VISIT_BUDGET: usize = 256;
 /// 单次稳定性检查最多提取多少个硬材质 cell。超过后视为大型地形/建筑，保持静态。
 const FLOATING_COMPONENT_CELL_LIMIT: usize = 4096;
+const FREE_OBJECT_DT: f32 = 1.0 / 60.0;
+const FREE_OBJECT_GRAVITY: f32 = -32.0;
+const FREE_OBJECT_TERMINAL_VELOCITY: f32 = -78.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreeObjectSpawn {
+    pub object_id: voxweb_core::ObjectID,
+    pub cells: Vec<(Position, MaterialCell)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreeObjectStateUpdate {
+    pub object_id: voxweb_core::ObjectID,
+    pub position: Vec3,
+    pub velocity: Vec3,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FreeObjectTickEvents {
+    pub states: Vec<FreeObjectStateUpdate>,
+    pub projections: Vec<FreeObjectProjection>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreeObjectProjection {
     pub object_id: voxweb_core::ObjectID,
-    pub deltas: Vec<(Position, BlockID)>,
+    pub deltas: Vec<(Position, MaterialCell)>,
 }
 
 /// 验证一次挖掘操作。
@@ -41,12 +64,12 @@ pub fn validate_break(world: &World, pos: Position, player_feet: Vec3) -> AckRea
     if pos.y == 0 {
         return AckReason::BlockNotEmpty;
     }
-    let block = world.get_block(pos);
-    if block == BlockID::AIR {
+    let cell = world.get_cell(pos);
+    if cell.is_empty() {
         // 试图挖空气：复用 BlockNotEmpty 语义表达 "目标方块状态不允许操作"
         return AckReason::BlockNotEmpty;
     }
-    if !properties(block).breakable {
+    if !properties(cell.primary).breakable {
         return AckReason::BlockNotEmpty;
     }
     AckReason::Ok
@@ -71,7 +94,15 @@ pub fn validate_place(
     if block == BlockID::AIR || !properties(block).appears_in_hotbar {
         return AckReason::BlockNotEmpty;
     }
-    if world.get_block(pos) != BlockID::AIR {
+    if !world.get_cell(pos).is_empty() {
+        return AckReason::BlockNotEmpty;
+    }
+    let target_aabb = Aabb::block_at(pos);
+    if world
+        .dynamic_object_aabbs()
+        .iter()
+        .any(|dynamic_aabb| target_aabb.intersects(dynamic_aabb))
+    {
         return AckReason::BlockNotEmpty;
     }
     if player_aabb(player_feet).intersects(&Aabb::block_at(pos)) {
@@ -89,9 +120,9 @@ fn distance_to_block_center(player_feet: Vec3, pos: Position) -> f32 {
 
 /// 挖放后立即运行一小段局部颗粒松弛。
 ///
-/// 当前仍基于 `BlockID` dense chunk 做过渡实现：`ImmediateRelaxation` 材质会优先竖直下落，
-/// 受阻后尝试向斜下方滑落。返回值是需要广播给客户端的权威 `FieldDelta` 序列。
-pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, BlockID)> {
+/// `ImmediateRelaxation` 材质会优先竖直下落，受阻后尝试向斜下方滑落。
+/// 返回值是需要广播给客户端的权威 `FieldDelta` 序列。
+pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, MaterialCell)> {
     let mut updates = Vec::new();
     let mut queue = VecDeque::new();
 
@@ -105,14 +136,14 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, B
         }
         visited += 1;
 
-        let Some((from, to, block)) = try_relax_one(world, pos) else {
+        let Some((from, to, cell)) = try_relax_one(world, pos) else {
             continue;
         };
         moves += 1;
-        world.set_block(from, BlockID::AIR);
-        world.set_block(to, block);
-        updates.push((from, BlockID::AIR));
-        updates.push((to, block));
+        world.set_cell(from, MaterialCell::EMPTY);
+        world.set_cell(to, cell);
+        updates.push((from, MaterialCell::EMPTY));
+        updates.push((to, cell));
 
         enqueue_relaxation_region(&mut queue, from);
         enqueue_relaxation_region(&mut queue, to);
@@ -122,20 +153,17 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, B
 }
 
 /// 第一版硬材质稳定性：`FloatingOnly` 连通块如果完全没有接触任何稳定材质，
-/// 就作为一个 FreeObject 提取、下落到最近支撑面，并立即投影回静态场。
-pub fn resolve_floating_after_edit(
-    world: &mut World,
-    origin: Position,
-) -> Vec<FreeObjectProjection> {
-    let mut projections = Vec::new();
+/// 就从静态场提取为 active FreeObject，后续由 tick 中的 AABB 动态体推进。
+pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectSpawn> {
+    let mut spawns = Vec::new();
     let mut checked = HashSet::new();
 
     for candidate in floating_candidates(origin) {
         if checked.contains(&candidate) || !chunk_loaded(world, candidate) {
             continue;
         }
-        let block = world.get_block(candidate);
-        if properties(block).stability != StabilityPolicy::FloatingOnly {
+        let cell = world.get_cell(candidate);
+        if properties(cell.primary).stability != StabilityPolicy::FloatingOnly {
             continue;
         }
         let Some(component) = collect_floating_component(world, candidate, &mut checked) else {
@@ -145,32 +173,88 @@ pub fn resolve_floating_after_edit(
             continue;
         }
 
-        let component_positions = component
-            .iter()
-            .map(|(pos, _)| *pos)
-            .collect::<HashSet<_>>();
-        let fall = projected_fall_distance(world, &component, &component_positions);
-        if fall <= 0 {
-            continue;
-        }
-
-        let Some(object_id) = world.record_projected_free_object(&component, -fall) else {
+        let Some(object_id) = world.spawn_dynamic_free_object(&component) else {
             continue;
         };
-        let mut deltas = Vec::with_capacity(component.len() * 2);
         for (pos, _) in &component {
-            world.set_block(*pos, BlockID::AIR);
-            deltas.push((*pos, BlockID::AIR));
+            world.set_cell(*pos, MaterialCell::EMPTY);
         }
-        for (pos, block) in &component {
-            let target = Position::new(pos.x, pos.y - fall, pos.z);
-            world.set_block(target, *block);
-            deltas.push((target, *block));
-        }
-        projections.push(FreeObjectProjection { object_id, deltas });
+        spawns.push(FreeObjectSpawn {
+            object_id,
+            cells: component,
+        });
     }
 
-    projections
+    spawns
+}
+
+pub fn tick_free_objects(world: &mut World) -> FreeObjectTickEvents {
+    let ids = world
+        .free_objects
+        .iter()
+        .filter_map(|(id, object)| (object.state == FreeObjectState::Dynamic).then_some(*id))
+        .collect::<Vec<_>>();
+    let mut events = FreeObjectTickEvents::default();
+    let mut refs_dirty = false;
+
+    for id in ids {
+        let Some(mut object) = world.free_objects.get(&id).cloned() else {
+            continue;
+        };
+
+        object.velocity.y = (object.velocity.y + FREE_OBJECT_GRAVITY * FREE_OBJECT_DT)
+            .max(FREE_OBJECT_TERMINAL_VELOCITY);
+        let next_position = object.transform.position + object.velocity * FREE_OBJECT_DT;
+
+        if static_collides_with_object(world, &object, next_position) {
+            let settled_position =
+                settle_position(world, &object, object.transform.position, next_position);
+            let Some(project_position) =
+                find_projectable_position(world, &object, settled_position)
+            else {
+                if let Some(stored) = world.free_objects.get_mut(&id) {
+                    stored.velocity = Vec3::ZERO;
+                    stored.transform.position = object.transform.position;
+                    events.states.push(FreeObjectStateUpdate {
+                        object_id: id,
+                        position: stored.transform.position,
+                        velocity: stored.velocity,
+                    });
+                }
+                continue;
+            };
+            let cells = object.cells_at_position(project_position);
+            let mut deltas = Vec::with_capacity(cells.len());
+            for (pos, cell) in cells {
+                world.set_cell(pos, cell);
+                deltas.push((pos, cell));
+            }
+            world.free_objects.remove(&id);
+            refs_dirty = true;
+            events.projections.push(FreeObjectProjection {
+                object_id: id,
+                deltas,
+            });
+            continue;
+        }
+
+        if let Some(stored) = world.free_objects.get_mut(&id) {
+            stored.velocity = object.velocity;
+            stored.transform.position = next_position;
+            events.states.push(FreeObjectStateUpdate {
+                object_id: id,
+                position: next_position,
+                velocity: object.velocity,
+            });
+            refs_dirty = true;
+        }
+    }
+
+    if refs_dirty {
+        world.rebuild_free_object_refs();
+    }
+
+    events
 }
 
 fn floating_candidates(origin: Position) -> [Position; 11] {
@@ -193,7 +277,7 @@ fn collect_floating_component(
     world: &World,
     start: Position,
     checked: &mut HashSet<Position>,
-) -> Option<Vec<(Position, BlockID)>> {
+) -> Option<Vec<(Position, MaterialCell)>> {
     let mut component = Vec::new();
     let mut queue = VecDeque::from([start]);
 
@@ -204,11 +288,11 @@ fn collect_floating_component(
         if !chunk_loaded(world, pos) {
             continue;
         }
-        let block = world.get_block(pos);
-        if properties(block).stability != StabilityPolicy::FloatingOnly {
+        let cell = world.get_cell(pos);
+        if properties(cell.primary).stability != StabilityPolicy::FloatingOnly {
             continue;
         }
-        component.push((pos, block));
+        component.push((pos, cell));
         if component.len() > FLOATING_COMPONENT_CELL_LIMIT {
             return None;
         }
@@ -222,7 +306,7 @@ fn collect_floating_component(
     Some(component)
 }
 
-fn component_is_supported(world: &World, component: &[(Position, BlockID)]) -> bool {
+fn component_is_supported(world: &World, component: &[(Position, MaterialCell)]) -> bool {
     let positions = component
         .iter()
         .map(|(pos, _)| *pos)
@@ -232,32 +316,10 @@ fn component_is_supported(world: &World, component: &[(Position, BlockID)]) -> b
             if positions.contains(&neighbor) || neighbor.y < 0 || neighbor.y >= CHUNK_Y as i32 {
                 return false;
             }
-            let block = world.get_block(neighbor);
-            block != BlockID::AIR && properties(block).solid
+            let cell = world.get_cell(neighbor);
+            !cell.is_empty() && properties(cell.primary).solid
         })
     })
-}
-
-fn projected_fall_distance(
-    world: &World,
-    component: &[(Position, BlockID)],
-    component_positions: &HashSet<Position>,
-) -> i32 {
-    let mut distance = 0;
-    'fall: loop {
-        let next = distance + 1;
-        for (pos, _) in component {
-            let target = Position::new(pos.x, pos.y - next, pos.z);
-            if target.y <= 0 || !chunk_loaded(world, target) {
-                break 'fall;
-            }
-            if !component_positions.contains(&target) && world.get_block(target) != BlockID::AIR {
-                break 'fall;
-            }
-        }
-        distance = next;
-    }
-    distance
 }
 
 fn six_neighbors(pos: Position) -> [Position; 6] {
@@ -269,6 +331,83 @@ fn six_neighbors(pos: Position) -> [Position; 6] {
         Position::new(pos.x, pos.y, pos.z + 1),
         Position::new(pos.x, pos.y, pos.z - 1),
     ]
+}
+
+fn static_collides_with_object(
+    world: &World,
+    object: &voxweb_core::FreeObject,
+    position: Vec3,
+) -> bool {
+    let aabb = object.aabb_at(position);
+    let min_x = aabb.min.x.floor() as i32;
+    let max_x = (aabb.max.x - f32::EPSILON).floor() as i32;
+    let min_y = aabb.min.y.floor() as i32;
+    let max_y = (aabb.max.y - f32::EPSILON).floor() as i32;
+    let min_z = aabb.min.z.floor() as i32;
+    let max_z = (aabb.max.z - f32::EPSILON).floor() as i32;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                if y <= 0 || y >= CHUNK_Y as i32 {
+                    return true;
+                }
+                let cell = world.get_cell(Position::new(x, y, z));
+                if !cell.is_empty() && properties(cell.primary).solid {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn settle_position(
+    world: &World,
+    object: &voxweb_core::FreeObject,
+    start: Vec3,
+    blocked: Vec3,
+) -> Vec3 {
+    let mut lo = blocked.y;
+    let mut hi = start.y;
+    for _ in 0..10 {
+        let mid = (lo + hi) * 0.5;
+        let pos = Vec3::new(start.x, mid, start.z);
+        if static_collides_with_object(world, object, pos) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Vec3::new(start.x, hi.round(), start.z)
+}
+
+fn find_projectable_position(
+    world: &World,
+    object: &voxweb_core::FreeObject,
+    settled: Vec3,
+) -> Option<Vec3> {
+    let rounded = Vec3::new(settled.x.round(), settled.y.round(), settled.z.round());
+    for dy in [0.0, 1.0, -1.0, 2.0, -2.0, 3.0] {
+        let candidate = rounded + Vec3::Y * dy;
+        if projection_cells_clear(world, object, candidate)
+            && !static_collides_with_object(world, object, candidate)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn projection_cells_clear(world: &World, object: &voxweb_core::FreeObject, position: Vec3) -> bool {
+    object
+        .cells_at_position(position)
+        .into_iter()
+        .all(|(pos, _)| {
+            pos.y > 0
+                && pos.y < CHUNK_Y as i32
+                && chunk_loaded(world, pos)
+                && world.get_cell(pos).is_empty()
+        })
 }
 
 fn enqueue_relaxation_region(queue: &mut VecDeque<Position>, origin: Position) {
@@ -288,7 +427,7 @@ fn enqueue_relaxation_region(queue: &mut VecDeque<Position>, origin: Position) {
     }
 }
 
-fn try_relax_one(world: &World, pos: Position) -> Option<(Position, Position, BlockID)> {
+fn try_relax_one(world: &World, pos: Position) -> Option<(Position, Position, MaterialCell)> {
     if pos.y <= 1 || pos.y >= CHUNK_Y as i32 {
         return None;
     }
@@ -296,21 +435,21 @@ fn try_relax_one(world: &World, pos: Position) -> Option<(Position, Position, Bl
         return None;
     }
 
-    let block = world.get_block(pos);
-    if properties(block).stability != StabilityPolicy::ImmediateRelaxation {
+    let cell = world.get_cell(pos);
+    if properties(cell.primary).stability != StabilityPolicy::ImmediateRelaxation {
         return None;
     }
 
     let down = Position::new(pos.x, pos.y - 1, pos.z);
     if can_receive_granular(world, down) {
-        return Some((pos, down, block));
+        return Some((pos, down, cell));
     }
 
-    for (dx, dz) in ordered_slide_dirs(pos, block) {
+    for (dx, dz) in ordered_slide_dirs(pos, cell.primary) {
         let side = Position::new(pos.x + dx, pos.y, pos.z + dz);
         let target = Position::new(pos.x + dx, pos.y - 1, pos.z + dz);
         if can_receive_granular(world, side) && can_receive_granular(world, target) {
-            return Some((pos, target, block));
+            return Some((pos, target, cell));
         }
     }
 
@@ -321,7 +460,7 @@ fn can_receive_granular(world: &World, pos: Position) -> bool {
     pos.y > 0
         && pos.y < CHUNK_Y as i32
         && chunk_loaded(world, pos)
-        && world.get_block(pos) == BlockID::AIR
+        && world.get_cell(pos).is_empty()
 }
 
 fn chunk_loaded(world: &World, pos: Position) -> bool {
@@ -520,8 +659,11 @@ mod tests {
 
         assert_eq!(w.get_block(Position::new(x, 65, z)), BlockID::AIR);
         assert_eq!(w.get_block(Position::new(x, 61, z)), BlockID::SAND);
-        assert!(updates.contains(&(Position::new(x, 65, z), BlockID::AIR)));
-        assert!(updates.contains(&(Position::new(x, 61, z), BlockID::SAND)));
+        assert!(updates.contains(&(Position::new(x, 65, z), MaterialCell::EMPTY)));
+        assert!(updates.contains(&(
+            Position::new(x, 61, z),
+            MaterialCell::from_block_id(BlockID::SAND)
+        )));
     }
 
     #[test]
@@ -542,6 +684,36 @@ mod tests {
         assert_eq!(w.get_block(Position::new(x, 62, z)), BlockID::AIR);
         assert_eq!(w.get_block(Position::new(x, 61, z)), BlockID::DIRT);
         assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
+    fn granular_relaxation_preserves_material_cell() {
+        let mut w = world_with_stone_chunk();
+        let from = Position::new(7, 62, 7);
+        let to = Position::new(7, 61, 7);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                w.set_block(Position::new(from.x + dx, 60, from.z + dz), BlockID::STONE);
+            }
+        }
+        w.set_cell(to, MaterialCell::EMPTY);
+        let cell = MaterialCell {
+            occupancy: 190,
+            primary: BlockID::SAND,
+            secondary: Some(voxweb_core::block::MixSlot {
+                material: BlockID::DIRT,
+                occupancy: 30,
+            }),
+            flags: voxweb_core::block::CellFlags(voxweb_core::block::CellFlags::DIRTY),
+        };
+        w.set_cell(from, cell);
+
+        let updates = relax_after_edit(&mut w, to);
+
+        assert_eq!(w.get_cell(from), MaterialCell::EMPTY);
+        assert_eq!(w.get_cell(to), cell);
+        assert!(updates.contains(&(from, MaterialCell::EMPTY)));
+        assert!(updates.contains(&(to, cell)));
     }
 
     #[test]
@@ -575,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_hard_block_projects_to_nearest_support() {
+    fn floating_hard_block_spawns_dynamic_object_then_projects() {
         let mut w = World::new(0);
         w.ensure_chunk_generated(ChunkPos::new(0, 0));
         clear_box(&mut w, 6..=10, 1..=8, 6..=10);
@@ -583,22 +755,31 @@ mod tests {
         let settled = Position::new(8, 1, 8);
         w.set_block(floating, BlockID::STONE_BRICKS);
 
-        let projections = resolve_floating_after_edit(&mut w, floating);
-        let updates = projection_deltas(&projections);
+        let spawns = resolve_floating_after_edit(&mut w, floating);
 
         assert_eq!(w.get_block(floating), BlockID::AIR);
-        assert_eq!(w.get_block(settled), BlockID::STONE_BRICKS);
-        assert!(updates.contains(&(floating, BlockID::AIR)));
-        assert!(updates.contains(&(settled, BlockID::STONE_BRICKS)));
-        assert_eq!(projections.len(), 1);
+        assert_eq!(w.get_block(settled), BlockID::AIR);
+        assert_eq!(spawns.len(), 1);
         assert_eq!(w.free_objects.len(), 1);
         let object = w.free_objects.values().next().unwrap();
         assert_eq!(object.samples.len(), 1);
-        assert_eq!(object.state, voxweb_core::FreeObjectState::Projected);
+        assert_eq!(object.state, voxweb_core::FreeObjectState::Dynamic);
+
+        let mut projected = Vec::new();
+        for _ in 0..90 {
+            let events = tick_free_objects(&mut w);
+            projected.extend(projection_deltas(&events.projections));
+            if !projected.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(w.get_block(settled), BlockID::STONE_BRICKS);
+        assert!(projected.contains(&(settled, MaterialCell::from_block_id(BlockID::STONE_BRICKS))));
+        assert!(w.free_objects.is_empty());
     }
 
     #[test]
-    fn floating_hard_component_projects_as_one_object() {
+    fn floating_hard_component_spawns_as_one_object() {
         let mut w = World::new(0);
         w.ensure_chunk_generated(ChunkPos::new(0, 0));
         clear_box(&mut w, 6..=11, 1..=8, 6..=10);
@@ -607,16 +788,13 @@ mod tests {
         w.set_block(a, BlockID::STONE_BRICKS);
         w.set_block(b, BlockID::WOOD);
 
-        let projections = resolve_floating_after_edit(&mut w, a);
-        let updates = projection_deltas(&projections);
+        let spawns = resolve_floating_after_edit(&mut w, a);
 
         assert_eq!(w.get_block(a), BlockID::AIR);
         assert_eq!(w.get_block(b), BlockID::AIR);
-        assert_eq!(w.get_block(Position::new(8, 1, 8)), BlockID::STONE_BRICKS);
-        assert_eq!(w.get_block(Position::new(9, 1, 8)), BlockID::WOOD);
-        assert!(updates.contains(&(Position::new(8, 1, 8), BlockID::STONE_BRICKS)));
-        assert!(updates.contains(&(Position::new(9, 1, 8), BlockID::WOOD)));
-        assert_eq!(projections.len(), 1);
+        assert_eq!(w.get_block(Position::new(8, 1, 8)), BlockID::AIR);
+        assert_eq!(w.get_block(Position::new(9, 1, 8)), BlockID::AIR);
+        assert_eq!(spawns.len(), 1);
         assert_eq!(w.free_objects.len(), 1);
         assert_eq!(w.free_objects.values().next().unwrap().samples.len(), 2);
     }
@@ -631,9 +809,9 @@ mod tests {
         w.set_block(base, BlockID::STONE_BRICKS);
         w.set_block(top, BlockID::STONE_BRICKS);
 
-        let projections = resolve_floating_after_edit(&mut w, top);
+        let spawns = resolve_floating_after_edit(&mut w, top);
 
-        assert!(projections.is_empty());
+        assert!(spawns.is_empty());
         assert_eq!(w.get_block(base), BlockID::STONE_BRICKS);
         assert_eq!(w.get_block(top), BlockID::STONE_BRICKS);
         assert!(w.free_objects.is_empty());
@@ -654,7 +832,7 @@ mod tests {
         }
     }
 
-    fn projection_deltas(projections: &[FreeObjectProjection]) -> Vec<(Position, BlockID)> {
+    fn projection_deltas(projections: &[FreeObjectProjection]) -> Vec<(Position, MaterialCell)> {
         projections
             .iter()
             .flat_map(|projection| projection.deltas.iter().copied())

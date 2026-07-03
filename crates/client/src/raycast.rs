@@ -7,6 +7,8 @@ use glam::{IVec3, Vec3};
 
 use voxweb_core::block::{BlockID, properties};
 use voxweb_core::chunk::Position;
+use voxweb_core::geometry::Aabb;
+use voxweb_core::object::ObjectID;
 use voxweb_core::{SmoothCellRef, is_smooth_granular, ray_intersect_smooth_cell};
 use voxweb_render::vertex::Face;
 
@@ -27,6 +29,17 @@ pub struct RaycastHit {
     pub point: Vec3,
     /// 精确表面法线。硬方块为轴向法线；软材质可为斜坡法线。
     pub surface_normal: Vec3,
+    /// 命中动态 FreeObject 时为 Some；静态 cell 命中时为 None。
+    pub object_id: Option<ObjectID>,
+    /// 动态对象当前 AABB。静态 cell 命中时为 None。
+    pub object_aabb: Option<Aabb>,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct DynamicObjectRaycast {
+    pub object_id: ObjectID,
+    pub aabb: Aabb,
+    pub block: BlockID,
 }
 
 /// 从 `origin` 沿 `direction` 发射射线，在 `max_distance` 内查找第一个 solid 方块。
@@ -34,6 +47,28 @@ pub struct RaycastHit {
 /// `get_block` 是世界坐标 → BlockID 的查询闭包（未加载/越界返回 AIR 即可）。
 /// 返回 None 表示射程内未命中任何 solid 方块。
 pub fn raycast(
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    dynamic_objects: &[DynamicObjectRaycast],
+) -> Option<RaycastHit> {
+    let static_hit = raycast_static(origin, direction, max_distance, get_block);
+    let dynamic_hit = raycast_dynamic(origin, direction, max_distance, dynamic_objects);
+    match (static_hit, dynamic_hit) {
+        (Some(static_hit), Some(dynamic_hit)) => {
+            if dynamic_hit.distance < static_hit.distance {
+                Some(dynamic_hit)
+            } else {
+                Some(static_hit)
+            }
+        }
+        (Some(hit), None) | (None, Some(hit)) => Some(hit),
+        (None, None) => None,
+    }
+}
+
+fn raycast_static(
     origin: Vec3,
     direction: Vec3,
     max_distance: f32,
@@ -116,6 +151,8 @@ pub fn raycast(
             distance: 0.0,
             point: origin,
             surface_normal: Vec3::Y,
+            object_id: None,
+            object_aabb: None,
         });
     }
 
@@ -171,6 +208,8 @@ pub fn raycast(
                         distance: smooth_distance,
                         point: origin + dir * smooth_distance,
                         surface_normal,
+                        object_id: None,
+                        object_aabb: None,
                     });
                 }
                 continue;
@@ -183,8 +222,104 @@ pub fn raycast(
                 distance: traveled,
                 point: origin + dir * traveled,
                 surface_normal: normal.as_vec3(),
+                object_id: None,
+                object_aabb: None,
             });
         }
+    }
+}
+
+fn raycast_dynamic(
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+    dynamic_objects: &[DynamicObjectRaycast],
+) -> Option<RaycastHit> {
+    let dir = direction.normalize_or_zero();
+    if dir.length_squared() < 1e-8 {
+        return None;
+    }
+    dynamic_objects
+        .iter()
+        .filter_map(|object| {
+            let (distance, normal) = ray_aabb_hit(origin, dir, object.aabb)?;
+            if distance > max_distance {
+                return None;
+            }
+            let point = origin + dir * distance;
+            let face = face_from_normal(normal);
+            Some(RaycastHit {
+                pos: Position::new(
+                    object.aabb.min.x.floor() as i32,
+                    object.aabb.min.y.floor() as i32,
+                    object.aabb.min.z.floor() as i32,
+                ),
+                normal,
+                face,
+                block: object.block,
+                distance,
+                point,
+                surface_normal: normal.as_vec3(),
+                object_id: Some(object.object_id),
+                object_aabb: Some(object.aabb),
+            })
+        })
+        .min_by(|a, b| a.distance.total_cmp(&b.distance))
+}
+
+fn ray_aabb_hit(origin: Vec3, dir: Vec3, aabb: Aabb) -> Option<(f32, IVec3)> {
+    let mut t_min = 0.0f32;
+    let mut t_max = f32::INFINITY;
+    let mut normal = IVec3::Y;
+
+    for axis in 0..3 {
+        let o = origin[axis];
+        let d = dir[axis];
+        let mn = aabb.min[axis];
+        let mx = aabb.max[axis];
+        if d.abs() < 1e-6 {
+            if o < mn || o > mx {
+                return None;
+            }
+            continue;
+        }
+
+        let inv = 1.0 / d;
+        let mut t0 = (mn - o) * inv;
+        let mut t1 = (mx - o) * inv;
+        let mut axis_normal = match axis {
+            0 if d > 0.0 => IVec3::new(-1, 0, 0),
+            0 => IVec3::new(1, 0, 0),
+            1 if d > 0.0 => IVec3::new(0, -1, 0),
+            1 => IVec3::new(0, 1, 0),
+            2 if d > 0.0 => IVec3::new(0, 0, -1),
+            _ => IVec3::new(0, 0, 1),
+        };
+        if t0 > t1 {
+            std::mem::swap(&mut t0, &mut t1);
+            axis_normal = -axis_normal;
+        }
+        if t0 > t_min {
+            t_min = t0;
+            normal = axis_normal;
+        }
+        t_max = t_max.min(t1);
+        if t_min > t_max {
+            return None;
+        }
+    }
+
+    Some((t_min.max(0.0), normal))
+}
+
+fn face_from_normal(normal: IVec3) -> Face {
+    match (normal.x, normal.y, normal.z) {
+        (1, 0, 0) => Face::PosX,
+        (-1, 0, 0) => Face::NegX,
+        (0, 1, 0) => Face::PosY,
+        (0, -1, 0) => Face::NegY,
+        (0, 0, 1) => Face::PosZ,
+        _ => Face::NegZ,
     }
 }
 
@@ -272,6 +407,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             10.0,
             &getter,
+            &[],
         )
         .expect("应命中 (3,64,0)");
         assert_eq!(hit.pos, Position::new(3, 64, 0));
@@ -293,6 +429,7 @@ mod tests {
             Vec3::new(0.0, -1.0, 0.0),
             20.0,
             &getter,
+            &[],
         )
         .expect("应命中 (0,64,0)");
         assert_eq!(hit.pos, Position::new(0, 64, 0));
@@ -314,6 +451,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             6.0, // 远小于 100
             &getter,
+            &[],
         );
         assert!(hit.is_none());
     }
@@ -335,6 +473,7 @@ mod tests {
             Vec3::new(1.0, 0.0, 0.0),
             10.0,
             &getter,
+            &[],
         )
         .expect("应穿过 WATER 命中 STONE");
         assert_eq!(hit.pos, Position::new(3, 64, 0));
@@ -343,7 +482,7 @@ mod tests {
     #[test]
     fn raycast_zero_direction_returns_none() {
         let getter = single_block_at((0, 0, 0));
-        let hit = raycast(Vec3::new(0.5, 64.5, 0.5), Vec3::ZERO, 10.0, &getter);
+        let hit = raycast(Vec3::new(0.5, 64.5, 0.5), Vec3::ZERO, 10.0, &getter, &[]);
         assert!(hit.is_none());
     }
 
@@ -361,11 +500,33 @@ mod tests {
             Vec3::new(0.0, -1.0, 0.0),
             10.0,
             &getter,
+            &[],
         )
         .expect("应命中沙面");
         assert_eq!(hit.pos, Position::new(0, 64, 0));
         assert_eq!(hit.face, Face::PosY);
         assert!((hit.point.y - 65.0).abs() < 0.06, "point={:?}", hit.point);
         assert!(hit.surface_normal.y > 0.8);
+    }
+
+    #[test]
+    fn raycast_dynamic_object_wins_when_closer_than_static_block() {
+        let getter = single_block_at((5, 64, 0));
+        let dynamic = [DynamicObjectRaycast {
+            object_id: 9,
+            aabb: Aabb::new(Vec3::new(2.0, 64.0, 0.0), Vec3::new(3.0, 65.0, 1.0)),
+            block: BlockID::STONE_BRICKS,
+        }];
+        let hit = raycast(
+            Vec3::new(0.5, 64.5, 0.5),
+            Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+            &getter,
+            &dynamic,
+        )
+        .expect("应命中更近的动态对象");
+        assert_eq!(hit.object_id, Some(9));
+        assert_eq!(hit.block, BlockID::STONE_BRICKS);
+        assert!((hit.distance - 1.5).abs() < 1e-3);
     }
 }

@@ -31,17 +31,16 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
-use voxweb_core::block::BlockID;
+use voxweb_core::block::{BlockID, MaterialCell};
 use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
-use voxweb_core::{Aabb, is_smooth_granular, smooth_cell_top_height};
+use voxweb_core::{Aabb, FreeObjectState, is_smooth_granular, smooth_cell_top_height};
 use voxweb_render::{Renderer, VisualFrame};
 
 use crate::app::{
-    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, FreeObjectCellAnimation,
-    FreeObjectProjectionAnimation, Game, GameMode, PreloadState, RemotePlayerState,
+    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
 };
 use crate::browser::{
     now_ms, random_seed, read_query_param, set_room_in_url, signaling_url, sync_canvas_size,
@@ -54,7 +53,7 @@ use crate::mesh_jobs::MeshPriority;
 use crate::prediction::{
     PendingAction, PendingKind, ReconcileResult, apply_pending_position_correction, reconcile_self,
 };
-use crate::raycast::{RaycastHit, raycast};
+use crate::raycast::{DynamicObjectRaycast, RaycastHit, raycast};
 use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
@@ -72,6 +71,9 @@ const AUTO_SAVE_INTERVAL_MS: f64 = 3000.0;
 const AUTO_SAVE_BATCH_CHUNKS: usize = 4;
 
 fn selection_aabb_for_hit(get_block: &dyn Fn(i32, i32, i32) -> BlockID, hit: RaycastHit) -> Aabb {
+    if let Some(aabb) = hit.object_aabb {
+        return aabb;
+    }
     let min = glam::Vec3::new(hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32);
     if is_smooth_granular(hit.block) {
         let top = smooth_cell_top_height(get_block, hit.pos.x, hit.pos.y, hit.pos.z, hit.block);
@@ -94,38 +96,6 @@ fn block_animation_color(block: BlockID) -> [f32; 3] {
         BlockID::STONE_BRICKS => [0.42, 0.43, 0.46],
         _ => [0.65, 0.62, 0.58],
     }
-}
-
-fn enqueue_free_object_animation(
-    game: &mut Game,
-    deltas: &[(Position, voxweb_core::MaterialCell)],
-    now_ms: f64,
-) {
-    let air_positions = deltas
-        .iter()
-        .filter_map(|(pos, cell)| cell.is_empty().then_some(*pos))
-        .collect::<Vec<_>>();
-    let material_positions = deltas
-        .iter()
-        .filter_map(|(pos, cell)| {
-            let block = cell.to_block_id();
-            (block != BlockID::AIR).then_some((*pos, block))
-        })
-        .collect::<Vec<_>>();
-    if air_positions.is_empty() || air_positions.len() != material_positions.len() {
-        return;
-    }
-    let cells = air_positions
-        .into_iter()
-        .zip(material_positions)
-        .map(|(from, (to, block))| FreeObjectCellAnimation { from, to, block })
-        .collect::<Vec<_>>();
-    game.free_object_animations
-        .push(FreeObjectProjectionAnimation {
-            started_at_ms: now_ms,
-            duration_ms: 320.0,
-            cells,
-        });
 }
 const SAVE_NOW_BATCH_CHUNKS: usize = 16;
 
@@ -320,6 +290,7 @@ fn apply_persisted_accounting(
     game: &mut Game,
     encoded_sizes: &[(ChunkPos, u64)],
     refreshed_quota: Option<crate::storage::QuotaInfo>,
+    refreshed_world_record_bytes: Option<u64>,
 ) {
     for (pos, size) in encoded_sizes.iter().copied() {
         game.known_persisted.insert(pos);
@@ -330,6 +301,10 @@ fn apply_persisted_accounting(
         } else {
             game.current_world_bytes = game.current_world_bytes.saturating_sub(old_size - size);
         }
+    }
+    if let Some(record_bytes) = refreshed_world_record_bytes {
+        let chunk_bytes = game.persisted_chunk_sizes.values().copied().sum::<u64>();
+        game.current_world_bytes = record_bytes.saturating_add(chunk_bytes);
     }
     if let Some(quota) = refreshed_quota {
         game.quota = Some(quota);
@@ -351,7 +326,8 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
         };
         let tick = g.server.borrow().world.tick_count;
         let snapshot_positions = g.server.borrow_mut().world.snapshot_dirty(usize::MAX, tick);
-        if snapshot_positions.is_empty() {
+        let active_objects = g.server.borrow().world.active_free_objects();
+        if snapshot_positions.is_empty() && active_objects.is_empty() {
             return;
         }
 
@@ -383,13 +359,14 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
             );
             server.borrow_mut().world.commit_flushed(&missing_positions);
         }
-        if encoded.is_empty() {
+        if encoded.is_empty() && active_objects.is_empty() {
             return;
         }
 
         log::info!(
-            "[storage] {reason}: best-effort flush {} chunks",
-            encoded.len()
+            "[storage] {reason}: best-effort flush {} chunks, {} active objects",
+            encoded.len(),
+            active_objects.len()
         );
         Some((
             storage,
@@ -397,20 +374,35 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
             positions,
             encoded,
             encoded_sizes,
+            active_objects,
             tick,
             session_id,
         ))
     };
 
-    let Some((storage, server, positions, encoded, encoded_sizes, tick, session_id)) = maybe_job
+    let Some((
+        storage,
+        server,
+        positions,
+        encoded,
+        encoded_sizes,
+        active_objects,
+        tick,
+        session_id,
+    )) = maybe_job
     else {
         return;
     };
     let app_ref = app.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let result = storage.save_chunks(encoded).await;
+        let result = storage.save_world_state(encoded, active_objects).await;
         let refreshed_quota = if result.is_ok() {
             storage.quota().await
+        } else {
+            None
+        };
+        let refreshed_record_bytes = if result.is_ok() {
+            storage.world_record_size().await.ok()
         } else {
             None
         };
@@ -423,7 +415,12 @@ fn flush_dirty_best_effort(app: &Rc<RefCell<App>>, reason: &'static str) {
                 if a.world_session_id == session_id
                     && let Some(g) = a.game.as_mut()
                 {
-                    apply_persisted_accounting(g, &encoded_sizes, refreshed_quota);
+                    apply_persisted_accounting(
+                        g,
+                        &encoded_sizes,
+                        refreshed_quota,
+                        refreshed_record_bytes,
+                    );
                 }
             }
             Err(e) => {
@@ -968,6 +965,13 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                     }
                 }
                 let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
+                let active_objects = match storage.load_active_free_objects().await {
+                    Ok(objects) => objects,
+                    Err(e) => {
+                        log::warn!("[storage] load active objects failed: {e:?}");
+                        Vec::new()
+                    }
+                };
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -981,6 +985,10 @@ fn attach_storage_async(app: Rc<RefCell<App>>, room_id: String, seed: u64, sessi
                             .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
+                    g.server
+                        .borrow_mut()
+                        .world
+                        .load_active_free_objects(active_objects);
                     g.known_persisted = known_set;
                     g.loaded_persisted_chunks = loaded_positions;
                     g.pending_persisted_loads.clear();
@@ -1033,6 +1041,13 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                     }
                 }
                 let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
+                let active_objects = match storage.load_active_free_objects().await {
+                    Ok(objects) => objects,
+                    Err(e) => {
+                        log::warn!("[storage] load active objects failed: {e:?}");
+                        Vec::new()
+                    }
+                };
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -1046,6 +1061,10 @@ fn attach_storage_for_new(app: Rc<RefCell<App>>, seed: u64, session_id: u64) {
                             .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
+                    g.server
+                        .borrow_mut()
+                        .world
+                        .load_active_free_objects(active_objects);
                     g.known_persisted = known_set;
                     g.loaded_persisted_chunks = loaded_positions;
                     g.pending_persisted_loads.clear();
@@ -1098,6 +1117,13 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                     }
                 }
                 let loaded_positions: HashSet<_> = loaded.iter().map(|(pos, _)| *pos).collect();
+                let active_objects = match storage.load_active_free_objects().await {
+                    Ok(objects) => objects,
+                    Err(e) => {
+                        log::warn!("[storage] load active objects failed: {e:?}");
+                        Vec::new()
+                    }
+                };
                 let quota = storage.quota().await;
                 let mut a = app.borrow_mut();
                 if a.world_session_id != session_id {
@@ -1111,6 +1137,10 @@ fn attach_storage_for_load(app: Rc<RefCell<App>>, key: String, session_id: u64) 
                             .load_field_chunk_from_storage(pos, field);
                         g.mesh_jobs.enqueue(pos, MeshPriority::High);
                     }
+                    g.server
+                        .borrow_mut()
+                        .world
+                        .load_active_free_objects(active_objects);
                     g.known_persisted = known_set;
                     g.loaded_persisted_chunks = loaded_positions;
                     g.pending_persisted_loads.clear();
@@ -1931,12 +1961,15 @@ fn render_game_frame(
         let world_ref = game.server.clone();
         {
             let server_borrow = world_ref.borrow();
+            let dynamic_aabbs = server_borrow.world.dynamic_object_aabbs();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
             if active_play && input.pointer_locked {
-                game.physics.step(&getter, &game.camera, &input, dt);
+                game.physics
+                    .step(&getter, &dynamic_aabbs, &game.camera, &input, dt);
             } else {
                 let neutral = neutral_input(&input);
-                game.physics.step(&getter, &game.camera, &neutral, dt);
+                game.physics
+                    .step(&getter, &dynamic_aabbs, &game.camera, &neutral, dt);
             }
         }
         apply_pending_position_correction(
@@ -1979,11 +2012,23 @@ fn render_game_frame(
         let (hit, selection) = {
             let server_borrow = world_ref.borrow();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
+            let dynamic_objects = server_borrow
+                .world
+                .free_objects
+                .values()
+                .filter(|object| object.state == FreeObjectState::Dynamic)
+                .map(|object| DynamicObjectRaycast {
+                    object_id: object.id,
+                    aabb: object.aabb(),
+                    block: object.material_summary.dominant,
+                })
+                .collect::<Vec<_>>();
             let hit = raycast(
                 game.camera.position,
                 game.camera.forward(),
                 MAX_REACH,
                 &getter,
+                &dynamic_objects,
             );
             let selection = hit.map(|h| selection_aabb_for_hit(&getter, h));
             (hit, selection)
@@ -2159,7 +2204,18 @@ fn render_game_frame(
                 let occluded = {
                     let server = g.server.borrow();
                     let getter = |x: i32, y: i32, z: i32| server.world.get_block_world(x, y, z);
-                    raycast(cam_pos, dir, dist.max(0.0), &getter)
+                    let dynamic_objects = server
+                        .world
+                        .free_objects
+                        .values()
+                        .filter(|object| object.state == FreeObjectState::Dynamic)
+                        .map(|object| DynamicObjectRaycast {
+                            object_id: object.id,
+                            aabb: object.aabb(),
+                            block: object.material_summary.dominant,
+                        })
+                        .collect::<Vec<_>>();
+                    raycast(cam_pos, dir, dist.max(0.0), &getter, &dynamic_objects)
                         .is_some_and(|hit| hit.distance + 0.15 < dist)
                 };
                 let name = g
@@ -2370,26 +2426,24 @@ fn render_game_frame(
                         });
                     }
                 }
-                game.free_object_animations
-                    .retain(|anim| !anim.is_finished(now));
-                for anim in &game.free_object_animations {
-                    let t = anim.progress(now);
-                    let eased = t * t * (3.0 - 2.0 * t);
-                    for cell in &anim.cells {
-                        let from = glam::Vec3::new(
-                            cell.from.x as f32,
-                            cell.from.y as f32,
-                            cell.from.z as f32,
-                        );
-                        let to =
-                            glam::Vec3::new(cell.to.x as f32, cell.to.y as f32, cell.to.z as f32);
-                        let p = from.lerp(to, eased);
+                let server = game.server.borrow();
+                for object in server.world.free_objects.values() {
+                    if object.state != FreeObjectState::Dynamic {
+                        continue;
+                    }
+                    for sample in &object.samples {
+                        let p = object.transform.position
+                            + glam::Vec3::new(
+                                sample.local_pos[0] as f32,
+                                sample.local_pos[1] as f32,
+                                sample.local_pos[2] as f32,
+                            );
                         instances.push(voxweb_render::passes::player::PlayerInstance {
                             position: p.to_array(),
                             _pad0: 0.0,
                             size: [1.0, 1.0, 1.0],
                             _pad_size: 0.0,
-                            color: block_animation_color(cell.block),
+                            color: block_animation_color(sample.material),
                             _pad1: 0.0,
                         });
                     }
@@ -2513,7 +2567,9 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         if in_flight > 0 {
             return;
         }
-        if !save_now && !g.server.borrow().world.persistence.should_flush(tick) {
+        let active_objects = g.server.borrow().world.active_free_objects();
+        let should_flush_chunks = g.server.borrow().world.persistence.should_flush(tick);
+        if !save_now && !should_flush_chunks && active_objects.is_empty() {
             return;
         }
         let batch_limit = if save_now {
@@ -2521,12 +2577,15 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
         } else {
             AUTO_SAVE_BATCH_CHUNKS
         };
-        let positions = g
-            .server
-            .borrow_mut()
-            .world
-            .snapshot_dirty(batch_limit, tick);
-        if positions.is_empty() {
+        let positions = if save_now || should_flush_chunks {
+            g.server
+                .borrow_mut()
+                .world
+                .snapshot_dirty(batch_limit, tick)
+        } else {
+            Vec::new()
+        };
+        if positions.is_empty() && active_objects.is_empty() {
             if save_now {
                 let dirty = g.server.borrow().world.persistence.dirty_len();
                 let in_flight = g.server.borrow().world.persistence.in_flight_len();
@@ -2569,7 +2628,7 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             );
             server.borrow_mut().world.commit_flushed(&missing_positions);
         }
-        if encoded.is_empty() {
+        if encoded.is_empty() && active_objects.is_empty() {
             return;
         }
         g.last_persist_ms = now;
@@ -2579,22 +2638,37 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
             encoded_positions,
             encoded,
             encoded_sizes,
+            active_objects,
             tick,
             save_now,
             session_id,
         ))
     };
 
-    let Some((storage, server, positions, encoded, encoded_sizes, tick, save_now, session_id)) =
-        maybe_job
+    let Some((
+        storage,
+        server,
+        positions,
+        encoded,
+        encoded_sizes,
+        active_objects,
+        tick,
+        save_now,
+        session_id,
+    )) = maybe_job
     else {
         return;
     };
     let app_ref = app.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let result = storage.save_chunks(encoded).await;
+        let result = storage.save_world_state(encoded, active_objects).await;
         let refreshed_quota = if result.is_ok() {
             storage.quota().await
+        } else {
+            None
+        };
+        let refreshed_record_bytes = if result.is_ok() {
+            storage.world_record_size().await.ok()
         } else {
             None
         };
@@ -2610,7 +2684,12 @@ fn pump_persistence(app: &Rc<RefCell<App>>) {
                 if a.world_session_id == session_id
                     && let Some(g) = a.game.as_mut()
                 {
-                    apply_persisted_accounting(g, &encoded_sizes, refreshed_quota);
+                    apply_persisted_accounting(
+                        g,
+                        &encoded_sizes,
+                        refreshed_quota,
+                        refreshed_record_bytes,
+                    );
                     if save_now_done {
                         g.save_now_requested = false;
                     }
@@ -2662,10 +2741,13 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         && now - game.last_break_at_ms >= cooldown
         && let Some(hit) = game.current_hit
     {
+        if hit.object_id.is_some() {
+            return;
+        }
         let pos = hit.pos;
         let backup = {
             let server = game.server.borrow();
-            server.world.get_block(pos)
+            server.world.get_cell(pos)
         };
         let input_tick = game.local_input_tick;
         let player_position = game.physics.feet_position;
@@ -2675,7 +2757,7 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
             game.server
                 .borrow_mut()
                 .world
-                .set_block_untracked(pos, BlockID::AIR);
+                .set_cell_untracked(pos, MaterialCell::EMPTY);
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
@@ -2702,6 +2784,9 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
     if input.place_just_pressed
         && let Some(hit) = game.current_hit
     {
+        if hit.object_id.is_some() {
+            return;
+        }
         let neighbor = Position::new(
             hit.pos.x + hit.normal.x,
             hit.pos.y + hit.normal.y,
@@ -2717,9 +2802,9 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         }
         let backup = {
             let server = game.server.borrow();
-            server.world.get_block(neighbor)
+            server.world.get_cell(neighbor)
         };
-        if backup != BlockID::AIR {
+        if !backup.is_empty() {
             return;
         }
         let request_id = game.pending.next_request_id();
@@ -2737,7 +2822,7 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
             game.server
                 .borrow_mut()
                 .world
-                .set_block_untracked(neighbor, block);
+                .set_cell_untracked(neighbor, MaterialCell::from_block_id(block));
             for cp in affected_chunks(neighbor) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
@@ -2871,27 +2956,60 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             }
         }
         ServerMessage::FieldDelta { pos, cell } => {
-            let block = cell.to_block_id();
             // Remote：先写 world，再做 remesh（因为 Remote 的 server 不做本地 handle_message）
             if game.mode == GameMode::Remote {
-                game.server
-                    .borrow_mut()
-                    .world
-                    .set_block_untracked(pos, block);
+                game.server.borrow_mut().world.set_cell_untracked(pos, cell);
             }
             for cp in affected_chunks(pos) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
         }
-        ServerMessage::FreeObjectProject { deltas, .. } => {
-            enqueue_free_object_animation(game, &deltas, now_ms());
+        ServerMessage::FreeObjectSpawn { object_id, cells } => {
+            let cells = cells
+                .into_iter()
+                .filter(|(_, cell)| !cell.is_empty())
+                .collect::<Vec<_>>();
+            if game.mode == GameMode::Remote {
+                let mut server = game.server.borrow_mut();
+                for (pos, _) in &cells {
+                    server.world.set_cell_untracked(*pos, MaterialCell::EMPTY);
+                }
+                let _ = server.world.insert_dynamic_free_object(object_id, &cells);
+            }
+            for (pos, _) in cells {
+                for cp in affected_chunks(pos) {
+                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                }
+            }
+        }
+        ServerMessage::FreeObjectState {
+            object_id,
+            position,
+            velocity,
+        } => {
+            if game.mode == GameMode::Remote
+                && let Some(object) = game
+                    .server
+                    .borrow_mut()
+                    .world
+                    .free_objects
+                    .get_mut(&object_id)
+            {
+                object.transform.position = position;
+                object.velocity = velocity;
+            }
+        }
+        ServerMessage::FreeObjectProject { object_id, deltas } => {
+            if game.mode == GameMode::Remote {
+                game.server
+                    .borrow_mut()
+                    .world
+                    .free_objects
+                    .remove(&object_id);
+            }
             for (pos, cell) in deltas {
-                let block = cell.to_block_id();
                 if game.mode == GameMode::Remote {
-                    game.server
-                        .borrow_mut()
-                        .world
-                        .set_block_untracked(pos, block);
+                    game.server.borrow_mut().world.set_cell_untracked(pos, cell);
                 }
                 for cp in affected_chunks(pos) {
                     game.mesh_jobs.enqueue(cp, MeshPriority::High);
@@ -2912,7 +3030,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     game.server
                         .borrow_mut()
                         .world
-                        .set_block_untracked(rolled.pos, rolled.backup);
+                        .set_cell_untracked(rolled.pos, rolled.backup);
                     for cp in affected_chunks(rolled.pos) {
                         game.mesh_jobs.enqueue(cp, MeshPriority::High);
                     }

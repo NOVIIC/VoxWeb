@@ -22,13 +22,14 @@
 ## 二、协议版本
 
 ```rust
-pub const PROTOCOL_VERSION: u32 = 8; // FreeObjectProject 即时投影事件
+pub const PROTOCOL_VERSION: u32 = 9; // FreeObject 动态生命周期
 ```
 
 每次破坏性修改必须递增。客户端 `Hello.version != PROTOCOL_VERSION` 时 Host 立即关闭连接（不发 Welcome）。
 
 | 版本 | 变化 |
 |---|---|
+| v9 | `FreeObjectProject` 不再承担下落动画；新增 `FreeObjectSpawn` 和 `FreeObjectState`，active FreeObject 由 Host 按 tick 推进，Remote 跟随权威状态，静止后再 `FreeObjectProject` |
 | v8 | 新增 `FreeObjectProject { object_id, deltas }`；`FloatingOnly` 硬材质小连通块坍落以 FreeObject 投影事件同步 |
 | v7 | `ChunkRequest` 改为 `FieldRequest`；`ChunkSnapshot` 改为 `FieldSnapshot`，payload 使用 `field::encode(FieldChunk)`；`BlockUpdate` 改为 `FieldDelta { pos, cell: MaterialCell }` |
 | v6 | `Welcome` 增加 `host_render_distance: u32`；`ChunkRequest` 增加 `center` / `render_distance`；新增 `HostSettings` 用于 Host 视距变化通知 |
@@ -61,7 +62,9 @@ pub const PROTOCOL_VERSION: u32 = 8; // FreeObjectProject 即时投影事件
 | `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单；v6 起含 Host 视距上限） |
 | `FieldSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 FieldChunk 数据，分片 |
 | `FieldDelta` | reliable | 按需 | `pos: Position, cell: MaterialCell` | 广播 | 单 cell 变更 |
-| `FreeObjectProject` | reliable | 按需 | `object_id: ObjectID, deltas: Vec<(Position, MaterialCell)>` | 广播 | FreeObject 投影回静态场 |
+| `FreeObjectSpawn` | reliable | 按需 | `object_id: ObjectID, cells: Vec<(Position, MaterialCell)>` | 广播 | 从静态场提取 active FreeObject；对应 cell 已从 Field 移除 |
+| `FreeObjectState` | unreliable | 最高 60Hz | `object_id: ObjectID, position: Vec3, velocity: Vec3` | 广播 | active FreeObject 的权威动态状态；丢旧包不影响最终结果 |
+| `FreeObjectProject` | reliable | 按需 | `object_id: ObjectID, deltas: Vec<(Position, MaterialCell)>` | 广播 | FreeObject 静止后投影回静态场，并结束 active 生命周期 |
 | `ActionAck` | reliable | 应答 | `request_id: u32, accepted: bool, reason: AckReason` | 单一 | 挖放应答 |
 | `PlayerTick` | unreliable | 60Hz | `tick: u32, players: Vec<PlayerSnapshot>, server_time_ms: u64` | 广播 | 全员位置广播 |
 | `PeerJoined` | reliable | 按需 | `entity_id: u32, display_name: String` | 广播（除新加入者） | 新玩家加入通告 |
@@ -233,7 +236,10 @@ Remote                          Host
                                             outbox: ActionAck{42, accepted=true}
                                             outbox: FieldDelta{(10,64,5), AIR cell}（广播）
                                             outbox: relaxed FieldDelta...（广播）
-                                            outbox: optional FreeObjectProject...（广播）
+                                            outbox: optional FreeObjectSpawn...（广播）
+                                          server.tick():
+                                            outbox: FreeObjectState...（广播，unreliable）
+                                            settled → FreeObjectProject...（广播，reliable）
                                           NG：
                                             outbox: ActionAck{42, accepted=false, reason}
    ◀── (reliable) ActionAck{42, accepted=true}
@@ -245,7 +251,13 @@ Remote                          Host
 
 若被挖放的材质或其邻近材质触发 `ImmediateRelaxation`，Host 会在同一可靠通道继续广播一串 `FieldDelta`。Remote 不独立决定最终滑落位置，只把这些更新按顺序写入本地世界并重网格化受影响 chunk。
 
-若硬建筑材质触发 `FloatingOnly` 坍落，Host 会生成 `FreeObjectProject`：其中包含本次提取对象的 `object_id` 以及投影回静态场所需的 cell delta。客户端会立即按权威 delta 更新静态场并重网格化，同时从 delta 中配对旧位置 / 新位置，播放约 320ms 的短时盒体下落动画。该动画只是投影事件的本地可见反馈，不是可同步的权威刚体状态；后续若需要真实飞行、碰撞反弹或碎裂，再在 `FreeObjectProject` 前追加 `FreeObjectSpawn/State`。
+若硬建筑材质触发 `FloatingOnly` 坍落，Host 会先生成 `FreeObjectSpawn`：其中包含本次提取对象的 `object_id` 和被移出静态场的 cell。随后 Host / Local-Only 在 60Hz 逻辑 tick 中推进 active FreeObject 的 AABB 动态体，并通过 unreliable `FreeObjectState` 广播当前位置和速度。Remote 只应用这些权威状态，不决定落点。对象静止后 Host 发送 reliable `FreeObjectProject`，客户端删除 active 对象、写入最终静态 cell，并重网格化受影响 chunk。
+
+当前 FreeObject 动态体的第一版约束：
+
+- 只有平移 AABB，没有旋转、反弹或碎裂。
+- 玩家碰撞、raycast 和放置校验会把 active FreeObject AABB 纳入查询。
+- `FreeObjectProject` 是生命周期结束事件，不再用于播放投影后的假下落动画。
 
 ```
 若 ActionAck.accepted=false：
@@ -298,7 +310,9 @@ Host → Chat{from=remote_id, content="hello"} → 广播（包括来源，让�
 | `FieldRequest`（一次移动外圈） | 100-400 字节 | 请求中心 + 有效视距 + 缺失 `ChunkPos` 列表；完整视距首包最多约 441 个 chunk |
 | `Break/Place` | 16-20 字节 | |
 | `FieldDelta` | 20-40 字节 | 取决于 `MaterialCell` secondary slot |
-| `FreeObjectProject`（小硬块坍落） | 40B-数 KB | 取决于投影 delta 数量 |
+| `FreeObjectSpawn`（小硬块提取） | 40B-数 KB | 取决于 sample/cell 数量 |
+| `FreeObjectState` | ~30 字节 | unreliable，旧状态可丢弃 |
+| `FreeObjectProject`（小硬块静止） | 40B-数 KB | 取决于投影 delta 数量 |
 | `FieldSnapshot`（典型地形 chunk） | 2-5 KB | FieldChunk column store 编码后；通常不需分片 |
 | `FieldSnapshot`（高多样性 chunk） | 8-20 KB | 可能需要 1-2 片 |
 | `Chat`（短消息） | 30-100 字节 | |

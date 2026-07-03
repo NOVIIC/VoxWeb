@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 
 use glam::Vec3;
 
-use voxweb_core::block::BlockID;
+use voxweb_core::block::{BlockID, MaterialCell};
 use voxweb_core::chunk::Position;
 
 use crate::physics::LocalPhysics;
@@ -19,8 +19,8 @@ use crate::physics::LocalPhysics;
 pub struct PendingAction {
     pub kind: PendingKind,
     pub pos: Position,
-    /// 操作发生前该坐标的方块，server 拒绝时写回这一格。
-    pub backup: BlockID,
+    /// 操作发生前该坐标的完整 cell，server 拒绝时写回这一格。
+    pub backup: MaterialCell,
 }
 
 /// 操作类型 + 对应的新方块（Place 时记录玩家想放的方块）。
@@ -102,7 +102,7 @@ mod tests {
             PendingAction {
                 kind: PendingKind::Break,
                 pos: Position::new(1, 64, 1),
-                backup: BlockID::STONE,
+                backup: MaterialCell::from_block_id(BlockID::STONE),
             },
         );
         assert_eq!(p.len(), 1);
@@ -118,12 +118,12 @@ mod tests {
         let action = PendingAction {
             kind: PendingKind::Place(BlockID::DIRT),
             pos: Position::new(2, 64, 2),
-            backup: BlockID::AIR,
+            backup: MaterialCell::EMPTY,
         };
         p.insert(id, action);
         let rolled = p.resolve(id, false).expect("rejected 应返回 backup action");
         assert_eq!(rolled.pos, Position::new(2, 64, 2));
-        assert_eq!(rolled.backup, BlockID::AIR);
+        assert_eq!(rolled.backup, MaterialCell::EMPTY);
         assert_eq!(rolled.kind, PendingKind::Place(BlockID::DIRT));
         assert!(p.is_empty(), "resolve 后条目应被移除");
     }
