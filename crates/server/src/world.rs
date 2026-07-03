@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use voxweb_core::block::{BlockID, MaterialCell};
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, Position};
 use voxweb_core::field::FieldChunk;
-use voxweb_core::object::{FreeObject, ObjectID};
+use voxweb_core::object::{FreeObject, FreeObjectState, ObjectID};
 
 use crate::persistence::PersistenceManager;
 use crate::terrain::TerrainGenerator;
@@ -23,7 +23,7 @@ pub struct World {
     pub chunks: HashMap<ChunkPos, Chunk>,
     /// MaterialField 镜像。当前渲染/碰撞仍使用 `chunks` 适配视图，但权威写入会同步维护这里。
     pub field_chunks: HashMap<ChunkPos, FieldChunk>,
-    /// 从静态场提取并投影过的材质团。第一版只记录生命周期结果，渲染仍靠投影后的 FieldDelta。
+    /// 从静态场提取出的材质团。Dynamic 对象按 tick 模拟，静止后投影回 FieldChunk。
     pub free_objects: HashMap<ObjectID, FreeObject>,
     pub terrain: TerrainGenerator,
     /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
@@ -220,6 +220,47 @@ impl World {
         let object = FreeObject::projected_from_cells(id, &materials, final_offset_y)?;
         self.free_objects.insert(id, object);
         Some(id)
+    }
+
+    pub fn spawn_dynamic_free_object(&mut self, cells: &[(Position, BlockID)]) -> Option<ObjectID> {
+        let id = self.next_object_id;
+        self.next_object_id = if self.next_object_id == ObjectID::MAX {
+            1
+        } else {
+            self.next_object_id + 1
+        };
+        let materials = cells
+            .iter()
+            .map(|(pos, block)| (*pos, *block))
+            .collect::<Vec<_>>();
+        let object = FreeObject::dynamic_from_cells(id, &materials)?;
+        self.free_objects.insert(id, object);
+        Some(id)
+    }
+
+    pub fn insert_dynamic_free_object(
+        &mut self,
+        id: ObjectID,
+        cells: &[(Position, BlockID)],
+    ) -> Option<()> {
+        let materials = cells
+            .iter()
+            .map(|(pos, block)| (*pos, *block))
+            .collect::<Vec<_>>();
+        let object = FreeObject::dynamic_from_cells(id, &materials)?;
+        self.free_objects.insert(id, object);
+        if self.next_object_id <= id {
+            self.next_object_id = id.saturating_add(1).max(1);
+        }
+        Some(())
+    }
+
+    pub fn dynamic_object_aabbs(&self) -> Vec<voxweb_core::Aabb> {
+        self.free_objects
+            .values()
+            .filter(|object| object.state == FreeObjectState::Dynamic)
+            .map(FreeObject::aabb)
+            .collect()
     }
 
     pub fn set_chunk_cache_capacity(&mut self, capacity: usize) {

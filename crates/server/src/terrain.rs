@@ -5,6 +5,12 @@ use noise::{NoiseFn, Perlin};
 use voxweb_core::block::BlockID;
 use voxweb_core::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos};
 
+const BASE_HEIGHT: f64 = 58.0;
+const HILL_AMPLITUDE: f64 = 24.0;
+const DETAIL_AMPLITUDE: f64 = 4.0;
+const HEIGHT_MIN: usize = 18;
+const HEIGHT_MAX: usize = 112;
+
 /// 地形生成器：封装 Perlin 噪声 + 生物群落参数。
 pub struct TerrainGenerator {
     perlin: Perlin,
@@ -26,11 +32,7 @@ impl TerrainGenerator {
                 let world_x = pos.x * CHUNK_X as i32 + lx as i32;
                 let world_z = pos.z * CHUNK_Z as i32 + lz as i32;
 
-                // 采样 Perlin 噪声，映射到 0..CHUNK_Y
-                let noise_val = self
-                    .perlin
-                    .get([world_x as f64 * 0.01, world_z as f64 * 0.01]);
-                let height = ((noise_val + 1.0) * 0.5 * (CHUNK_Y as f64 * 0.4)) as usize;
+                let height = self.height_at(world_x, world_z);
 
                 for ly in 0..CHUNK_Y {
                     // ly == 0 强制 BEDROCK 兜底；height 极小时 height-3 会下溢，故用 ly + 3 < height 等价判断。
@@ -50,5 +52,30 @@ impl TerrainGenerator {
             }
         }
         chunk
+    }
+
+    fn height_at(&self, world_x: i32, world_z: i32) -> usize {
+        let mut weighted = 0.0;
+        let mut total_weight = 0.0;
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let distance = ((dx * dx + dz * dz) as f64).sqrt();
+                let weight = if distance == 0.0 { 2.0 } else { 1.0 / distance };
+                weighted += self.raw_height(world_x + dx, world_z + dz) * weight;
+                total_weight += weight;
+            }
+        }
+        (weighted / total_weight)
+            .round()
+            .clamp(HEIGHT_MIN as f64, HEIGHT_MAX as f64) as usize
+    }
+
+    fn raw_height(&self, world_x: i32, world_z: i32) -> f64 {
+        let x = world_x as f64;
+        let z = world_z as f64;
+        let continent = self.perlin.get([x * 0.0035, z * 0.0035]);
+        let hills = self.perlin.get([x * 0.009, z * 0.009]);
+        let detail = self.perlin.get([x * 0.035, z * 0.035]);
+        BASE_HEIGHT + continent * 10.0 + hills * HILL_AMPLITUDE + detail * DETAIL_AMPLITUDE
     }
 }

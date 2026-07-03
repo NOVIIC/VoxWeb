@@ -186,6 +186,9 @@ impl Server {
     /// **Remote 模式不调用**（无权威逻辑可推进）。
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        let free_object_events = physics::tick_free_objects(&mut self.world);
+        self.enqueue_free_object_states(free_object_events.states);
+        self.enqueue_free_object_projections(free_object_events.projections);
         self.world.tick();
         self.broadcast_tick();
     }
@@ -253,6 +256,7 @@ impl Server {
             .host_render_distance
             .min(INITIAL_SNAPSHOT_RADIUS as u32) as i32;
         self.send_initial_snapshot(eid, spawn_chunk, snapshot_radius);
+        self.send_active_free_objects(eid);
 
         eid
     }
@@ -336,7 +340,7 @@ impl Server {
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, voxweb_core::BlockID::AIR);
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
-                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
+                    let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -347,7 +351,7 @@ impl Server {
                     );
                     self.enqueue_field_delta(pos, voxweb_core::BlockID::AIR);
                     self.enqueue_field_deltas(relaxed);
-                    self.enqueue_free_object_projections(collapsed);
+                    self.enqueue_free_object_spawns(spawned);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -372,7 +376,7 @@ impl Server {
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_block(pos, block);
                     let relaxed = physics::relax_after_edit(&mut self.world, pos);
-                    let collapsed = physics::resolve_floating_after_edit(&mut self.world, pos);
+                    let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
                         ServerMessage::ActionAck {
@@ -383,7 +387,7 @@ impl Server {
                     );
                     self.enqueue_field_delta(pos, block);
                     self.enqueue_field_deltas(relaxed);
-                    self.enqueue_free_object_projections(collapsed);
+                    self.enqueue_free_object_spawns(spawned);
                 } else {
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -513,6 +517,41 @@ impl Server {
         }
     }
 
+    fn send_active_free_objects(&mut self, recipient: EntityId) {
+        let active = self
+            .world
+            .free_objects
+            .values()
+            .filter(|object| object.state == voxweb_core::FreeObjectState::Dynamic)
+            .map(|object| {
+                (
+                    object.id,
+                    object
+                        .cells_at_current_position()
+                        .into_iter()
+                        .map(|(pos, material)| (pos, MaterialCell::from_block_id(material)))
+                        .collect::<Vec<_>>(),
+                    object.transform.position,
+                    object.velocity,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (object_id, cells, position, velocity) in active {
+            self.enqueue(
+                Recipient::One(recipient),
+                ServerMessage::FreeObjectSpawn { object_id, cells },
+            );
+            self.enqueue(
+                Recipient::One(recipient),
+                ServerMessage::FreeObjectState {
+                    object_id,
+                    position,
+                    velocity,
+                },
+            );
+        }
+    }
+
     /// 处理 Remote 的按需区块请求。
     ///
     /// 这里做两个轻量防护：单包处理数量上限，以及只能请求服务端记录位置附近的 chunk。
@@ -609,6 +648,38 @@ impl Server {
     ) {
         for (pos, block) in updates {
             self.enqueue_field_delta(pos, block);
+        }
+    }
+
+    fn enqueue_free_object_spawns(&mut self, spawns: Vec<physics::FreeObjectSpawn>) {
+        for spawn in spawns {
+            for (pos, _) in &spawn.cells {
+                self.enqueue_field_delta(*pos, voxweb_core::BlockID::AIR);
+            }
+            self.enqueue(
+                Recipient::All,
+                ServerMessage::FreeObjectSpawn {
+                    object_id: spawn.object_id,
+                    cells: spawn
+                        .cells
+                        .into_iter()
+                        .map(|(pos, block)| (pos, MaterialCell::from_block_id(block)))
+                        .collect(),
+                },
+            );
+        }
+    }
+
+    fn enqueue_free_object_states(&mut self, states: Vec<physics::FreeObjectStateUpdate>) {
+        for state in states {
+            self.enqueue(
+                Recipient::All,
+                ServerMessage::FreeObjectState {
+                    object_id: state.object_id,
+                    position: state.position,
+                    velocity: state.velocity,
+                },
+            );
         }
     }
 

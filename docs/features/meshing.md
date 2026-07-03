@@ -24,7 +24,7 @@
 
 - 先用 `get_block_world` 做跨区块面剔除
 - `HardBlocky` / `Foliage` 等不透明硬表面按方向构造 mask，用贪婪网格化合并同材质且 AO 一致的可见单位面
-- `SmoothGranular` 表面不进入硬方块 mask，而是生成 `smooth_vertices + smooth_indices`：顶部高度由 `core::surface` 的共享查询按邻近颗粒列插值，边缘生成梯形侧面，并把真实法线交给 shader 光照
+- `SmoothGranular` 表面不进入硬方块 mask，而是生成 `smooth_vertices + smooth_indices`：顶部高度由 `core::surface` 的共享查询按扩邻域颗粒列加权插值，边缘生成梯形侧面，并把真实法线交给 shader 光照
 - 透明材质仍输出 `transparent_vertices + transparent_indices`，交给 Transparent Pass
 - `visible_faces` 记录硬方块逐面基线的可见单位面数量，供 HUD 展示贪婪合并优化比例
 
@@ -129,7 +129,7 @@ pub struct SmoothVertex {
 }
 ```
 
-当前实现是第一版高度场平滑提面，不是完整 Surface Nets / Marching Cubes。高度查询放在 `core::surface`，渲染、raycast、选中框和客户端玩家碰撞共用同一规则；权威世界和网络仍然按当前 `Chunk`/`BlockID` 适配视图工作。
+当前实现是第一版高度场平滑提面，不是完整 Surface Nets / Marching Cubes。高度查询放在 `core::surface`，渲染、raycast、选中框和客户端玩家碰撞共用同一规则；角点高度会从更宽的邻域采样并做距离加权，减少自然草/土/沙的 1m 台阶感。权威世界和网络仍然按当前 `Chunk`/`BlockID` 适配视图工作。
 
 ---
 

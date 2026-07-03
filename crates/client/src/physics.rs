@@ -87,6 +87,7 @@ impl LocalPhysics {
     pub fn step(
         &mut self,
         get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
         camera: &Camera,
         input: &InputState,
         dt: f32,
@@ -97,8 +98,10 @@ impl LocalPhysics {
         while remaining > 0.0 {
             let step_dt = remaining.min(MAX_SUBSTEP_DT);
             match self.mode {
-                CameraMode::Fly => self.step_fly(get_block, camera, input, step_dt),
-                CameraMode::Walk => self.step_walk(get_block, camera, input, step_dt),
+                CameraMode::Fly => self.step_fly(get_block, dynamic_aabbs, camera, input, step_dt),
+                CameraMode::Walk => {
+                    self.step_walk(get_block, dynamic_aabbs, camera, input, step_dt)
+                }
             }
             remaining -= step_dt;
         }
@@ -109,6 +112,7 @@ impl LocalPhysics {
     fn step_fly(
         &mut self,
         get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
         camera: &Camera,
         input: &InputState,
         dt: f32,
@@ -140,9 +144,9 @@ impl LocalPhysics {
         if dir.length_squared() > 0.0 {
             let disp = dir.normalize() * FLY_SPEED * dt;
             // 分轴扫动碰撞（与 Walk 一致）：先 Y 再 X 再 Z，撞墙时吸附并停止该轴
-            self.move_axis_y(get_block, disp.y);
-            self.move_axis_x(get_block, disp.x);
-            self.move_axis_z(get_block, disp.z);
+            self.move_axis_y(get_block, dynamic_aabbs, disp.y);
+            self.move_axis_x(get_block, dynamic_aabbs, disp.x);
+            self.move_axis_z(get_block, dynamic_aabbs, disp.z);
         }
         self.velocity = Vec3::ZERO;
         self.on_ground = false;
@@ -153,6 +157,7 @@ impl LocalPhysics {
     fn step_walk(
         &mut self,
         get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
         camera: &Camera,
         input: &InputState,
         dt: f32,
@@ -196,22 +201,34 @@ impl LocalPhysics {
 
         // 5) 分轴扫动碰撞：Y → X → Z
         let disp = self.velocity * dt;
-        self.move_axis_y(get_block, disp.y);
-        self.move_axis_x(get_block, disp.x);
-        self.move_axis_z(get_block, disp.z);
+        self.move_axis_y(get_block, dynamic_aabbs, disp.y);
+        self.move_axis_x(get_block, dynamic_aabbs, disp.x);
+        self.move_axis_z(get_block, dynamic_aabbs, disp.z);
 
         // 6) 地面检测
-        self.on_ground = check_ground(get_block, self.feet_position);
+        self.on_ground = check_ground(get_block, dynamic_aabbs, self.feet_position);
     }
 
-    fn move_axis_y(&mut self, get_block: &dyn Fn(i32, i32, i32) -> BlockID, dy: f32) {
+    fn move_axis_y(
+        &mut self,
+        get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
+        dy: f32,
+    ) {
         if dy == 0.0 {
             return;
         }
         let new_feet = self.feet_position + Vec3::Y * dy;
         let candidate = player_aabb(new_feet);
-        if collides_with_world(get_block, &candidate) {
+        if collides_with_world(get_block, dynamic_aabbs, &candidate) {
             self.velocity.y = 0.0;
+            if dy < 0.0
+                && let Some(snap) =
+                    find_dynamic_floor_snap(dynamic_aabbs, &candidate, self.feet_position.y)
+            {
+                self.feet_position.y = snap;
+                return;
+            }
             if dy < 0.0
                 && let Some(snap) =
                     find_smooth_floor_snap(get_block, &candidate, self.feet_position.y)
@@ -225,6 +242,7 @@ impl LocalPhysics {
             let snap = self.feet_position.y.floor();
             if !collides_with_world(
                 get_block,
+                dynamic_aabbs,
                 &player_aabb(Vec3::new(self.feet_position.x, snap, self.feet_position.z)),
             ) {
                 self.feet_position.y = snap;
@@ -236,7 +254,7 @@ impl LocalPhysics {
                 let down = snap - i as f32;
                 let aabb_down =
                     player_aabb(Vec3::new(self.feet_position.x, down, self.feet_position.z));
-                if !collides_with_world(get_block, &aabb_down) {
+                if !collides_with_world(get_block, dynamic_aabbs, &aabb_down) {
                     self.feet_position.y = down;
                     return;
                 }
@@ -244,7 +262,7 @@ impl LocalPhysics {
                 let up = snap + i as f32;
                 let aabb_up =
                     player_aabb(Vec3::new(self.feet_position.x, up, self.feet_position.z));
-                if !collides_with_world(get_block, &aabb_up) {
+                if !collides_with_world(get_block, dynamic_aabbs, &aabb_up) {
                     self.feet_position.y = up;
                     return;
                 }
@@ -255,7 +273,12 @@ impl LocalPhysics {
         }
     }
 
-    fn move_axis_x(&mut self, get_block: &dyn Fn(i32, i32, i32) -> BlockID, dx: f32) {
+    fn move_axis_x(
+        &mut self,
+        get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
+        dx: f32,
+    ) {
         if dx == 0.0 {
             return;
         }
@@ -265,11 +288,11 @@ impl LocalPhysics {
             self.feet_position.z,
         );
         let candidate = player_aabb(new_feet);
-        if collides_with_world(get_block, &candidate) {
+        if collides_with_world(get_block, dynamic_aabbs, &candidate) {
             // 吸附到墙面：在位移方向上找到最近的 solid 方块，把玩家 AABB 贴到其面上。
             // 直接零速度不吸附会导致浮点累积误差让玩家逐渐"远离"墙壁。
             let half = voxweb_core::geometry::PLAYER_WIDTH * 0.5;
-            if let Some(snap_x) = find_wall_snap_x(get_block, &candidate, dx, half) {
+            if let Some(snap_x) = find_wall_snap_x(get_block, dynamic_aabbs, &candidate, dx, half) {
                 self.feet_position.x = snap_x;
             }
             self.velocity.x = 0.0;
@@ -278,7 +301,12 @@ impl LocalPhysics {
         }
     }
 
-    fn move_axis_z(&mut self, get_block: &dyn Fn(i32, i32, i32) -> BlockID, dz: f32) {
+    fn move_axis_z(
+        &mut self,
+        get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+        dynamic_aabbs: &[Aabb],
+        dz: f32,
+    ) {
         if dz == 0.0 {
             return;
         }
@@ -288,9 +316,9 @@ impl LocalPhysics {
             self.feet_position.z + dz,
         );
         let candidate = player_aabb(new_feet);
-        if collides_with_world(get_block, &candidate) {
+        if collides_with_world(get_block, dynamic_aabbs, &candidate) {
             let half = voxweb_core::geometry::PLAYER_WIDTH * 0.5;
-            if let Some(snap_z) = find_wall_snap_z(get_block, &candidate, dz, half) {
+            if let Some(snap_z) = find_wall_snap_z(get_block, dynamic_aabbs, &candidate, dz, half) {
                 self.feet_position.z = snap_z;
             }
             self.velocity.z = 0.0;
@@ -303,7 +331,17 @@ impl LocalPhysics {
 // —— 自由函数 ——
 
 /// 玩家 AABB 是否与世界中任何 solid 方块重叠。
-pub fn collides_with_world(get_block: &dyn Fn(i32, i32, i32) -> BlockID, aabb: &Aabb) -> bool {
+pub fn collides_with_world(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    dynamic_aabbs: &[Aabb],
+    aabb: &Aabb,
+) -> bool {
+    if dynamic_aabbs
+        .iter()
+        .any(|dynamic_aabb| aabb.intersects(dynamic_aabb))
+    {
+        return true;
+    }
     // 扫描覆盖 AABB 的所有整数方块单元（floor..ceil）
     let min_x = aabb.min.x.floor() as i32;
     let max_x = (aabb.max.x - f32::EPSILON).floor() as i32;
@@ -381,13 +419,36 @@ fn find_smooth_floor_snap(
     best
 }
 
+fn find_dynamic_floor_snap(
+    dynamic_aabbs: &[Aabb],
+    aabb: &Aabb,
+    previous_feet_y: f32,
+) -> Option<f32> {
+    dynamic_aabbs
+        .iter()
+        .filter(|dynamic| {
+            aabb.max.x > dynamic.min.x
+                && aabb.min.x < dynamic.max.x
+                && aabb.max.z > dynamic.min.z
+                && aabb.min.z < dynamic.max.z
+                && dynamic.max.y <= previous_feet_y + 0.12
+                && dynamic.max.y >= aabb.min.y - 0.08
+        })
+        .map(|dynamic| dynamic.max.y)
+        .max_by(|a, b| a.total_cmp(b))
+}
+
 /// 玩家脚下 GROUND_PROBE 米内有 solid 方块 → 在地面。
-pub fn check_ground(get_block: &dyn Fn(i32, i32, i32) -> BlockID, feet: Vec3) -> bool {
+pub fn check_ground(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    dynamic_aabbs: &[Aabb],
+    feet: Vec3,
+) -> bool {
     let probe = Aabb {
         min: Vec3::new(feet.x - 0.3, feet.y - GROUND_PROBE, feet.z - 0.3),
         max: Vec3::new(feet.x + 0.3, feet.y, feet.z + 0.3),
     };
-    collides_with_world(get_block, &probe)
+    collides_with_world(get_block, dynamic_aabbs, &probe)
 }
 
 /// AIR / 透明（如水）不参与碰撞；其它走 BlockProperties.solid 表。
@@ -402,17 +463,18 @@ fn block_solid(id: BlockID) -> bool {
 /// X 轴墙面吸附：在位移方向上找到最近的 solid 方块，返回吸附后的 feet.x。
 fn find_wall_snap_x(
     get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    dynamic_aabbs: &[Aabb],
     aabb: &Aabb,
     dx: f32,
     half_width: f32,
 ) -> Option<f32> {
+    let mut best = dynamic_wall_snap_x(dynamic_aabbs, aabb, dx, half_width);
     let min_x = aabb.min.x.floor() as i32;
     let max_x = aabb.max.x.ceil() as i32; // 用 ceil 确保覆盖触碰面的方块
     let min_y = aabb.min.y.floor() as i32;
     let max_y = aabb.max.y.ceil() as i32;
     let min_z = aabb.min.z.floor() as i32;
     let max_z = aabb.max.z.ceil() as i32;
-    let mut best: Option<f32> = None;
     for bx in min_x..max_x {
         for by in min_y..max_y {
             for bz in min_z..max_z {
@@ -444,20 +506,46 @@ fn find_wall_snap_x(
     best
 }
 
+fn dynamic_wall_snap_x(
+    dynamic_aabbs: &[Aabb],
+    aabb: &Aabb,
+    dx: f32,
+    half_width: f32,
+) -> Option<f32> {
+    dynamic_aabbs
+        .iter()
+        .filter(|dynamic| aabb.intersects(dynamic))
+        .map(|dynamic| {
+            if dx > 0.0 {
+                dynamic.min.x - half_width
+            } else {
+                dynamic.max.x + half_width
+            }
+        })
+        .reduce(|best, snap| {
+            if (dx > 0.0 && snap < best) || (dx <= 0.0 && snap > best) {
+                snap
+            } else {
+                best
+            }
+        })
+}
+
 /// Z 轴墙面吸附：与 find_wall_snap_x 对称。
 fn find_wall_snap_z(
     get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    dynamic_aabbs: &[Aabb],
     aabb: &Aabb,
     dz: f32,
     half_width: f32,
 ) -> Option<f32> {
+    let mut best = dynamic_wall_snap_z(dynamic_aabbs, aabb, dz, half_width);
     let min_x = aabb.min.x.floor() as i32;
     let max_x = aabb.max.x.ceil() as i32;
     let min_y = aabb.min.y.floor() as i32;
     let max_y = aabb.max.y.ceil() as i32;
     let min_z = aabb.min.z.floor() as i32;
     let max_z = aabb.max.z.ceil() as i32;
-    let mut best: Option<f32> = None;
     for bx in min_x..max_x {
         for by in min_y..max_y {
             for bz in min_z..max_z {
@@ -486,6 +574,31 @@ fn find_wall_snap_z(
         }
     }
     best
+}
+
+fn dynamic_wall_snap_z(
+    dynamic_aabbs: &[Aabb],
+    aabb: &Aabb,
+    dz: f32,
+    half_width: f32,
+) -> Option<f32> {
+    dynamic_aabbs
+        .iter()
+        .filter(|dynamic| aabb.intersects(dynamic))
+        .map(|dynamic| {
+            if dz > 0.0 {
+                dynamic.min.z - half_width
+            } else {
+                dynamic.max.z + half_width
+            }
+        })
+        .reduce(|best, snap| {
+            if (dz > 0.0 && snap < best) || (dz <= 0.0 && snap > best) {
+                snap
+            } else {
+                best
+            }
+        })
 }
 
 #[inline]
@@ -524,11 +637,13 @@ mod tests {
         // 脚 y=65 → 玩家站在 y=64 STONE 顶面正上方，AABB.min.y=65 == block.max.y=65 触面不算碰撞
         assert!(!collides_with_world(
             &getter,
+            &[],
             &player_aabb(Vec3::new(0.5, 65.0, 0.5))
         ));
         // 脚 y=64.9 → AABB.min.y=64.9 < 65=STONE.max.y → 真重叠
         assert!(collides_with_world(
             &getter,
+            &[],
             &player_aabb(Vec3::new(0.5, 64.9, 0.5))
         ));
     }
@@ -541,7 +656,7 @@ mod tests {
         let camera = Camera::default();
         // 60Hz 跑 5 秒，足够从 y=80 落到 y=65
         for _ in 0..(60 * 5) {
-            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         }
         assert!(p.on_ground, "玩家应当落地");
         // 脚底 y 应在 65 附近（STONE 顶面 = 65.0）
@@ -559,12 +674,12 @@ mod tests {
         let mut input = InputState::default();
         let camera = Camera::default();
         // 先 tick 一次让 on_ground=true
-        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         assert!(p.on_ground, "tick 后玩家应在地面");
 
         // 模拟 just-pressed 跳跃
         input.jump_just_pressed = true;
-        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         // 跳起后 velocity.y 应接近 JUMP_SPEED 减一帧重力（8.4 - 32/60 ≈ 7.87）
         assert!(
             p.velocity.y > JUMP_SPEED * 0.9,
@@ -589,9 +704,9 @@ mod tests {
         p.velocity = Vec3::new(WALK_SPEED, 0.0, WALK_SPEED);
         let dt = 0.05;
         let disp = p.velocity * dt;
-        p.move_axis_y(&getter, disp.y);
-        p.move_axis_x(&getter, disp.x);
-        p.move_axis_z(&getter, disp.z);
+        p.move_axis_y(&getter, &[], disp.y);
+        p.move_axis_x(&getter, &[], disp.x);
+        p.move_axis_z(&getter, &[], disp.z);
         // x 被墙吸附：AABB.max.x 贴到 x=1 墙面（feet.x = 1.0 - 0.3 = 0.7）
         assert!(
             (p.feet_position.x - 0.7).abs() < 0.01,
@@ -630,7 +745,7 @@ mod tests {
         let mut input = InputState::default();
         input.forward = true;
         let y_before = p.feet_position.y;
-        p.step(&getter, &camera, &input, 0.5);
+        p.step(&getter, &[], &camera, &input, 0.5);
         assert!(
             (p.feet_position.y - y_before).abs() < 1e-4,
             "Fly 模式按 W 不应改变 Y，但 y_before={} y_after={}",
@@ -654,7 +769,7 @@ mod tests {
         let mut input = InputState::default();
         input.jump_held = true;
         let y_before = p.feet_position.y;
-        p.step(&getter, &camera, &input, 0.5);
+        p.step(&getter, &[], &camera, &input, 0.5);
         assert!(
             p.feet_position.y > y_before,
             "Space 应让玩家上升，y_before={} y_after={}",
@@ -674,13 +789,13 @@ mod tests {
         let input = InputState::default();
         // 先稳定落地
         for _ in 0..(60 * 5) {
-            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         }
         assert!(p.on_ground, "前置：玩家应当先落地");
         let y_landed = p.feet_position.y;
 
         // 模拟 tab 后台 10 秒（RAF 节流后单次回调 dt=10s）
-        p.step(&getter, &camera, &input, 10.0);
+        p.step(&getter, &[], &camera, &input, 10.0);
 
         // 玩家应仍贴在地面上，不应穿透到 STONE 层（y=64）以下
         assert!(
@@ -708,15 +823,15 @@ mod tests {
         let mut input = InputState::default();
         let camera = Camera::default();
         // 先 tick 一次让 on_ground=true
-        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         assert!(p.on_ground, "前置：玩家应在地面");
 
         // 跳跃
         input.jump_just_pressed = true;
-        p.step(&getter, &camera, &input, 1.0 / 60.0);
+        p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         // 持续几帧让玩家上升撞到天花板
         for _ in 0..20 {
-            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         }
         // 玩家不应卡在天花板内部：头顶（feet.y + 1.8）不应超过天花板底面（y=68）
         assert!(
@@ -756,7 +871,7 @@ mod tests {
         // 飞行足够长时间确保撞墙
         for frame in 0..60 {
             let old_x = p.feet_position.x;
-            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
             if frame < 10 || (p.feet_position.x - old_x).abs() > 1e-6 {
                 eprintln!(
                     "frame {}: x {:.6} -> {:.6} (dx={:.6})",
@@ -799,7 +914,7 @@ mod tests {
         input.jump_held = true; // 上升
         // 飞行足够长时间确保撞天花板
         for _ in 0..60 {
-            p.step(&getter, &camera, &input, 1.0 / 60.0);
+            p.step(&getter, &[], &camera, &input, 1.0 / 60.0);
         }
         // 玩家头顶（feet.y + 1.8）不应超过天花板底面（y=70）
         assert!(

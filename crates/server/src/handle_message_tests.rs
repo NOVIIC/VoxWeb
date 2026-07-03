@@ -267,7 +267,7 @@ fn handle_message_break_enqueues_ack_one_and_field_delta_all() {
 }
 
 #[test]
-fn handle_message_break_broadcasts_free_object_projection_for_floating_hard_block() {
+fn handle_message_break_broadcasts_free_object_spawn_for_floating_hard_block() {
     let (mut server, eid) = prepare_world();
     let support = Position::new(3, 64, 3);
     let lower_support = Position::new(3, 63, 3);
@@ -290,28 +290,60 @@ fn handle_message_break_broadcasts_free_object_projection_for_floating_hard_bloc
     );
 
     assert_eq!(server.world.get_block(floating), voxweb_core::BlockID::AIR);
-    assert_eq!(server.world.get_block(support), voxweb_core::BlockID::STONE);
-    assert_eq!(server.world.free_objects.len(), 1);
+    assert_eq!(server.world.get_block(support), voxweb_core::BlockID::AIR);
+    assert!(!server.world.free_objects.is_empty());
 
+    let spawn = find_outbox(&server, |m| {
+        matches!(
+            (&m.recipient, &m.message),
+            (
+                Recipient::All,
+                ServerMessage::FreeObjectSpawn {
+                    object_id: _,
+                    cells,
+                }
+            ) if cells.iter().any(|(pos, cell)| {
+                *pos == floating && cell.to_block_id() == voxweb_core::BlockID::STONE
+            })
+        )
+    });
+    assert!(
+        spawn.is_some(),
+        "missing FreeObjectSpawn with extracted cells"
+    );
+
+    for _ in 0..60 {
+        server.tick();
+        if server.outbox.iter().any(|m| {
+            matches!(
+                (&m.recipient, &m.message),
+                (
+                    Recipient::All,
+                    ServerMessage::FreeObjectProject {
+                        object_id: _,
+                        deltas,
+                    }
+                ) if deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
+            )
+        }) {
+            break;
+        }
+    }
     let projection = find_outbox(&server, |m| {
         matches!(
             (&m.recipient, &m.message),
             (
                 Recipient::All,
                 ServerMessage::FreeObjectProject {
-                    object_id: 1,
+                    object_id: _,
                     deltas,
                 }
-            ) if deltas.iter().any(|(pos, cell)| {
-                *pos == floating && cell.to_block_id() == voxweb_core::BlockID::AIR
-            }) && deltas.iter().any(|(pos, cell)| {
-                *pos == support && cell.to_block_id() == voxweb_core::BlockID::STONE
-            })
+            ) if deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
         )
     });
     assert!(
         projection.is_some(),
-        "missing FreeObjectProject with projection deltas"
+        "missing FreeObjectProject after dynamic object settles"
     );
 }
 

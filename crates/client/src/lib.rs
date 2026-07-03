@@ -36,12 +36,11 @@ use voxweb_core::chunk::{ChunkPos, Position};
 use voxweb_core::protocol::{
     ClientMessage, EntityId, PROTOCOL_VERSION, PlayerEntry, RoomEvent, ServerMessage,
 };
-use voxweb_core::{Aabb, is_smooth_granular, smooth_cell_top_height};
+use voxweb_core::{Aabb, FreeObjectState, is_smooth_granular, smooth_cell_top_height};
 use voxweb_render::{Renderer, VisualFrame};
 
 use crate::app::{
-    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, FreeObjectCellAnimation,
-    FreeObjectProjectionAnimation, Game, GameMode, PreloadState, RemotePlayerState,
+    AppState, BASE_SENSITIVITY_RAD_PER_PIXEL, Game, GameMode, PreloadState, RemotePlayerState,
 };
 use crate::browser::{
     now_ms, random_seed, read_query_param, set_room_in_url, signaling_url, sync_canvas_size,
@@ -54,7 +53,7 @@ use crate::mesh_jobs::MeshPriority;
 use crate::prediction::{
     PendingAction, PendingKind, ReconcileResult, apply_pending_position_correction, reconcile_self,
 };
-use crate::raycast::{RaycastHit, raycast};
+use crate::raycast::{DynamicObjectRaycast, RaycastHit, raycast};
 use crate::storage::{OpfsStorage, WorldStorage};
 use crate::ui::lobby::{
     ConnectingAction, LobbyAction, LobbyState, draw_connecting, draw_lobby, generate_room_id,
@@ -72,6 +71,9 @@ const AUTO_SAVE_INTERVAL_MS: f64 = 3000.0;
 const AUTO_SAVE_BATCH_CHUNKS: usize = 4;
 
 fn selection_aabb_for_hit(get_block: &dyn Fn(i32, i32, i32) -> BlockID, hit: RaycastHit) -> Aabb {
+    if let Some(aabb) = hit.object_aabb {
+        return aabb;
+    }
     let min = glam::Vec3::new(hit.pos.x as f32, hit.pos.y as f32, hit.pos.z as f32);
     if is_smooth_granular(hit.block) {
         let top = smooth_cell_top_height(get_block, hit.pos.x, hit.pos.y, hit.pos.z, hit.block);
@@ -94,38 +96,6 @@ fn block_animation_color(block: BlockID) -> [f32; 3] {
         BlockID::STONE_BRICKS => [0.42, 0.43, 0.46],
         _ => [0.65, 0.62, 0.58],
     }
-}
-
-fn enqueue_free_object_animation(
-    game: &mut Game,
-    deltas: &[(Position, voxweb_core::MaterialCell)],
-    now_ms: f64,
-) {
-    let air_positions = deltas
-        .iter()
-        .filter_map(|(pos, cell)| cell.is_empty().then_some(*pos))
-        .collect::<Vec<_>>();
-    let material_positions = deltas
-        .iter()
-        .filter_map(|(pos, cell)| {
-            let block = cell.to_block_id();
-            (block != BlockID::AIR).then_some((*pos, block))
-        })
-        .collect::<Vec<_>>();
-    if air_positions.is_empty() || air_positions.len() != material_positions.len() {
-        return;
-    }
-    let cells = air_positions
-        .into_iter()
-        .zip(material_positions)
-        .map(|(from, (to, block))| FreeObjectCellAnimation { from, to, block })
-        .collect::<Vec<_>>();
-    game.free_object_animations
-        .push(FreeObjectProjectionAnimation {
-            started_at_ms: now_ms,
-            duration_ms: 320.0,
-            cells,
-        });
 }
 const SAVE_NOW_BATCH_CHUNKS: usize = 16;
 
@@ -1931,12 +1901,15 @@ fn render_game_frame(
         let world_ref = game.server.clone();
         {
             let server_borrow = world_ref.borrow();
+            let dynamic_aabbs = server_borrow.world.dynamic_object_aabbs();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
             if active_play && input.pointer_locked {
-                game.physics.step(&getter, &game.camera, &input, dt);
+                game.physics
+                    .step(&getter, &dynamic_aabbs, &game.camera, &input, dt);
             } else {
                 let neutral = neutral_input(&input);
-                game.physics.step(&getter, &game.camera, &neutral, dt);
+                game.physics
+                    .step(&getter, &dynamic_aabbs, &game.camera, &neutral, dt);
             }
         }
         apply_pending_position_correction(
@@ -1979,11 +1952,23 @@ fn render_game_frame(
         let (hit, selection) = {
             let server_borrow = world_ref.borrow();
             let getter = |x: i32, y: i32, z: i32| server_borrow.world.get_block_world(x, y, z);
+            let dynamic_objects = server_borrow
+                .world
+                .free_objects
+                .values()
+                .filter(|object| object.state == FreeObjectState::Dynamic)
+                .map(|object| DynamicObjectRaycast {
+                    object_id: object.id,
+                    aabb: object.aabb(),
+                    block: object.material_summary.dominant,
+                })
+                .collect::<Vec<_>>();
             let hit = raycast(
                 game.camera.position,
                 game.camera.forward(),
                 MAX_REACH,
                 &getter,
+                &dynamic_objects,
             );
             let selection = hit.map(|h| selection_aabb_for_hit(&getter, h));
             (hit, selection)
@@ -2159,7 +2144,18 @@ fn render_game_frame(
                 let occluded = {
                     let server = g.server.borrow();
                     let getter = |x: i32, y: i32, z: i32| server.world.get_block_world(x, y, z);
-                    raycast(cam_pos, dir, dist.max(0.0), &getter)
+                    let dynamic_objects = server
+                        .world
+                        .free_objects
+                        .values()
+                        .filter(|object| object.state == FreeObjectState::Dynamic)
+                        .map(|object| DynamicObjectRaycast {
+                            object_id: object.id,
+                            aabb: object.aabb(),
+                            block: object.material_summary.dominant,
+                        })
+                        .collect::<Vec<_>>();
+                    raycast(cam_pos, dir, dist.max(0.0), &getter, &dynamic_objects)
                         .is_some_and(|hit| hit.distance + 0.15 < dist)
                 };
                 let name = g
@@ -2370,26 +2366,24 @@ fn render_game_frame(
                         });
                     }
                 }
-                game.free_object_animations
-                    .retain(|anim| !anim.is_finished(now));
-                for anim in &game.free_object_animations {
-                    let t = anim.progress(now);
-                    let eased = t * t * (3.0 - 2.0 * t);
-                    for cell in &anim.cells {
-                        let from = glam::Vec3::new(
-                            cell.from.x as f32,
-                            cell.from.y as f32,
-                            cell.from.z as f32,
-                        );
-                        let to =
-                            glam::Vec3::new(cell.to.x as f32, cell.to.y as f32, cell.to.z as f32);
-                        let p = from.lerp(to, eased);
+                let server = game.server.borrow();
+                for object in server.world.free_objects.values() {
+                    if object.state != FreeObjectState::Dynamic {
+                        continue;
+                    }
+                    for sample in &object.samples {
+                        let p = object.transform.position
+                            + glam::Vec3::new(
+                                sample.local_pos[0] as f32,
+                                sample.local_pos[1] as f32,
+                                sample.local_pos[2] as f32,
+                            );
                         instances.push(voxweb_render::passes::player::PlayerInstance {
                             position: p.to_array(),
                             _pad0: 0.0,
                             size: [1.0, 1.0, 1.0],
                             _pad_size: 0.0,
-                            color: block_animation_color(cell.block),
+                            color: block_animation_color(sample.material),
                             _pad1: 0.0,
                         });
                     }
@@ -2662,6 +2656,9 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
         && now - game.last_break_at_ms >= cooldown
         && let Some(hit) = game.current_hit
     {
+        if hit.object_id.is_some() {
+            return;
+        }
         let pos = hit.pos;
         let backup = {
             let server = game.server.borrow();
@@ -2702,6 +2699,9 @@ fn dispatch_actions(game: &mut Game, input: &InputState) {
     if input.place_just_pressed
         && let Some(hit) = game.current_hit
     {
+        if hit.object_id.is_some() {
+            return;
+        }
         let neighbor = Position::new(
             hit.pos.x + hit.normal.x,
             hit.pos.y + hit.normal.y,
@@ -2883,8 +2883,50 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 game.mesh_jobs.enqueue(cp, MeshPriority::High);
             }
         }
-        ServerMessage::FreeObjectProject { deltas, .. } => {
-            enqueue_free_object_animation(game, &deltas, now_ms());
+        ServerMessage::FreeObjectSpawn { object_id, cells } => {
+            let cells = cells
+                .into_iter()
+                .map(|(pos, cell)| (pos, cell.to_block_id()))
+                .filter(|(_, block)| *block != BlockID::AIR)
+                .collect::<Vec<_>>();
+            if game.mode == GameMode::Remote {
+                let mut server = game.server.borrow_mut();
+                for (pos, _) in &cells {
+                    server.world.set_block_untracked(*pos, BlockID::AIR);
+                }
+                let _ = server.world.insert_dynamic_free_object(object_id, &cells);
+            }
+            for (pos, _) in cells {
+                for cp in affected_chunks(pos) {
+                    game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                }
+            }
+        }
+        ServerMessage::FreeObjectState {
+            object_id,
+            position,
+            velocity,
+        } => {
+            if game.mode == GameMode::Remote
+                && let Some(object) = game
+                    .server
+                    .borrow_mut()
+                    .world
+                    .free_objects
+                    .get_mut(&object_id)
+            {
+                object.transform.position = position;
+                object.velocity = velocity;
+            }
+        }
+        ServerMessage::FreeObjectProject { object_id, deltas } => {
+            if game.mode == GameMode::Remote {
+                game.server
+                    .borrow_mut()
+                    .world
+                    .free_objects
+                    .remove(&object_id);
+            }
             for (pos, cell) in deltas {
                 let block = cell.to_block_id();
                 if game.mode == GameMode::Remote {

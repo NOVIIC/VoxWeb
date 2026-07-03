@@ -1,8 +1,8 @@
 //! 通道分配与消息序列化辅助。
 //!
 //! 两条 DataChannel：
-//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、FieldRequest/FieldSnapshot、FieldDelta、FreeObjectProject、ActionAck、Chat、PeerJoined/Left
-//! - `unreliable` (unordered + 0 retransmits): PlayerInput、PlayerTick、Ping/Pong
+//! - `reliable`   (ordered + reliable):   Hello/Welcome、HostSettings、FieldRequest/FieldSnapshot、FieldDelta、FreeObjectSpawn/Project、ActionAck、Chat、PeerJoined/Left
+//! - `unreliable` (unordered + 0 retransmits): PlayerInput、PlayerTick、FreeObjectState、Ping/Pong
 //!
 //! 选择依据见 docs/networking/protocol.md §三 通道列。
 
@@ -32,11 +32,14 @@ pub fn channel_for_client_message(msg: &ClientMessage) -> ChannelKind {
 /// 根据 ServerMessage 类型选择 DataChannel。
 pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
     match msg {
-        ServerMessage::PlayerTick { .. } | ServerMessage::Pong { .. } => ChannelKind::Unreliable,
+        ServerMessage::PlayerTick { .. }
+        | ServerMessage::FreeObjectState { .. }
+        | ServerMessage::Pong { .. } => ChannelKind::Unreliable,
         ServerMessage::Welcome { .. }
         | ServerMessage::HostSettings { .. }
         | ServerMessage::FieldSnapshot { .. }
         | ServerMessage::FieldDelta { .. }
+        | ServerMessage::FreeObjectSpawn { .. }
         | ServerMessage::FreeObjectProject { .. }
         | ServerMessage::ActionAck { .. }
         | ServerMessage::PeerJoined { .. }

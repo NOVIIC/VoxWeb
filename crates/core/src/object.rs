@@ -56,10 +56,30 @@ pub enum FreeObjectState {
 }
 
 impl FreeObject {
+    pub fn dynamic_from_cells(id: ObjectID, cells: &[(Position, MaterialID)]) -> Option<Self> {
+        Self::from_cells(id, cells, 0, FreeObjectState::Dynamic, Vec3::ZERO)
+    }
+
     pub fn projected_from_cells(
         id: ObjectID,
         cells: &[(Position, MaterialID)],
         final_offset_y: i32,
+    ) -> Option<Self> {
+        Self::from_cells(
+            id,
+            cells,
+            final_offset_y,
+            FreeObjectState::Projected,
+            Vec3::ZERO,
+        )
+    }
+
+    fn from_cells(
+        id: ObjectID,
+        cells: &[(Position, MaterialID)],
+        final_offset_y: i32,
+        state: FreeObjectState,
+        velocity: Vec3,
     ) -> Option<Self> {
         let first = cells.first()?;
         let mut min = first.0;
@@ -109,7 +129,7 @@ impl FreeObject {
             transform: Transform {
                 position: final_min,
             },
-            velocity: Vec3::ZERO,
+            velocity,
             angular_velocity: Vec3::ZERO,
             samples,
             material_summary: MaterialSummary {
@@ -119,7 +139,62 @@ impl FreeObject {
             },
             mass,
             collision_proxy: CollisionProxy::Aabb(Aabb::new(final_min, final_max)),
-            state: FreeObjectState::Projected,
+            state,
         })
+    }
+
+    pub fn aabb(&self) -> Aabb {
+        self.aabb_at(self.transform.position)
+    }
+
+    pub fn aabb_at(&self, position: Vec3) -> Aabb {
+        let Some(first) = self.samples.first() else {
+            return match &self.collision_proxy {
+                CollisionProxy::Aabb(aabb) => *aabb,
+                CollisionProxy::SampleCloud => Aabb::new(position, position),
+            };
+        };
+        let mut min = first.local_pos;
+        let mut max = first.local_pos;
+        for sample in &self.samples {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(sample.local_pos[axis]);
+                max[axis] = max[axis].max(sample.local_pos[axis]);
+            }
+        }
+        Aabb::new(
+            position + Vec3::new(min[0] as f32, min[1] as f32, min[2] as f32),
+            position
+                + Vec3::new(
+                    max[0] as f32 + 1.0,
+                    max[1] as f32 + 1.0,
+                    max[2] as f32 + 1.0,
+                ),
+        )
+    }
+
+    pub fn cells_at_position(&self, position: Vec3) -> Vec<(Position, MaterialID)> {
+        let base = Position::new(
+            position.x.round() as i32,
+            position.y.round() as i32,
+            position.z.round() as i32,
+        );
+        self.samples
+            .iter()
+            .map(|sample| {
+                (
+                    Position::new(
+                        base.x + sample.local_pos[0] as i32,
+                        base.y + sample.local_pos[1] as i32,
+                        base.z + sample.local_pos[2] as i32,
+                    ),
+                    sample.material,
+                )
+            })
+            .collect()
+    }
+
+    pub fn cells_at_current_position(&self) -> Vec<(Position, MaterialID)> {
+        self.cells_at_position(self.transform.position)
     }
 }

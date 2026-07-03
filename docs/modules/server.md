@@ -231,8 +231,9 @@ fn broadcast_tick(&mut self) {
 1. `TerrainGenerator::new(seed)`：用 `noise::Perlin::new(seed as u32)` 构造一个噪声源
 2. 对 chunk 内每个 `(lx, lz)` 列：
    - 世界坐标 `(world_x, world_z) = (pos.x * 16 + lx, pos.z * 16 + lz)`
-   - 采样 `perlin.get([world_x * 0.01, world_z * 0.01])` → 值域 `[-1, 1]`
-   - 映射到高度 `height = ((noise + 1) * 0.5 * CHUNK_Y * 0.4) as usize`（最高 ≈ 102）
+   - 采样三档 Perlin：低频 continent、中频 hills、高频 detail
+   - 按 `BASE_HEIGHT + continent * 10 + hills * 24 + detail * 4` 生成原始高度
+   - 对 3×3 邻域做轻量加权平滑，并 clamp 到 `18..=112`
 3. 分层填充每个 `(lx, ly, lz)`：
    - `ly == 0` → 强制 BEDROCK（不可破坏世界边界，避免挖穿底部）
    - `ly + 3 < height` → STONE
@@ -242,7 +243,7 @@ fn broadcast_tick(&mut self) {
 
 > 见 [`crates/server/src/terrain.rs`](../../crates/server/src/terrain.rs)。
 >
-> 注意：当前仅使用单一 Perlin 通道；多倍频叠加 / 山脉 / 平原差异化属于地形增强项。
+> 注意：当前已从单一 Perlin 直映射改为低频 fBm + 邻域平滑，目的是降低草/土/沙自然地形的 1m 台阶感；更完整的 thermal erosion / biome 分区仍是增强项。
 
 ### 扩展点
 - 生物群系（草原 / 沙漠 / 雪地）
@@ -278,7 +279,8 @@ pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet:
     // 3) y == 0 → BlockNotEmpty
     // 4) block == AIR 或 !properties(block).appears_in_hotbar → BlockNotEmpty
     // 5) 目标非空 → BlockNotEmpty
-    // 6) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
+    // 6) Aabb::block_at(pos) 与 active FreeObject AABB 相交 → BlockNotEmpty
+    // 7) Aabb::block_at(pos).intersects(&player_aabb(player_feet)) → Overlap
     //    Ok
 }
 ```
@@ -298,17 +300,23 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, B
     // 5) 返回每个 cell 的权威 FieldDelta 序列
 }
 
-pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectProjection> {
+pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectSpawn> {
     // 1) 从 origin 及其上方/四邻域收集 FloatingOnly 候选
     // 2) BFS 找小型硬材质连通块；超过预算视为大型地形/建筑并保持静态
-    // 3) 若连通块没有接触任何稳定 solid 支撑，记录 FreeObject
-    // 4) 整体下落到最近支撑面并投影回 Field/Chunk
-    // 5) 返回每个 FreeObject 的旧位置 AIR + 新位置材质投影 delta
+    // 3) 若连通块没有接触任何稳定 solid 支撑，从 Field/Chunk 移除并创建 active FreeObject
+    // 4) 返回 FreeObjectSpawn；调用方广播旧位置 AIR FieldDelta + FreeObjectSpawn
+}
+
+pub fn tick_free_objects(world: &mut World) -> FreeObjectTickEvents {
+    // 1) 只推进 state == Dynamic 的 FreeObject
+    // 2) 施加重力和终端速度，使用 AABB 查询静态场碰撞
+    // 3) 未碰撞则广播 FreeObjectState
+    // 4) 碰撞静止后投影回 Field/Chunk，删除 active object，并广播 FreeObjectProject
 }
 ```
 
 当前这是 `BlockID` dense chunk 上的过渡原型，不做质量拆分和多材质混合；它保证 Host / Local-Only 立即给玩家软材质反馈，并通过 `FieldDelta` 同步结果。
-硬材质第一版同样是整格过渡实现：不会模拟可见刚体飞行，而是在同一权威步骤完成提取、下落、投影，并通过 `FreeObjectProject` 广播投影结果。
+硬材质第一版是平移 AABB 动态体：没有旋转、反弹或碎裂，但下落过程是服务端 tick 推进的权威状态，客户端渲染和碰撞查询都读取 active FreeObject。
 
 ---
 
@@ -357,12 +365,12 @@ match msg {
             Ok(()) => {
                 self.world.set_block(pos, BlockID::AIR);
                 let relaxed = physics::relax_after_edit(&mut self.world, pos);
-                let projections = physics::resolve_floating_after_edit(&mut self.world, pos);
+                let spawns = physics::resolve_floating_after_edit(&mut self.world, pos);
                 self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::EMPTY }));
                 for (pos, block) in relaxed {
                     self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::from_block_id(block) }));
                 }
-                self.enqueue_free_object_projections(projections);
+                self.enqueue_free_object_spawns(spawns);
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
             }
             Err(reason) => {
@@ -372,7 +380,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围与玩家 AABB 重叠；成功后 set_block + relax_after_edit + FieldDelta，并用 FreeObjectProject 广播硬材质投影 */
+        /* 同上：按点击时 feet 校验范围、玩家 AABB 和 active FreeObject AABB；成功后 set_block + relax_after_edit + FieldDelta，并用 FreeObjectSpawn/State/Project 同步硬材质动态生命周期 */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));

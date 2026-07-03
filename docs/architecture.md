@@ -48,7 +48,7 @@
 **关键观察**：
 - Caddy 静态站只负责把游戏代码送进浏览器；游戏开始后浏览器与静态站之间无任何长连接。
 - Cloudflare Workers 信令仅在 P2P 握手期短暂使用；连接建立后两个 Peer 直连，信令服务可下线不影响进行中的会话。
-- 所有游戏世界数据流（FieldSnapshot、FieldDelta、FreeObjectProject、PlayerTick）都走 P2P DataChannel，不经过任何中心服务器。
+- 所有游戏世界数据流（FieldSnapshot、FieldDelta、FreeObjectSpawn/State/Project、PlayerTick）都走 P2P DataChannel，不经过任何中心服务器。
 - **兜底**：若某对 (Host, Remote) 的 WebRTC 直连失败（ICE 失败 / 15s 协商超时），Host 自动请求信令 Worker 把该对升级为「字节中继」——后续 bincode 字节走 WS 二进制帧由 DO 转发，其它直连 peer 不受影响。详见 [`networking/signaling.md`](networking/signaling.md) §九。
 
 ---

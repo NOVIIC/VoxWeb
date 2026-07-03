@@ -8,9 +8,9 @@ use glam::{Vec2, Vec3};
 use crate::block::{BlockID, VisualClass, properties};
 use crate::chunk::CHUNK_Y;
 
-pub const SMOOTH_MIN_FILL: f32 = 0.35;
-pub const SMOOTH_MAX_OVERFILL: f32 = 1.20;
-const MIXED_MATERIAL_BIAS: f32 = -0.08;
+pub const SMOOTH_MIN_FILL: f32 = 0.20;
+pub const SMOOTH_MAX_OVERFILL: f32 = 1.08;
+const MIXED_MATERIAL_BIAS: f32 = -0.05;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SmoothCellRef {
@@ -57,11 +57,14 @@ pub fn smooth_corner_height(
 ) -> f32 {
     let mut total = 0.0f32;
     let mut count = 0.0f32;
-    for sx in [corner_wx - 1, corner_wx] {
-        for sz in [corner_wz - 1, corner_wz] {
+    for sx in (corner_wx - 1)..=(corner_wx + 1) {
+        for sz in (corner_wz - 1)..=(corner_wz + 1) {
             if let Some(height) = nearby_smooth_column_height(get_block, sx, sz, base_y, block) {
-                total += height;
-                count += 1.0;
+                let dx = (sx - corner_wx).abs() as f32;
+                let dz = (sz - corner_wz).abs() as f32;
+                let weight = 1.0 / (1.0 + dx + dz);
+                total += height * weight;
+                count += weight;
             }
         }
     }
@@ -81,7 +84,7 @@ pub fn nearby_smooth_column_height(
     base_y: i32,
     block: BlockID,
 ) -> Option<f32> {
-    for y in ((base_y - 2).max(0)..=(base_y + 1).min(CHUNK_Y as i32 - 1)).rev() {
+    for y in ((base_y - 3).max(0)..=(base_y + 2).min(CHUNK_Y as i32 - 1)).rev() {
         let here = get_block(wx, y, wz);
         if !is_smooth_granular(here) {
             continue;

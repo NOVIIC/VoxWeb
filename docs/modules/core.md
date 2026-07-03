@@ -119,7 +119,7 @@ pub struct FreeObject {
 }
 ```
 
-第一版 FreeObject 用于记录硬材质浮空连通块的“提取 → 下落 → 投影”生命周期结果。当前服务器会立即把小型 `FloatingOnly` 连通块投影回静态场，并用 `ServerMessage::FreeObjectProject { object_id, deltas }` 广播投影 delta；后续可把 `FreeObjectState::Dynamic` 接到可见刚体飞行和网络状态。
+第一版 FreeObject 用于硬材质浮空连通块的“提取 → active 动态体 → 投影”生命周期。服务器把小型 `FloatingOnly` 连通块从静态场移除后创建 `FreeObjectState::Dynamic` 对象；对象以平移 AABB 形式按 tick 下落，`FreeObject::aabb()` / `aabb_at()` 提供碰撞代理，`cells_at_current_position()` / `cells_at_position()` 用于最终投影。网络上用 `FreeObjectSpawn` 创建 active 对象、`FreeObjectState` 同步 transform / velocity、`FreeObjectProject` 结束生命周期并写回静态场。
 
 ### `field.rs` — FieldChunk 原型
 
