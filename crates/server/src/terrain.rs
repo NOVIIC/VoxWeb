@@ -11,7 +11,7 @@ const DETAIL_AMPLITUDE: f64 = 4.0;
 const HEIGHT_MIN: usize = 18;
 const HEIGHT_MAX: usize = 112;
 
-/// 地形生成器：封装 Perlin 噪声 + 生物群落参数。
+/// 地形生成器：封装 Perlin 噪声高度图（多倍频叠加 + 邻域平滑）。当前无 biome 分区。
 pub struct TerrainGenerator {
     perlin: Perlin,
 }

@@ -235,13 +235,14 @@ Remote                          Host
          input_tick=810, player_position=feet_at_click}  ────▶
                                           physics::validate_break →
                                           OK：
-                                            world.set_block AIR
-                                            relaxed = relax_after_edit(pos)
+                                            world.set_cell (10,64,5) EMPTY
+                                            mark_edit_unstable(pos)  ← 软材质邻域入队，颗粒下落推迟到 tick
+                                            resolve_floating_after_edit(pos)  ← 硬材质浮空即时提取
                                             outbox: ActionAck{42, accepted=true}
                                             outbox: FieldDelta{(10,64,5), AIR cell}（广播）
-                                            outbox: relaxed FieldDelta...（广播）
                                             outbox: optional FreeObjectSpawn...（广播）
                                           server.tick():
+                                            step_soft_grains → FreeObjectSpawnBatch / 超预算 try_relax_one FieldDelta
                                             outbox: FreeObjectState...（广播，unreliable）
                                             settled → FreeObjectProject...（广播，reliable）
                                           NG：

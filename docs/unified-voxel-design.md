@@ -1,6 +1,7 @@
 # 统一体素设计
 
 > **状态**：第一版核心闭环已落地到 cell 保真路径。已实现 `MaterialID`/`MaterialProperties` 过渡层、`MaterialCell`、`FieldChunk`/`Column`/`Span`、OPFS FieldChunk v2、active FreeObject world.json 持久化、网络 `FieldSnapshot`/`FieldDelta`、石砖/基岩材质、基岩托底、基于材质属性的基础挖放仲裁、`ImmediateRelaxation` 软材质局部下落/滑落，`FloatingOnly` 硬材质小连通块的 FreeObject 提取、active AABB 动态下落、`FreeObjectSpawn/State/Project` 同步、客户端动态碰撞/raycast 查询，以及 `SmoothGranular` 的扩邻域高度场平滑提面 / raycast / 选中 / 客户端碰撞共用查询；运行时预测回滚、颗粒松弛、FreeObject sample 和 project delta 均保留完整 `MaterialCell`。真实流体、完整 Surface Nets / Marching Cubes、旋转刚体、碰撞反弹和碎裂尚未实现，作为固体/颗粒闭环之后的增强项。
+> **实现进度校准**：材质属性表中的模拟字段（`placement_kernel`/`break_kernel`/`angle_of_repose`/`cohesion`/`shear_strength`/`compressive_strength`/`restitution`/`friction`/`hardness`/`mechanics`）目前**只定义、未被任何 solver 读取**，颗粒松弛的坡角与滑速是硬编码常量，沙/土/草行为一致；§8.2 支撑图（`SupportEdge`/`StabilityComponent`）、§12.1 的 `ApplyKernel`/`StabilityEvent` 消息、§12.2 的 transform 量化与 region hash 纠偏均为**设计目标而非现状**。完整完成度评估与优先级待办见 [`roadmap.md`](roadmap.md) 第五节「统一体素 · 待办清单」。
 > **何时阅读**：重构世界表示、物理系统、方块交互、实体系统之前
 > **关联文档**：[`README.md`](../README.md) · [`architecture.md`](architecture.md) · [`features/physics.md`](features/physics.md) · [`features/meshing.md`](features/meshing.md) · [`features/persistence.md`](features/persistence.md) · [`networking/protocol.md`](networking/protocol.md) · [`modules/core.md`](modules/core.md) · [`modules/server.md`](modules/server.md) · [`modules/render.md`](modules/render.md) · [`modules/client.md`](modules/client.md)
 
@@ -300,6 +301,8 @@ MaterialProperties
 
 这比“所有材质只改几个数字，算法完全一样”更实际，也更容易调出好手感。
 
+> **当前实现状态**：这套路由是设计目标。运行时目前只有 `stability`（NoPhysics / FloatingOnly / ImmediateRelaxation）、`breakable`、`appears_in_hotbar`、`visual_class` 真正参与分派；`placement_kernel` / `break_kernel` / `angle_of_repose` / `cohesion` / `shear_strength` / `compressive_strength` / `restitution` / `friction` / `hardness` / `mechanics` 已在材质表中定义但**尚未被任何 solver 读取**，颗粒松弛的坡角与滑速当前为硬编码常量。见 [`roadmap.md`](roadmap.md) 高优先级第 1 项。
+
 ---
 
 ## 六、编辑：材质天然单位
@@ -358,6 +361,8 @@ struct KernelWrite {
 5. 若无法混合且目标为软材质，可触发挤出/滑落，把多余质量写到邻近 cell。
 
 这样能避免“无限材质通道”导致存储和提面都失控。
+
+> **当前实现状态**：`MaterialCell.secondary` / `MixSlot` 通道已定义但玩法从不写入——`validate_place` 遇到非空 cell 直接拒绝（`BlockNotEmpty`）；同材质累加、secondary 混合与反应规则尚未实现，故“primary + secondary 两通道够不够”这一问题（§17.1）在当前代码路径下从未被真正触发。
 
 ---
 
@@ -498,6 +503,8 @@ struct StabilityComponent {
 }
 ```
 
+> **当前实现状态**：`SupportEdge` / `StabilityComponent` 是设计目标类型，**代码中尚不存在**。第一版硬材质稳定性只用本节末的 `FloatingOnly` BFS 近似（六邻域「任意固体即支撑」判断连通块是否接触稳定基底），没有承重、重心投影、悬挑或抗剪计算。
+
 求解关注：
 
 - 连通区域是否连接到稳定基底。
@@ -608,7 +615,7 @@ enum QueryHit {
 
 草、土、沙看起来不够平滑有两个不同原因：
 
-1. **自然地形高度太陡**：当前地形是单通道 Perlin 直接映射高度，缺少坡度限制、侵蚀感和平原/丘陵分区。即使平滑 extractor 工作正常，相邻列高度差过大时仍会产生台阶和陡墙。
+1. **自然地形高度仍偏格状**：当前地形已从单通道 Perlin 升级为多倍频叠加（continent / hills / detail 三段 Perlin）+ 3×3 邻域距离加权平滑，相邻列高度差大多已落在 0..1m；但仍缺坡度限制、侵蚀感和平原/丘陵/山地分区。残留台阶感更多来自**连续 1m 单位阶梯 + 满格立方体渲染**，而非高度突变——因此地形调参需与提面/occupancy 升级配套。
 2. **当前 SmoothGranular 仍以满格 cell 为输入**：高度场只在可见顶部做插值，底层质量仍是 1m 整格；没有半格 occupancy、column mass 或真正的 Surface Nets，因此在侧面、硬软交界和悬崖处仍会暴露格子结构。
 
 地形生成应先降低“格子台阶”的输入压力：
@@ -711,6 +718,8 @@ struct FluidCell {
 | FreeObjectState | 低频权威状态、位置、速度、旋转 |
 | FreeObjectProject | 动态物体静止后投影回静态场 |
 
+> **当前实现状态**：已落地 `FieldSnapshot` / `FieldDelta` / `FreeObject{Spawn,State,Project}`（及三者 Batch 变体）/ `ActionAck`。`ApplyKernel`、`StabilityEvent` **尚未实现**——挖放仍走 `BlockID` 的 `Place` / `Break` 请求 + `FieldDelta` 广播，坍塌 / 提取 / 投影直接用 `FreeObject*` 与 `FieldDelta` 表达。`FreeObjectState` 目前只携带 `position` / `velocity`（裸 `Vec3`），**无旋转字段**。
+
 ### 12.2 量化
 
 网络状态应避免裸 `f32` 成为长期权威数据：
@@ -720,6 +729,8 @@ struct FluidCell {
 - 速度和角速度使用有限精度。
 - FreeObject sample 局部坐标可用小整数或半精度量化。
 - 每个 FieldChunk / region 可以带 hash，用于纠偏。
+
+> **当前实现状态**：cell mass 已是 `u8`（`MaterialCell.occupancy`）。但 `FreeObjectState` / `FreeObjectStateBatch` 的 `position` / `velocity` 仍是 unreliable 通道上的**裸 `f32`（`Vec3`）**；transform / 速度量化、sample 局部坐标量化和 region hash 纠偏均**未实现**，是本节待落地项（见 [`roadmap.md`](roadmap.md) 中优先级）。
 
 ### 12.3 预测
 

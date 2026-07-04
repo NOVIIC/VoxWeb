@@ -30,7 +30,7 @@
 - `World::field_chunks` 维护 `FieldChunk` MaterialField；当前渲染/碰撞仍从同步更新的 dense `chunks` 镜像读取，网络快照直接发送 FieldChunk
 - `World::free_objects` 记录 active FreeObject 生命周期：小型 `FloatingOnly` 连通块（`granular=false`）整体刚性下落，软材质单格颗粒（`granular=true`）自由落体 + 抛物线斜滑；均按 `FieldChunk.free_object_refs` 建立运行时引用，静止后投影回静态场；FreeObject sample 保留完整 `MaterialCell`，Host / Local-Only 的 OPFS 加载会从 `world.json.active_free_objects` 恢复这些对象（含正在下落的颗粒）
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
-- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`ImmediateRelaxation` 软材质挖放后由 `mark_edit_unstable` 入 `World::unstable_soft` 队列，`step_soft_grains` 每 tick 限额提取为下落颗粒（超预算回退 `relax_after_edit` 瞬间松弛），`tick_free_objects` 推进颗粒与硬材质刚体
+- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`ImmediateRelaxation` 软材质挖放后由 `mark_edit_unstable` 入 `World::unstable_soft` 队列，`step_soft_grains` 每 tick 限额提取为下落颗粒（超预算回退 `try_relax_one` 瞬间松弛一步并广播 `FieldDelta`），`tick_free_objects` 推进颗粒与硬材质刚体
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
 - `Server` 通过 `handle_message` 消费 Local / Host / Remote 输入，向 outbox 写入点对点或广播消息
 - `send_initial_snapshot` 与 `FieldRequest` 负责 Remote 初始和运行时 FieldChunk 同步
@@ -297,13 +297,21 @@ pub fn validate_place(world: &World, pos: Position, block: BlockID, player_feet:
 ### 局部颗粒松弛与硬材质浮空
 
 ```rust
-pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, MaterialCell)> {
-    // 1) 从 origin 及其上方/四邻域入队
-    // 2) 只处理 properties(block).stability == ImmediateRelaxation 的材质
-    // 3) 优先竖直下落；受阻后按确定性方向尝试斜下滑落
-    // 4) 单次挖放受 RELAXATION_MOVE_BUDGET / RELAXATION_VISIT_BUDGET 限流
-    // 5) 返回每个 cell 的权威 FieldDelta 序列
+pub fn mark_edit_unstable(world: &mut World, origin: Position) {
+    // 挖放时调用：把 origin 邻域的 ImmediateRelaxation 软材质 cell 入 world.unstable_soft 队列。
+    // 真正下落/提取推迟到后续 tick 的 step_soft_grains，从而形成可见的级联坍塌。
 }
+
+pub fn step_soft_grains(world: &mut World) -> SoftStepEvents {
+    // 每 tick 调用：
+    // 1) 从 unstable_soft 取有限个 cell（受 UNSTABLE_VISIT_BUDGET_PER_TICK 限流）
+    // 2) 预算内：提取为单格 active grain FreeObject（后续由 tick_free_objects 自由落体）
+    // 3) 超预算 / 超 MAX_ACTIVE_GRAINS：回退 try_relax_one 瞬间松弛一步，广播 FieldDelta
+    // 4) 移除后唤醒上方软材质复检，形成级联；返回 spawns + updates
+}
+
+// relax_after_edit 仍保留为瞬间松弛的参考实现，供 try_relax_one 复用语义与单元测试使用，
+// 已不在生产挖放路径上。
 
 pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectSpawn> {
     // 1) 从 origin 及其上方/四邻域收集 FloatingOnly 候选
@@ -369,12 +377,9 @@ match msg {
         match physics::validate_break(&self.world, pos, feet) {
             Ok(()) => {
                 self.world.set_cell(pos, MaterialCell::EMPTY);
-                let relaxed = physics::relax_after_edit(&mut self.world, pos);
-                let spawns = physics::resolve_floating_after_edit(&mut self.world, pos);
+                physics::mark_edit_unstable(&mut self.world, pos);   // 软材质邻域入队；颗粒下落在后续 tick 由 step_soft_grains 逐格提取
+                let spawns = physics::resolve_floating_after_edit(&mut self.world, pos); // 硬材质浮空连通块即时提取
                 self.outbox.push_back(broadcast(FieldDelta { pos, cell: MaterialCell::EMPTY }));
-                for (pos, cell) in relaxed {
-                    self.outbox.push_back(broadcast(FieldDelta { pos, cell }));
-                }
                 self.enqueue_free_object_spawns(spawns);
                 self.outbox.push_back(reply_to(sender, ActionAck { request_id, accepted: true, reason: Ok }));
             }
@@ -385,7 +390,7 @@ match msg {
     }
     ClientMessage::Place { pos, block, request_id, input_tick, player_position } => {
         let feet = self.action_player_position(sender, input_tick, player_position);
-        /* 同上：按点击时 feet 校验范围、玩家 AABB 和 active FreeObject AABB；成功后 set_cell + relax_after_edit + FieldDelta，并用 FreeObjectSpawn/State/Project 同步硬材质动态生命周期 */
+        /* 同上：按点击时 feet 校验范围、玩家 AABB 和 active FreeObject AABB；成功后 set_cell + mark_edit_unstable + resolve_floating_after_edit + FieldDelta，并用 FreeObjectSpawn/State/Project 同步硬材质动态生命周期 */
     }
     ClientMessage::Chat { content } => {
         self.outbox.push_back(broadcast(Chat { from: sender, content }));
@@ -491,7 +496,7 @@ impl PersistenceManager {
 **Physics / message dispatch**：
 - `physics::validate_break` 各拒绝路径：y 越界 / 射程 > 6m / 底层边界 / AIR / 不可破坏材质 → BlockNotEmpty
 - `physics::validate_place`：y 越界 / 射程 / 底层边界 / 非热栏材质 / BlockNotEmpty / AABB Overlap
-- `physics::relax_after_edit`：沙/土/草竖直下落、破坏支撑后补落、受阻后斜下滑落、单次预算限制
+- `physics::relax_after_edit`（瞬间松弛参考实现，语义被 `try_relax_one` 超预算兜底复用；生产逐格颗粒下落走 `step_soft_grains` + `tick_free_objects`）：沙/土/草竖直下落、破坏支撑后补落、受阻后斜下滑落、单次预算限制
 - `Server::handle_message` 集成：Hello 落表 / PlayerInput 更新 / Break 成功广播 / Place 重叠拒绝
 - 全部 10 个单元测试通过 `cargo test -p voxweb-server --lib`
 

@@ -363,7 +363,7 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 - **下落**：`tick_free_objects` 对 grain 走专门分支——竖直方向真实自由落体；落到边缘（直下受阻但斜下方有空格）时朝确定性下坡方向给一个水平初速，颗粒沿顶面爬到边缘后在重力下**抛物线滑入低处**，从而"斜滑摊平成堆"。为避免相邻 cell 间方向翻转导致抖动，滑动会保持当前方向直到不再是有效下坡。
 - **级联**：grain 离开源格或落定时唤醒上方/斜上方邻居重新入队，形成可见的**逐帧塔塌**；1 宽沙柱会按 1:1 休止角摊平，而不是保持单柱。
 - **落定**：颗粒静止后 `find_projectable_position` 找到空格，单格投影回 `MaterialField` 并合并进 `FreeObjectProjectBatch`。同一列多个颗粒靠场占用自然堆叠。
-- **限流/兜底**：活跃 grain 有上限（`MAX_ACTIVE_GRAINS`）、每 tick 提取有预算（`GRAIN_SPAWN_BUDGET_PER_TICK`）；超出的不稳定 cell 回退到瞬间松弛 `relax_after_edit` 单步并发 `FieldDelta`，保证收敛、状态有界。
+- **限流/兜底**：活跃 grain 有上限（`MAX_ACTIVE_GRAINS`）、每 tick 提取有预算（`GRAIN_SPAWN_BUDGET_PER_TICK`）；超出的不稳定 cell 回退到瞬间松弛 `try_relax_one` 单步并发 `FieldDelta`，保证收敛、状态有界。
 - 提取、下落状态和投影都保留完整 `MaterialCell`，不会把 occupancy / secondary 退化成单纯 `BlockID`。
 - 已知视觉取舍：飞行中的 grain 渲染成 sample cube（方块感），落定后并回 `SmoothGranular` 高度场平滑外观。
 
