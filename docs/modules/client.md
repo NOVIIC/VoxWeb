@@ -618,7 +618,7 @@ Remote 模式不会本地生成地形。`ChunkLoader` 在 Remote 下维护两组
 - `loaded`：已经收到完整 `FieldSnapshot` 并写入本地 world 的 chunk
 - `requested`：已经通过 `FieldRequest` 发给 Host、正在等待快照的 chunk
 
-运行时单格编辑通过 `FieldDelta` 写入本地 world；硬材质小连通块坍落通过 `FreeObjectSpawn` 在本地创建 active FreeObject，并通过 `FreeObjectState` 更新 transform / velocity。客户端直接渲染 active object 的 sample cube，并把 active AABB 纳入玩家碰撞和 raycast。收到 `FreeObjectProject` 后删除 active object、写入最终静态 cell，并对受影响 chunk 入队重网格化。
+运行时单格编辑通过 `FieldDelta` 写入本地 world；硬材质小连通块坍落通过 `FreeObjectSpawn` 在本地创建 active FreeObject，软材质颗粒（沙/土/草）级联下落通过 `FreeObjectSpawnBatch` 批量创建 active grain，都通过 `FreeObjectState` / `FreeObjectStateBatch` 更新 transform / velocity。客户端直接渲染 active object 的 sample cube，并把 active AABB 纳入玩家碰撞和 raycast。收到 `FreeObjectProject` / `FreeObjectProjectBatch` 后删除 active object、写入最终静态 cell，并对受影响 chunk 入队重网格化。批量消息的 handler 等价于对单条消息 handler 做循环，客户端不区分 grain 与硬材质（都作哑跟随权威状态渲染）。
 
 Connecting 阶段以出生点为中心补齐有效视距；InGame 阶段每次玩家跨 chunk 边界、渲染距离变化或收到 Host 视距变化，重新计算 `(2*effective_render_distance+1)^2` 的 desired 集合，只把 `loaded` / `requested` 都没有的 chunk 打包进 `FieldRequest`。收到 `FieldSnapshot` 后调用 `mark_loaded(pos)`，并重网格化该 chunk 与周围邻居。超过 `effective_render_distance + unload_buffer` 的本地 world chunk 和 GPU mesh 会被卸载。
 

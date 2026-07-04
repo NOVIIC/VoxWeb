@@ -116,6 +116,9 @@ pub struct FreeObject {
     pub mass: f32,
     pub collision_proxy: CollisionProxy,
     pub state: FreeObjectState,
+    /// 是否为软材质颗粒（沙/土/草）。true → tick 中走抛物线斜滑分支；
+    /// 硬材质 FloatingOnly 为 false，保持刚性落定。旧存档 `#[serde(default)]` = false。
+    pub granular: bool,
 }
 ```
 

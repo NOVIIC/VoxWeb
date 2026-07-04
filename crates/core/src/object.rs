@@ -20,6 +20,10 @@ pub struct FreeObject {
     pub mass: f32,
     pub collision_proxy: CollisionProxy,
     pub state: FreeObjectState,
+    /// 是否为软材质颗粒（sand/dirt/grass）。true 时在 tick 中走抛物线斜滑分支；
+    /// 硬材质 `FloatingOnly` 对象为 false，保持刚性落定。旧存档默认 false。
+    #[serde(default)]
+    pub granular: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,7 +67,15 @@ pub enum FreeObjectState {
 
 impl FreeObject {
     pub fn dynamic_from_cells(id: ObjectID, cells: &[(Position, MaterialCell)]) -> Option<Self> {
-        Self::from_cells(id, cells, 0, FreeObjectState::Dynamic, Vec3::ZERO)
+        Self::from_cells(id, cells, 0, FreeObjectState::Dynamic, Vec3::ZERO, false)
+    }
+
+    /// 软材质颗粒：单/小 cell 的动态对象，tick 中走抛物线斜滑分支。
+    pub fn dynamic_grain_from_cells(
+        id: ObjectID,
+        cells: &[(Position, MaterialCell)],
+    ) -> Option<Self> {
+        Self::from_cells(id, cells, 0, FreeObjectState::Dynamic, Vec3::ZERO, true)
     }
 
     pub fn projected_from_cells(
@@ -77,6 +89,7 @@ impl FreeObject {
             final_offset_y,
             FreeObjectState::Projected,
             Vec3::ZERO,
+            false,
         )
     }
 
@@ -86,6 +99,7 @@ impl FreeObject {
         final_offset_y: i32,
         state: FreeObjectState,
         velocity: Vec3,
+        granular: bool,
     ) -> Option<Self> {
         let first = cells.first()?;
         let mut min = first.0;
@@ -158,6 +172,7 @@ impl FreeObject {
             mass,
             collision_proxy: CollisionProxy::Aabb(Aabb::new(final_min, final_max)),
             state,
+            granular,
         })
     }
 

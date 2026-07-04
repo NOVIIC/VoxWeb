@@ -26,11 +26,42 @@ const FLOATING_COMPONENT_CELL_LIMIT: usize = 4096;
 const FREE_OBJECT_DT: f32 = 1.0 / 60.0;
 const FREE_OBJECT_GRAVITY: f32 = -32.0;
 const FREE_OBJECT_TERMINAL_VELOCITY: f32 = -78.0;
+/// 软材质颗粒斜滑时的水平初速（m/s）。越大滑得越远、越"流动"。
+const GRAIN_SLIDE_SPEED: f32 = 3.0;
+/// 颗粒离地飞行时的水平阻尼，避免斜滑后横向漂移过远。
+const GRAIN_AIR_HORIZONTAL_DAMPING: f32 = 0.8;
+/// 同时活跃的软材质颗粒上限。超过后新的不稳定 cell 回退到瞬间松弛。
+const MAX_ACTIVE_GRAINS: usize = 128;
+/// 单 tick 最多提取多少个新颗粒，平滑突发坍塌的 CPU / 协议峰值。
+const GRAIN_SPAWN_BUDGET_PER_TICK: usize = 32;
+/// 单 tick 最多检查多少个不稳定候选 cell。
+const UNSTABLE_VISIT_BUDGET_PER_TICK: usize = 256;
+
+/// 挖放后需要重新做软材质稳定性判定的邻域偏移（cell 自身 + 上方 + 四侧 + 四斜上）。
+const RELAX_REGION_OFFSETS: [(i32, i32, i32); 10] = [
+    (0, 0, 0),
+    (0, 1, 0),
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+    (1, 1, 0),
+    (-1, 1, 0),
+    (0, 1, 1),
+    (0, 1, -1),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FreeObjectSpawn {
     pub object_id: voxweb_core::ObjectID,
     pub cells: Vec<(Position, MaterialCell)>,
+}
+
+/// `step_soft_grains` 一个 tick 的产物：新提取的颗粒 + 超预算时瞬间松弛的 FieldDelta。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SoftStepEvents {
+    pub spawns: Vec<FreeObjectSpawn>,
+    pub updates: Vec<(Position, MaterialCell)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +183,96 @@ pub fn relax_after_edit(world: &mut World, origin: Position) -> Vec<(Position, M
     updates
 }
 
-/// 第一版硬材质稳定性：`FloatingOnly` 连通块如果完全没有接触任何稳定材质，
+/// 挖放后把编辑点邻域的软材质 cell 塞进 `world.unstable_soft` 队列。
+/// 真正是否下落、何时提取成颗粒由 `step_soft_grains` 每 tick 判定，从而形成可见的级联坍塌。
+pub fn mark_edit_unstable(world: &mut World, origin: Position) {
+    for (dx, dy, dz) in RELAX_REGION_OFFSETS {
+        enqueue_if_soft(
+            world,
+            Position::new(origin.x + dx, origin.y + dy, origin.z + dz),
+        );
+    }
+}
+
+/// 每 tick 推进软材质颗粒级联：从 `unstable_soft` 队列取候选，
+/// 不稳定的软材质 cell 在预算内提取为 active grain（后续由 `tick_free_objects` 下落），
+/// 超预算 / 超上限时回退到瞬间松弛一步以保证收敛。
+pub fn step_soft_grains(world: &mut World) -> SoftStepEvents {
+    let mut events = SoftStepEvents::default();
+    let mut visited = 0usize;
+    let mut spawned = 0usize;
+    let mut refs_dirty = false;
+
+    while visited < UNSTABLE_VISIT_BUDGET_PER_TICK {
+        let Some(pos) = world.next_unstable() else {
+            break;
+        };
+        visited += 1;
+
+        if !is_unstable_soft(world, pos) {
+            continue;
+        }
+
+        let can_spawn =
+            spawned < GRAIN_SPAWN_BUDGET_PER_TICK && world.active_grain_count() < MAX_ACTIVE_GRAINS;
+        if can_spawn {
+            let cell = world.get_cell(pos);
+            world.set_cell(pos, MaterialCell::EMPTY);
+            if let Some(object_id) = world.spawn_grain(pos, cell) {
+                spawned += 1;
+                refs_dirty = true;
+                events.spawns.push(FreeObjectSpawn {
+                    object_id,
+                    cells: vec![(pos, cell)],
+                });
+                wake_support_above(world, pos);
+            } else {
+                // 单 cell 理论上不会失败；万一失败则还原，避免丢方块。
+                world.set_cell(pos, cell);
+            }
+        } else if let Some((from, to, cell)) = try_relax_one(world, pos) {
+            // 兜底：超预算/超上限，瞬间松弛一步并广播 FieldDelta。
+            world.set_cell(from, MaterialCell::EMPTY);
+            world.set_cell(to, cell);
+            events.updates.push((from, MaterialCell::EMPTY));
+            events.updates.push((to, cell));
+            wake_support_above(world, from);
+            enqueue_if_soft(world, to);
+        }
+    }
+
+    if refs_dirty {
+        world.rebuild_free_object_refs();
+    }
+    events
+}
+
+/// cell 是否为可下落/斜滑的软材质：复用 `try_relax_one` 的落点判定。
+fn is_unstable_soft(world: &World, pos: Position) -> bool {
+    try_relax_one(world, pos).is_some()
+}
+
+/// 把 `pos` 上方及四斜上方的软材质 cell 唤醒入队（它们可能因 `pos` 空出而失去支撑）。
+fn wake_support_above(world: &mut World, pos: Position) {
+    for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+        enqueue_if_soft(world, Position::new(pos.x + dx, pos.y + 1, pos.z + dz));
+    }
+}
+
+/// 仅当 `pos` 是已加载、非空、`ImmediateRelaxation` 软材质时入队，避免队列被硬材质/空气膨胀。
+fn enqueue_if_soft(world: &mut World, pos: Position) {
+    if pos.y <= 1 || pos.y >= CHUNK_Y as i32 || !chunk_loaded(world, pos) {
+        return;
+    }
+    let cell = world.get_cell(pos);
+    if cell.is_empty() {
+        return;
+    }
+    if properties(cell.primary).stability != StabilityPolicy::ImmediateRelaxation {
+        return;
+    }
+    world.enqueue_unstable(pos);
+}
 /// 就从静态场提取为 active FreeObject，后续由 tick 中的 AABB 动态体推进。
 pub fn resolve_floating_after_edit(world: &mut World, origin: Position) -> Vec<FreeObjectSpawn> {
     let mut spawns = Vec::new();
@@ -198,56 +318,15 @@ pub fn tick_free_objects(world: &mut World) -> FreeObjectTickEvents {
     let mut refs_dirty = false;
 
     for id in ids {
-        let Some(mut object) = world.free_objects.get(&id).cloned() else {
+        let Some(object) = world.free_objects.get(&id).cloned() else {
             continue;
         };
-
-        object.velocity.y = (object.velocity.y + FREE_OBJECT_GRAVITY * FREE_OBJECT_DT)
-            .max(FREE_OBJECT_TERMINAL_VELOCITY);
-        let next_position = object.transform.position + object.velocity * FREE_OBJECT_DT;
-
-        if static_collides_with_object(world, &object, next_position) {
-            let settled_position =
-                settle_position(world, &object, object.transform.position, next_position);
-            let Some(project_position) =
-                find_projectable_position(world, &object, settled_position)
-            else {
-                if let Some(stored) = world.free_objects.get_mut(&id) {
-                    stored.velocity = Vec3::ZERO;
-                    stored.transform.position = object.transform.position;
-                    events.states.push(FreeObjectStateUpdate {
-                        object_id: id,
-                        position: stored.transform.position,
-                        velocity: stored.velocity,
-                    });
-                }
-                continue;
-            };
-            let cells = object.cells_at_position(project_position);
-            let mut deltas = Vec::with_capacity(cells.len());
-            for (pos, cell) in cells {
-                world.set_cell(pos, cell);
-                deltas.push((pos, cell));
-            }
-            world.free_objects.remove(&id);
-            refs_dirty = true;
-            events.projections.push(FreeObjectProjection {
-                object_id: id,
-                deltas,
-            });
-            continue;
-        }
-
-        if let Some(stored) = world.free_objects.get_mut(&id) {
-            stored.velocity = object.velocity;
-            stored.transform.position = next_position;
-            events.states.push(FreeObjectStateUpdate {
-                object_id: id,
-                position: next_position,
-                velocity: object.velocity,
-            });
-            refs_dirty = true;
-        }
+        let dirty = if object.granular {
+            tick_grain(world, id, object, &mut events)
+        } else {
+            tick_rigid_object(world, id, object, &mut events)
+        };
+        refs_dirty |= dirty;
     }
 
     if refs_dirty {
@@ -255,6 +334,211 @@ pub fn tick_free_objects(world: &mut World) -> FreeObjectTickEvents {
     }
 
     events
+}
+
+/// 硬材质刚性对象：竖直自由落体，碰撞后二分求落点并整体投影回场。行为与旧实现一致。
+fn tick_rigid_object(
+    world: &mut World,
+    id: voxweb_core::ObjectID,
+    mut object: voxweb_core::FreeObject,
+    events: &mut FreeObjectTickEvents,
+) -> bool {
+    object.velocity.y = (object.velocity.y + FREE_OBJECT_GRAVITY * FREE_OBJECT_DT)
+        .max(FREE_OBJECT_TERMINAL_VELOCITY);
+    let next_position = object.transform.position + object.velocity * FREE_OBJECT_DT;
+
+    if static_collides_with_object(world, &object, next_position) {
+        let settled_position =
+            settle_position(world, &object, object.transform.position, next_position);
+        let Some(project_position) = find_projectable_position(world, &object, settled_position)
+        else {
+            if let Some(stored) = world.free_objects.get_mut(&id) {
+                stored.velocity = Vec3::ZERO;
+                stored.transform.position = object.transform.position;
+                events.states.push(FreeObjectStateUpdate {
+                    object_id: id,
+                    position: stored.transform.position,
+                    velocity: stored.velocity,
+                });
+            }
+            return false;
+        };
+        let cells = object.cells_at_position(project_position);
+        let mut deltas = Vec::with_capacity(cells.len());
+        for (pos, cell) in cells {
+            world.set_cell(pos, cell);
+            deltas.push((pos, cell));
+        }
+        world.free_objects.remove(&id);
+        events.projections.push(FreeObjectProjection {
+            object_id: id,
+            deltas,
+        });
+        return true;
+    }
+
+    if let Some(stored) = world.free_objects.get_mut(&id) {
+        stored.velocity = object.velocity;
+        stored.transform.position = next_position;
+        events.states.push(FreeObjectStateUpdate {
+            object_id: id,
+            position: next_position,
+            velocity: object.velocity,
+        });
+        return true;
+    }
+    false
+}
+
+/// 软材质颗粒：真实自由落体 + 落到边缘时朝下坡方向抛物线斜滑；静止后单格投影回场。
+///
+/// 分轴推进（先 Y 再 X/Z）：落地后若旁边存在更低的空格，就给一个朝该方向的水平初速，
+/// 颗粒沿顶面爬到边缘后在重力下抛物线滑入低处——这就是"斜滑摊平成堆"的可见过程。
+fn tick_grain(
+    world: &mut World,
+    id: voxweb_core::ObjectID,
+    mut object: voxweb_core::FreeObject,
+    events: &mut FreeObjectTickEvents,
+) -> bool {
+    let dt = FREE_OBJECT_DT;
+    object.velocity.y =
+        (object.velocity.y + FREE_OBJECT_GRAVITY * dt).max(FREE_OBJECT_TERMINAL_VELOCITY);
+
+    let mut pos = object.transform.position;
+
+    // —— Y 轴：竖直自由落体，碰撞则吸附到落面 ——
+    let y_target = Vec3::new(pos.x, pos.y + object.velocity.y * dt, pos.z);
+    let grounded = if static_collides_with_object(world, &object, y_target) {
+        pos = settle_position(world, &object, pos, y_target);
+        object.velocity.y = 0.0;
+        true
+    } else {
+        pos.y = y_target.y;
+        false
+    };
+    object.transform.position = pos;
+
+    // —— 水平：落地时朝下坡方向给初速；离地时阻尼收敛，避免横向漂移过远 ——
+    if grounded {
+        let cell = grain_cell(pos);
+        // 已在滑动且当前方向仍是有效下坡就保持，避免相邻 cell 间方向翻转导致来回抖动、永不静止。
+        let keep = dominant_horizontal_dir(object.velocity)
+            .filter(|&(dx, dz)| is_downhill_dir(world, cell, dx, dz));
+        match keep.or_else(|| grain_downhill_dir(world, &object, pos)) {
+            Some((dx, dz)) => {
+                object.velocity.x = dx as f32 * GRAIN_SLIDE_SPEED;
+                object.velocity.z = dz as f32 * GRAIN_SLIDE_SPEED;
+            }
+            None => {
+                object.velocity.x = 0.0;
+                object.velocity.z = 0.0;
+            }
+        }
+    } else {
+        object.velocity.x *= GRAIN_AIR_HORIZONTAL_DAMPING;
+        object.velocity.z *= GRAIN_AIR_HORIZONTAL_DAMPING;
+        if object.velocity.x.abs() < 0.01 {
+            object.velocity.x = 0.0;
+        }
+        if object.velocity.z.abs() < 0.01 {
+            object.velocity.z = 0.0;
+        }
+    }
+
+    // —— X / Z 轴：分轴推进，撞静态场则该轴归零 ——
+    if object.velocity.x != 0.0 {
+        let x_target = Vec3::new(pos.x + object.velocity.x * dt, pos.y, pos.z);
+        if static_collides_with_object(world, &object, x_target) {
+            object.velocity.x = 0.0;
+        } else {
+            pos.x = x_target.x;
+        }
+    }
+    if object.velocity.z != 0.0 {
+        let z_target = Vec3::new(pos.x, pos.y, pos.z + object.velocity.z * dt);
+        if static_collides_with_object(world, &object, z_target) {
+            object.velocity.z = 0.0;
+        } else {
+            pos.z = z_target.z;
+        }
+    }
+    object.transform.position = pos;
+
+    // —— 静止判定：落地 + 无水平速度 → 单格投影回场，并唤醒上方邻居继续级联 ——
+    // 落点被占（另一个颗粒先落）时 find_projectable_position 返回 None：悬停，下 tick 再试。
+    let at_rest = grounded && object.velocity.x == 0.0 && object.velocity.z == 0.0;
+    if at_rest && let Some(project_position) = find_projectable_position(world, &object, pos) {
+        let cells = object.cells_at_position(project_position);
+        let mut deltas = Vec::with_capacity(cells.len());
+        for (cell_pos, cell) in cells {
+            world.set_cell(cell_pos, cell);
+            deltas.push((cell_pos, cell));
+            wake_support_above(world, cell_pos);
+        }
+        world.free_objects.remove(&id);
+        events.projections.push(FreeObjectProjection {
+            object_id: id,
+            deltas,
+        });
+        return true;
+    }
+
+    if let Some(stored) = world.free_objects.get_mut(&id) {
+        stored.velocity = object.velocity;
+        stored.transform.position = object.transform.position;
+        events.states.push(FreeObjectStateUpdate {
+            object_id: id,
+            position: object.transform.position,
+            velocity: object.velocity,
+        });
+        return true;
+    }
+    false
+}
+
+/// 颗粒落地后可斜滑的方向：旁边同高为空、且斜下方可容纳。无则返回 None（原地静止）。
+fn grain_downhill_dir(
+    world: &World,
+    object: &voxweb_core::FreeObject,
+    pos: Vec3,
+) -> Option<(i32, i32)> {
+    let cell = grain_cell(pos);
+    let material = object
+        .samples
+        .first()
+        .map(|sample| sample.cell().primary)
+        .unwrap_or(BlockID::AIR);
+    ordered_slide_dirs(cell, material)
+        .into_iter()
+        .find(|&(dx, dz)| is_downhill_dir(world, cell, dx, dz))
+}
+
+/// 从 `cell` 朝 (dx,dz) 是否可斜滑：同高侧格为空、斜下方格可容纳。
+fn is_downhill_dir(world: &World, cell: Position, dx: i32, dz: i32) -> bool {
+    let side = Position::new(cell.x + dx, cell.y, cell.z + dz);
+    let target = Position::new(cell.x + dx, cell.y - 1, cell.z + dz);
+    can_receive_granular(world, side) && can_receive_granular(world, target)
+}
+
+/// 颗粒当前所在的整数 cell。
+fn grain_cell(pos: Vec3) -> Position {
+    Position::new(
+        pos.x.round() as i32,
+        pos.y.round() as i32,
+        pos.z.round() as i32,
+    )
+}
+
+/// 从速度提取主导水平方向（用于保持滑动方向一致，避免抖动）。
+fn dominant_horizontal_dir(velocity: Vec3) -> Option<(i32, i32)> {
+    let (ax, az) = (velocity.x.abs(), velocity.z.abs());
+    if ax < 0.01 && az < 0.01 {
+        None
+    } else if ax >= az {
+        Some((velocity.x.signum() as i32, 0))
+    } else {
+        Some((0, velocity.z.signum() as i32))
+    }
 }
 
 fn floating_candidates(origin: Position) -> [Position; 11] {
@@ -411,18 +695,7 @@ fn projection_cells_clear(world: &World, object: &voxweb_core::FreeObject, posit
 }
 
 fn enqueue_relaxation_region(queue: &mut VecDeque<Position>, origin: Position) {
-    for (dx, dy, dz) in [
-        (0, 0, 0),
-        (0, 1, 0),
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-        (1, 1, 0),
-        (-1, 1, 0),
-        (0, 1, 1),
-        (0, 1, -1),
-    ] {
+    for (dx, dy, dz) in RELAX_REGION_OFFSETS {
         queue.push_back(Position::new(origin.x + dx, origin.y + dy, origin.z + dz));
     }
 }
@@ -830,6 +1103,175 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 反复推进 step_soft_grains + tick_free_objects 直到没有活跃颗粒且队列清空，返回耗时 tick 数。
+    fn run_soft_sim(world: &mut World, max_ticks: usize) -> usize {
+        for tick in 0..max_ticks {
+            if world.active_grain_count() == 0 && world.unstable_len() == 0 {
+                return tick;
+            }
+            step_soft_grains(world);
+            tick_free_objects(world);
+        }
+        max_ticks
+    }
+
+    #[test]
+    fn unstable_soft_cell_extracts_to_grain_not_instant() {
+        // 悬空沙子：mark + 一步 step_soft_grains 应提取成 active grain，而不是瞬间落定。
+        let mut w = world_with_stone_chunk();
+        let sand = Position::new(4, 66, 4);
+        clear_box(&mut w, 4..=4, 65..=70, 4..=4); // 65 起留空，让沙子能落
+        w.set_block(sand, BlockID::SAND);
+
+        mark_edit_unstable(&mut w, sand);
+        let events = step_soft_grains(&mut w);
+
+        assert_eq!(events.spawns.len(), 1, "应提取出 1 个颗粒");
+        assert!(events.updates.is_empty(), "预算内不应走瞬间松弛兜底");
+        assert_eq!(w.get_block(sand), BlockID::AIR, "颗粒 cell 已从静态场移除");
+        assert_eq!(w.active_grain_count(), 1);
+        let grain = w.free_objects.values().next().unwrap();
+        assert!(grain.granular);
+        assert_eq!(grain.samples.len(), 1);
+    }
+
+    #[test]
+    fn grain_falls_over_ticks_and_projects_to_support() {
+        let mut w = world_with_stone_chunk(); // stone plane at y=64, air at 65
+        let sand = Position::new(4, 68, 4);
+        clear_box(&mut w, 4..=4, 65..=70, 4..=4);
+        w.set_block(sand, BlockID::SAND);
+
+        mark_edit_unstable(&mut w, sand);
+        let ticks = run_soft_sim(&mut w, 600);
+
+        assert!(ticks > 1, "应经过多帧下落而非瞬间到位，实际 {ticks} tick");
+        assert!(ticks < 600, "应在上限内稳定");
+        assert_eq!(w.get_block(sand), BlockID::AIR);
+        assert_eq!(
+            w.get_block(Position::new(4, 65, 4)),
+            BlockID::SAND,
+            "应落在石头顶上 y=65"
+        );
+        assert!(w.free_objects.is_empty());
+    }
+
+    #[test]
+    fn grain_slides_off_edge_and_settles_lower() {
+        // 沙子落在一个 1 宽石柱顶上，直下受阻但旁边是空的 → 抛物线滑落到低处。
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        clear_box(&mut w, 2..=6, 1..=12, 2..=6);
+        for x in 2..=6 {
+            for z in 2..=6 {
+                w.set_block(Position::new(x, 1, z), BlockID::STONE); // 地板 y=1
+            }
+        }
+        // (4,2,4) 石柱，沙子放柱顶上方
+        w.set_block(Position::new(4, 2, 4), BlockID::STONE);
+        let sand = Position::new(4, 4, 4);
+        w.set_block(sand, BlockID::SAND);
+
+        mark_edit_unstable(&mut w, sand);
+        let ticks = run_soft_sim(&mut w, 600);
+
+        assert!(ticks < 600, "应稳定");
+        assert_eq!(w.get_block(sand), BlockID::AIR, "沙子应离开原位");
+        assert!(w.free_objects.is_empty());
+        // 沙子应落在地板上（y=2），且偏离了原来的 x=4,z=4 柱心（滑到旁边）。
+        let mut found = None;
+        for x in 2..=6 {
+            for z in 2..=6 {
+                if w.get_block(Position::new(x, 2, z)) == BlockID::SAND {
+                    found = Some((x, z));
+                }
+            }
+        }
+        let (fx, fz) = found.expect("沙子应落在地板层 y=2");
+        assert!(fx != 4 || fz != 4, "应滑到柱心以外，实际落点 ({fx},{fz})");
+    }
+
+    #[test]
+    fn floating_sand_column_cascades_and_conserves_mass() {
+        // 悬空沙柱应逐格坍落并按 1:1 休止角摊平成堆：质量守恒、无悬空、最终稳定。
+        // 用干净平地（四周全空），避免地形噪声制造额外斜滑机会干扰断言。
+        let mut w = World::new(0);
+        w.ensure_chunk_generated(ChunkPos::new(0, 0));
+        clear_box(&mut w, 0..=15, 1..=40, 0..=15);
+        for x in 0..16 {
+            for z in 0..16 {
+                w.set_block(Position::new(x, 1, z), BlockID::STONE); // 地板 y=1
+            }
+        }
+        let column = [2, 3, 4, 5]; // (8, 2..=5, 8) 4 格沙柱，底格落在地板上
+        for y in column {
+            w.set_block(Position::new(8, y, 8), BlockID::SAND);
+        }
+
+        mark_edit_unstable(&mut w, Position::new(8, 2, 8));
+        let ticks = run_soft_sim(&mut w, 2000);
+
+        assert!(ticks > 1, "应经过多帧坍落而非瞬间");
+        assert!(ticks < 2000, "应在上限内稳定");
+        assert!(w.free_objects.is_empty(), "所有颗粒应落定");
+
+        // 质量守恒：整片区域内沙子总数不变。
+        let mut total = 0usize;
+        let mut column_height = 0usize;
+        for x in 0..16 {
+            for y in 1..40 {
+                for z in 0..16 {
+                    if w.get_block(Position::new(x, y, z)) == BlockID::SAND {
+                        total += 1;
+                        if x == 8 && z == 8 {
+                            column_height += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(total, column.len(), "沙子数量应守恒");
+        // 底格落在地板上，且沙堆应摊开（不再是 4 高的单柱）。
+        assert_eq!(
+            w.get_block(Position::new(8, 2, 8)),
+            BlockID::SAND,
+            "柱底应留在地板上"
+        );
+        assert!(
+            column_height < column.len(),
+            "1 宽沙柱应摊平成堆，而不是保持原样"
+        );
+    }
+
+    #[test]
+    fn per_tick_spawn_budget_caps_grains_and_falls_back() {
+        // 大片悬空沙板：单步 step 最多提取 GRAIN_SPAWN_BUDGET_PER_TICK 个颗粒，
+        // 其余在访问预算内走瞬间松弛兜底（updates 非空）。
+        let mut w = world_with_stone_chunk();
+        let mut cells = Vec::new();
+        for x in 0..15 {
+            for z in 0..15 {
+                let pos = Position::new(x, 66, z);
+                clear_box(&mut w, x..=x, 65..=67, z..=z);
+                w.set_block(pos, BlockID::SAND);
+                cells.push(pos);
+            }
+        }
+        for pos in &cells {
+            w.enqueue_unstable(*pos);
+        }
+
+        let events = step_soft_grains(&mut w);
+
+        assert_eq!(
+            events.spawns.len(),
+            GRAIN_SPAWN_BUDGET_PER_TICK,
+            "单步提取应被 per-tick 预算限住"
+        );
+        assert_eq!(w.active_grain_count(), GRAIN_SPAWN_BUDGET_PER_TICK);
+        assert!(!events.updates.is_empty(), "超预算的 cell 应走瞬间松弛兜底");
     }
 
     fn projection_deltas(projections: &[FreeObjectProjection]) -> Vec<(Position, MaterialCell)> {

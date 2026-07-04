@@ -25,6 +25,11 @@ pub struct World {
     pub field_chunks: HashMap<ChunkPos, FieldChunk>,
     /// 从静态场提取出的材质团。Dynamic 对象按 tick 模拟，静止后投影回 FieldChunk。
     pub free_objects: HashMap<ObjectID, FreeObject>,
+    /// 待做稳定性判定的软材质 cell 队列（沙/土/草颗粒下落级联）。
+    /// 编辑与颗粒 spawn/settle 会把邻域入队，`physics::step_soft_grains` 每 tick 限额 drain。
+    pub unstable_soft: VecDeque<Position>,
+    /// `unstable_soft` 的去重集合，避免同一 cell 反复入队膨胀。
+    unstable_soft_set: HashSet<Position>,
     pub terrain: TerrainGenerator,
     /// 自创建以来的总 tick 数（Phase 2 仅累加，Phase 5 起驱动 Server::broadcast_tick）
     pub tick_count: u64,
@@ -47,6 +52,8 @@ impl World {
             chunks: HashMap::new(),
             field_chunks: HashMap::new(),
             free_objects: HashMap::new(),
+            unstable_soft: VecDeque::new(),
+            unstable_soft_set: HashSet::new(),
             terrain: TerrainGenerator::new(seed),
             tick_count: 0,
             dirty_chunks: HashSet::new(),
@@ -274,6 +281,42 @@ impl World {
         self.free_objects.insert(id, object);
         self.rebuild_free_object_refs();
         Some(id)
+    }
+
+    /// 提取一个软材质颗粒（sand/dirt/grass）为 active grain 对象。
+    /// 不重建 free_object_refs（调用方在批量 spawn 后统一 `rebuild_free_object_refs`）。
+    pub fn spawn_grain(&mut self, pos: Position, cell: MaterialCell) -> Option<ObjectID> {
+        let id = self.allocate_object_id();
+        let object = FreeObject::dynamic_grain_from_cells(id, &[(pos, cell)])?;
+        self.free_objects.insert(id, object);
+        Some(id)
+    }
+
+    /// 当前活跃（Dynamic）软材质颗粒数量，用于限制同时下落的 grain 上限。
+    pub fn active_grain_count(&self) -> usize {
+        self.free_objects
+            .values()
+            .filter(|object| object.granular && object.state == FreeObjectState::Dynamic)
+            .count()
+    }
+
+    /// 把一个 cell 加入软材质稳定性判定队列（去重）。真正是否下落由 physics 层判定。
+    pub fn enqueue_unstable(&mut self, pos: Position) {
+        if self.unstable_soft_set.insert(pos) {
+            self.unstable_soft.push_back(pos);
+        }
+    }
+
+    /// 从队列取出下一个待判定 cell。
+    pub fn next_unstable(&mut self) -> Option<Position> {
+        let pos = self.unstable_soft.pop_front()?;
+        self.unstable_soft_set.remove(&pos);
+        Some(pos)
+    }
+
+    /// 当前排队待判定的软材质 cell 数量。
+    pub fn unstable_len(&self) -> usize {
+        self.unstable_soft.len()
     }
 
     pub fn insert_dynamic_free_object(

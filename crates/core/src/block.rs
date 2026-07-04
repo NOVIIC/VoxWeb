@@ -61,7 +61,7 @@ pub enum StabilityPolicy {
     FutureFluid,
 }
 
-/// 材质决定放置 kernel；当前运行时只实现 SingleCell。
+/// 材质放置 kernel（设计路由字段）；当前运行时未按 kernel 分派，放置一律走单格路径。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum PlacementKernel {
     None,
@@ -69,7 +69,7 @@ pub enum PlacementKernel {
     GranularLocal,
 }
 
-/// 材质决定挖掘 kernel；当前运行时只实现 SingleCell。
+/// 材质挖掘 kernel（设计路由字段）；当前运行时未按 kernel 分派，挖掘一律走单格路径。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum BreakKernel {
     None,

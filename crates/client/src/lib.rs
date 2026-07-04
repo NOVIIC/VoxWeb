@@ -3016,6 +3016,57 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                 }
             }
         }
+        ServerMessage::FreeObjectSpawnBatch { spawns } => {
+            // 软材质颗粒批量提取：语义等价多条 FreeObjectSpawn。
+            for (object_id, cells) in spawns {
+                let cells = cells
+                    .into_iter()
+                    .filter(|(_, cell)| !cell.is_empty())
+                    .collect::<Vec<_>>();
+                if game.mode == GameMode::Remote {
+                    let mut server = game.server.borrow_mut();
+                    for (pos, _) in &cells {
+                        server.world.set_cell_untracked(*pos, MaterialCell::EMPTY);
+                    }
+                    let _ = server.world.insert_dynamic_free_object(object_id, &cells);
+                }
+                for (pos, _) in cells {
+                    for cp in affected_chunks(pos) {
+                        game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                    }
+                }
+            }
+        }
+        ServerMessage::FreeObjectStateBatch { states } => {
+            if game.mode == GameMode::Remote {
+                let mut server = game.server.borrow_mut();
+                for (object_id, position, velocity) in states {
+                    if let Some(object) = server.world.free_objects.get_mut(&object_id) {
+                        object.transform.position = position;
+                        object.velocity = velocity;
+                    }
+                }
+            }
+        }
+        ServerMessage::FreeObjectProjectBatch { projections } => {
+            for (object_id, deltas) in projections {
+                if game.mode == GameMode::Remote {
+                    game.server
+                        .borrow_mut()
+                        .world
+                        .free_objects
+                        .remove(&object_id);
+                }
+                for (pos, cell) in deltas {
+                    if game.mode == GameMode::Remote {
+                        game.server.borrow_mut().world.set_cell_untracked(pos, cell);
+                    }
+                    for cp in affected_chunks(pos) {
+                        game.mesh_jobs.enqueue(cp, MeshPriority::High);
+                    }
+                }
+            }
+        }
         ServerMessage::ActionAck {
             request_id,
             accepted,

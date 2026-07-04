@@ -319,11 +319,10 @@ fn handle_message_break_broadcasts_free_object_spawn_for_floating_hard_block() {
                 (&m.recipient, &m.message),
                 (
                     Recipient::All,
-                    ServerMessage::FreeObjectProject {
-                        object_id: _,
-                        deltas,
-                    }
-                ) if deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
+                    ServerMessage::FreeObjectProjectBatch { projections }
+                ) if projections.iter().any(|(_, deltas)| {
+                    deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
+                })
             )
         }) {
             break;
@@ -334,16 +333,15 @@ fn handle_message_break_broadcasts_free_object_spawn_for_floating_hard_block() {
             (&m.recipient, &m.message),
             (
                 Recipient::All,
-                ServerMessage::FreeObjectProject {
-                    object_id: _,
-                    deltas,
-                }
-            ) if deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
+                ServerMessage::FreeObjectProjectBatch { projections }
+            ) if projections.iter().any(|(_, deltas)| {
+                deltas.iter().any(|(_, cell)| cell.to_block_id() == voxweb_core::BlockID::STONE)
+            })
         )
     });
     assert!(
         projection.is_some(),
-        "missing FreeObjectProject after dynamic object settles"
+        "missing FreeObjectProjectBatch after dynamic object settles"
     );
 }
 
@@ -420,7 +418,7 @@ fn handle_message_place_overlap_rejected_and_no_field_delta() {
 }
 
 #[test]
-fn handle_message_place_granular_broadcasts_relaxed_updates() {
+fn handle_message_place_granular_spawns_falling_grain() {
     let (mut server, eid) = prepare_world();
     let placed = Position::new(5, 66, 3);
     let settled = Position::new(5, 65, 3);
@@ -438,8 +436,12 @@ fn handle_message_place_granular_broadcasts_relaxed_updates() {
         },
     );
 
-    assert_eq!(server.world.get_block(placed), voxweb_core::BlockID::AIR);
-    assert_eq!(server.world.get_block(settled), voxweb_core::BlockID::SAND);
+    // 放置即时只落在放置点并广播编辑 FieldDelta；下落改由后续 tick 逐格模拟。
+    assert_eq!(
+        server.world.get_block(placed),
+        voxweb_core::BlockID::SAND,
+        "放置后沙子先停在放置点，尚未下落"
+    );
     assert!(server.outbox.iter().any(|m| {
         matches!(
             m.message,
@@ -447,20 +449,43 @@ fn handle_message_place_granular_broadcasts_relaxed_updates() {
                 if pos == placed && cell.to_block_id() == voxweb_core::BlockID::SAND
         )
     }));
-    assert!(server.outbox.iter().any(|m| {
-        matches!(
-            m.message,
-            ServerMessage::FieldDelta { pos, cell }
-                if pos == placed && cell.to_block_id() == voxweb_core::BlockID::AIR
-        )
-    }));
-    assert!(server.outbox.iter().any(|m| {
-        matches!(
-            m.message,
-            ServerMessage::FieldDelta { pos, cell }
-                if pos == settled && cell.to_block_id() == voxweb_core::BlockID::SAND
-        )
-    }));
+
+    // 驱动 tick：颗粒提取（SpawnBatch）→ 自由落体 → 落定（ProjectBatch）。
+    let mut spawned = false;
+    let mut projected = false;
+    for _ in 0..180 {
+        server.tick();
+        if server.outbox.iter().any(|m| {
+            matches!(
+                &m.message,
+                ServerMessage::FreeObjectSpawnBatch { spawns }
+                    if spawns.iter().any(|(_, cells)| cells.iter().any(|(pos, cell)| {
+                        *pos == placed && cell.to_block_id() == voxweb_core::BlockID::SAND
+                    }))
+            )
+        }) {
+            spawned = true;
+        }
+        if server.outbox.iter().any(|m| {
+            matches!(
+                &m.message,
+                ServerMessage::FreeObjectProjectBatch { projections }
+                    if projections.iter().any(|(_, deltas)| deltas.iter().any(|(pos, cell)| {
+                        *pos == settled && cell.to_block_id() == voxweb_core::BlockID::SAND
+                    }))
+            )
+        }) {
+            projected = true;
+        }
+        if server.world.get_block(settled) == voxweb_core::BlockID::SAND {
+            break;
+        }
+    }
+
+    assert!(spawned, "应广播 FreeObjectSpawnBatch 提取下落颗粒");
+    assert!(projected, "应广播 FreeObjectProjectBatch 记录落定");
+    assert_eq!(server.world.get_block(placed), voxweb_core::BlockID::AIR);
+    assert_eq!(server.world.get_block(settled), voxweb_core::BlockID::SAND);
 }
 
 #[test]

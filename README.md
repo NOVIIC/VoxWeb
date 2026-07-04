@@ -38,11 +38,11 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 已落地：
 
 - 浏览器能力前置检测：WebAssembly / WebGPU / OPFS / WebRTC / WebSocket / 指针锁；触屏设备默认拦截
-- 单机与 Host 共用 `server` 权威逻辑；Remote 通过 FieldSnapshot、FieldDelta、FreeObjectSpawn/State/Project、PlayerTick 同步
+- 单机与 Host 共用 `server` 权威逻辑；Remote 通过 FieldSnapshot、FieldDelta、FreeObjectSpawn/State/Project（及批量 Spawn/State/Project Batch）、PlayerTick 同步
 - `core::field` 的 `FieldChunk` 已用于 OPFS 存档和网络快照；`server::World` 的运行时读写、Remote 预测回滚、颗粒松弛和 FreeObject 投影均走 `MaterialCell` API，`core::chunk` 仍作为当前渲染/碰撞适配镜像
 - `core::block` 已有 MaterialID/MaterialProperties 过渡层；`core::field` 已有 FieldChunk/Column/Span 原型和 Chunk 双向转换，`server::World` 会同步维护 `field_chunks` 与 dense `chunks`
 - 石砖进入第 9 格 hotbar，世界最低层生成不可破坏基岩
-- `ImmediateRelaxation` 软材质已有局部松弛原型：沙/土/草在挖放后由 Host / Local-Only 立即下落或滑落，并通过多条 FieldDelta 同步
+- `ImmediateRelaxation` 软材质（沙/土/草）已有**真实颗粒下落动画**：挖放后由 Host / Local-Only 把不稳定 cell 逐格提取为单格 active FreeObject（grain），按 tick 真实自由落体，落到边缘时朝下坡方向抛物线斜滑、摊平成堆，可见级联坍塌；活跃颗粒有上限，超预算的 cell 回退到瞬间松弛。grain 状态通过批量 `FreeObjectSpawnBatch/StateBatch/ProjectBatch` 同步
 - `FloatingOnly` 硬材质已有第一版动态稳定性：完全浮空的小连通块会提取为 active FreeObject，由 Host / Local-Only 按 tick 下落，客户端按 `FreeObjectState` 渲染并把 active AABB 纳入玩家碰撞和 raycast，静止后通过 `FreeObjectProject` 投影回静态场
 - OPFS 会随 chunk 保存 active FreeObject 状态；FreeObject sample 保留完整 `MaterialCell`，重进存档时正在下落的硬材质对象会从 `world.json` 恢复，并重建 `FieldChunk.free_object_refs`
 - 渲染主路径为 Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI
@@ -95,7 +95,7 @@ docs/
 | **Host / Remote / Local-Only** | 房主（跑权威 Server）/ 非房主玩家 / 单人模式（无网络） |
 | **OPFS** | Origin Private File System，浏览器内置“源专属”虚拟文件系统，本项目存档底层 |
 | **FieldChunk** | 统一体素存档/网络快照单元，内部为 16×16 column store，可在 span 与 dense cell 列之间切换 |
-| **DataChannel** | WebRTC 字节流通道。本项目用两条：`reliable`（FieldSnapshot/FieldDelta/FreeObjectSpawn/FreeObjectProject/Chat/Join/Leave）与 `unreliable`（60Hz PlayerTick/FreeObjectState） |
+| **DataChannel** | WebRTC 字节流通道。本项目用两条：`reliable`（FieldSnapshot/FieldDelta/FreeObjectSpawn(Batch)/FreeObjectProject(Batch)/Chat/Join/Leave）与 `unreliable`（60Hz PlayerTick/FreeObjectState(Batch)） |
 | **Tick / Snapshot** | 服务端 60Hz 逻辑步长 / 新玩家加入时的世界全量快照（分片传输） |
 | **Render Graph / Pass** | 多 Pass 渲染调度框架；Pass 即一次 GPU 渲染编码（Depth Pre / Opaque / Skybox / Transparent / UI） |
 | **AABB / DDA / AO** | 玩家碰撞体（0.6×1.8）/ 体素射线检测算法 / 顶点级 4 等级环境光遮蔽 |

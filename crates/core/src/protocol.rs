@@ -13,8 +13,10 @@ use crate::object::ObjectID;
 /// 协议版本号。Hello.version 与之不一致时 Host 拒绝接入。
 /// 任何破坏性消息字段变更必须递增此版本。
 ///
+/// v10：新增 `FreeObjectSpawnBatch/StateBatch/ProjectBatch`；软材质颗粒（沙/土/草）
+///      改为批量 active FreeObject 下落动画。
 /// v9：FreeObject 升级为 Spawn/State/Project 动态生命周期。
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// FieldSnapshot 单片 payload 上限（字节）。
 /// 浏览器 SCTP 用户消息上限约 16 KB；保守留 14 KB，剩余给 frag_index/frag_total/bincode header。
@@ -150,6 +152,19 @@ pub enum ServerMessage {
     FreeObjectProject {
         object_id: ObjectID,
         deltas: Vec<(Position, MaterialCell)>,
+    },
+    /// 批量提取软材质颗粒（sand/dirt/grass）。一帧内可能同时提取多个 grain，
+    /// 合并成一条 reliable 消息避免消息风暴。语义等价于多条 `FreeObjectSpawn`。
+    FreeObjectSpawnBatch {
+        spawns: Vec<(ObjectID, Vec<(Position, MaterialCell)>)>,
+    },
+    /// 批量动态 FreeObject 权威状态。每 tick 把所有活跃 grain 的状态合并成一条
+    /// unreliable 消息。语义等价于多条 `FreeObjectState`。
+    FreeObjectStateBatch { states: Vec<(ObjectID, Vec3, Vec3)> },
+    /// 批量投影：多个 grain 在同一帧落定时合并成一条 reliable 消息。
+    /// 语义等价于多条 `FreeObjectProject`。
+    FreeObjectProjectBatch {
+        projections: Vec<(ObjectID, Vec<(Position, MaterialCell)>)>,
     },
     /// 挖放请求的仲裁结果
     ActionAck {
@@ -353,9 +368,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_nine() {
-        // FreeObject 动态生命周期网络语义为 v9；破坏性变更应同步更新此测试与版本号。
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn protocol_version_is_ten() {
+        // 软材质颗粒批量下落动画网络语义为 v10；破坏性变更应同步更新此测试与版本号。
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -419,6 +434,43 @@ mod tests {
             object_id: 7,
             position: Vec3::new(1.0, 2.0, 3.0),
             velocity: Vec3::new(0.0, -3.0, 0.0),
+        });
+    }
+
+    #[test]
+    fn roundtrip_free_object_batches() {
+        roundtrip(&ServerMessage::FreeObjectSpawnBatch {
+            spawns: vec![
+                (
+                    11,
+                    vec![(
+                        Position::new(4, 65, 4),
+                        MaterialCell::from_block_id(BlockID::SAND),
+                    )],
+                ),
+                (
+                    12,
+                    vec![(
+                        Position::new(5, 66, 4),
+                        MaterialCell::from_block_id(BlockID::DIRT),
+                    )],
+                ),
+            ],
+        });
+        roundtrip(&ServerMessage::FreeObjectStateBatch {
+            states: vec![
+                (11, Vec3::new(4.0, 63.5, 4.0), Vec3::new(0.0, -6.0, 0.0)),
+                (12, Vec3::new(5.0, 64.2, 4.0), Vec3::new(3.0, -4.0, 0.0)),
+            ],
+        });
+        roundtrip(&ServerMessage::FreeObjectProjectBatch {
+            projections: vec![(
+                11,
+                vec![(
+                    Position::new(4, 61, 4),
+                    MaterialCell::from_block_id(BlockID::SAND),
+                )],
+            )],
         });
     }
 

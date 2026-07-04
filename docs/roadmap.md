@@ -12,8 +12,8 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 - **启动与部署**：`trunk` 构建 WASM 客户端，Caddy 静态托管，`signaling/` 独立部署到 Cloudflare Workers + Durable Objects
 - **浏览器前置检测**：在加载 WASM 前检查 WebAssembly、WebGPU、OPFS、WebRTC、WebSocket、指针锁；移动/触屏设备默认展示不可用提示
 - **世界与交互**：Perlin 地形、动态 chunk 加载/卸载、玩家 AABB、Walk/Fly、跳跃、DDA 射线、挖放、hotbar、选中方块线框
-- **材质物理**：软材质局部松弛；硬材质 `FloatingOnly` 小连通块提取为 active FreeObject，按 tick 下落，使用 AABB 参与玩家碰撞/raycast，静止后投影；松弛、预测回滚和 FreeObject 生命周期保留完整 `MaterialCell`
-- **多人同步**：Local-Only / Host / Remote 三角色；Hello/Welcome 握手；FieldSnapshot 分片；FieldRequest；PlayerInput / PlayerTick；FieldDelta；FreeObjectSpawn/State/Project；ActionAck；PeerJoined / PeerLeft
+- **材质物理**：软材质（沙/土/草）颗粒下落动画——不稳定 cell 提取为单格 active FreeObject，真实自由落体 + 抛物线斜滑摊平 + 级联坍塌，活跃颗粒有上限、超预算回退瞬间松弛；硬材质 `FloatingOnly` 小连通块提取为 active FreeObject，按 tick 刚性下落，使用 AABB 参与玩家碰撞/raycast，静止后投影；提取、下落状态、预测回滚和投影保留完整 `MaterialCell`
+- **多人同步**：Local-Only / Host / Remote 三角色；Hello/Welcome 握手；FieldSnapshot 分片；FieldRequest；PlayerInput / PlayerTick；FieldDelta；FreeObjectSpawn/State/Project 及批量 Spawn/State/Project Batch；ActionAck；PeerJoined / PeerLeft
 - **网络兜底**：WebRTC 双 DataChannel 为主；ICE 失败或协商超时时，Host 可把指定 peer 对升级为 Cloudflare Worker WebSocket 字节中继
 - **UI**：大厅、连接进度、HUD、玩家列表、聊天、系统消息、名牌、暂停菜单、设置持久化、断线页面；统一 egui 主题和固定尺寸 HUD 控件
 - **渲染**：WebGPU 多 Pass 主路径，程序化天空、程序化方块纹理图集、自然距离雾、轻量 tone mapping、Depth Pre-Pass、实体方块、`SmoothGranular` 高度场平滑提面、玩家/active FreeObject 盒体、透明方块、选中线框、egui UI
@@ -57,7 +57,49 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 
 ---
 
-## 五、文档维护
+## 五、统一体素 · 待办清单
+
+> 来源：对 [`unified-voxel-design.md`](unified-voxel-design.md) §16 原型路线 + §17 待解决问题的一次实现审计（2026-07）。
+> 勾选状态反映与「设计全量」的差距，不是「能不能玩」——当前第一版闭环可玩，下列是通向设计目标的剩余工作。
+
+### 已落地（对照 §16 原型路线）
+
+- [x] 阶段 1 Cell 语义：`MaterialCell` + `FieldChunk` column store + 材质属性表（数据模型层）
+- [x] 阶段 2 部分：blocky 贪婪网格 + `SmoothGranular` 高度场提面，mesh / raycast / 选中 / 客户端碰撞共用查询
+- [x] 阶段 4 颗粒松弛：逐格 grain 自由落体 + 抛物线斜滑 + 级联坍塌 + 活跃上限 / 超预算兜底 + 分帧预算
+- [x] 阶段 5 FreeObject 第一版：失稳提取 → 平移下落 → 静止投影，质量守恒有测试
+- [x] 阶段 7 部分：`FieldSnapshot` / `FieldDelta` / `FreeObject{Spawn,State,Project}`（含 Batch）/ `ActionAck` / Host 权威 / 完整 `MaterialCell` 预测回滚
+- [x] 持久化：OPFS `FieldChunk` v2 span 压缩存档 + active object `world.json` 恢复 + 严格 `storage_version` 校验
+
+### 🔴 高优先级（最影响可玩性 / 设计闭环）
+
+- [ ] **材质属性驱动颗粒松弛**（large）：把 `angle_of_repose` / `cohesion` 接进 solver，让沙 / 土 / 草表现分化。当前这些属性**运行时零读取**，堆积角恒为硬编码 1:1（≈45°）、滑速恒为常量，三种软材质行为完全一致——这是「统一体素」立论的根基却尚未通电。落点 `crates/server/src/physics.rs`（`is_downhill_dir` / `try_relax_one` / `ordered_slide_dirs`）。对应设计 §5.4、§17.Q7。
+- [ ] **地形自然度**（low → medium）：低频主导 fBm 振幅重排 + 坡度限制 / 轻量 thermal erosion + 平原 / 丘陵 / 山地 biome + 出生点平缓区。落点 `crates/server/src/terrain.rs`。⚠️ 残留台阶感的根因是「连续 1m 单位阶梯 + 满格立方体渲染」，需与下一项配套才有完整视觉收益。对应设计 §9.5、§17.Q7。
+- [ ] **硬软交界 seam / skirt + occupancy 驱动提面**（large）：软表面采样硬 cell 作边界、侧面补 skirt 几何、`SmoothGranular` 改用 column top height / occupancy 输入而非满格 `BlockID`（现平滑面只抬顶角、侧面仍是 1m 竖直 quad、交界露格、AO 恒定无遮蔽）。落点 `crates/render/src/chunk_mesh.rs`、`crates/core/src/surface.rs`。对应设计 §9.2、§9.5、§17.Q2/Q8。
+
+### 🟡 中优先级
+
+- [ ] **硬材质坍塌级联复检**（medium）：现「石块搭在沙上、沙流走后石块仍悬空」，要等下次就近编辑才复检。给硬材质加不稳定队列，grain 移除后唤醒上方硬块复检。落点 `crates/server/src/physics.rs`（`wake_support_above` 目前只唤醒软材质）、`crates/server/src/world.rs`。对应设计 §8.4。
+- [ ] **收紧 `component_is_supported` 支撑语义**（small）：现把任意 solid 邻居都当支撑，包含会自行滑走的沙 / 土 / 草，导致浮空硬块被不稳定软邻居「撑住」。落点 `crates/server/src/physics.rs`。对应设计 §8.1。
+- [ ] **客户端放置预测查动态 AABB**（small）：Remote 乐观放置会短暂误放到下落体侧面再被服务端回滚闪烁；服务端 `validate_place` 已查 active FreeObject AABB，客户端预测未查。落点 `crates/client/src/lib.rs`（放置预测路径）。对应设计 §9.4、§17.Q5。
+- [ ] **placement / break kernel 派发**（large，前瞻架构）：读 `placement_kernel` / `break_kernel` 决定 SingleCell vs GranularLocal；实现 §6.2 放置四步与 §6.4 多材质叠加优先级；新增 `ApplyKernel` 协议消息（`PROTOCOL_VERSION` 需递增）。当前单格路径对现有材质功能完整、无 bug，属架构补齐。落点 `crates/server/src/lib.rs`、`crates/core/src/protocol.rs`。对应设计 §6、§12.1、§17.Q1/Q9。
+- [ ] **FreeObject transform / velocity 量化**（medium）：去掉 unreliable 通道上的裸 `f32` 权威状态，改定点 / 半精度。当前 Host 权威 + Remote 只渲染，无功能 bug，价值在带宽与未来预测确定性。落点 `crates/core/src/protocol.rs`。对应设计 §12.2、§17.Q4。
+- [ ] **region hash 纠偏 + `material_registry_version`**（medium）：给 `FieldChunk` / region 加 checksum 供丢包乱序纠偏；存档追加材质迁移编号。单人 v1 下「拒绝 + 删档」是设计认可策略，此项面向多人与长期演进。落点 `crates/core/src/field.rs`、`crates/server/src/persistence.rs`、`crates/client/src/storage.rs`。对应设计 §12.2、§13、§17.Q10/Q11。
+
+### 🟢 低优先级
+
+- [ ] **清理死脚手架**（small）：运行时零使用的定义——`StabilityPolicy::FutureFluid`、全部 `MechanicsClass` 变体、`PlacementKernel/BreakKernel::GranularLocal`、`CollisionProxy::SampleCloud`（及缺失的 `ConvexHull`）、`FreeObjectState::Settled/Projected`、`MaterialCell.secondary/MixSlot`、`FreeObject.angular_velocity/mass`、`world.json.protocol_version` 死校验字段。逐一删除或补实现，避免后续读者误判为既有能力。
+- [ ] 多材质叠加 / 反应规则（§6.4）
+- [ ] 存档 `MaterialID` 迁移 remap（§13、§17.Q10）
+- [ ] FreeObject 空间索引 broadphase + local mesh cache（§7.3、§9.1）
+- [ ] 硬 FreeObject 全局帧预算 + 投影兜底 splatting（§7.4、§17.Q4/Q6）
+- [ ] 完整支撑图：`SupportEdge` / 重心投影 / 悬挑 / 抗剪（§8.2）
+- [ ] 真实流体 solver（§11，明确延后至固体 / 颗粒闭环稳定之后）
+- [ ] 完整 Surface Nets / Marching Cubes（视 occupancy 提面收益再评估，§16 阶段 2）
+
+---
+
+## 六、文档维护
 
 - 当前态说明放入对应专题文档，避免在根目录新增历史报告。
 - 协议字段、存档 schema、部署命令或用户流程变化时，同步更新本页验收场景和对应专题文档。
