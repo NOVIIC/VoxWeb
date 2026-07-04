@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0-alpha.3"
+version = "0.7.0-alpha.4"
 edition = "2024"
 
 [workspace.lints.rust]
