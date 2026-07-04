@@ -186,9 +186,14 @@ impl Server {
     /// **Remote 模式不调用**（无权威逻辑可推进）。
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        // 软材质颗粒级联：每 tick 从不稳定队列提取新颗粒（批量 Spawn），超预算回退瞬间松弛。
+        let soft = physics::step_soft_grains(&mut self.world);
+        self.enqueue_free_object_spawn_batch(soft.spawns);
+        self.enqueue_field_deltas(soft.updates);
+        // 推进所有 active 对象（硬材质刚体 + 软材质颗粒），批量同步 state / project。
         let free_object_events = physics::tick_free_objects(&mut self.world);
-        self.enqueue_free_object_states(free_object_events.states);
-        self.enqueue_free_object_projections(free_object_events.projections);
+        self.enqueue_free_object_state_batch(free_object_events.states);
+        self.enqueue_free_object_project_batch(free_object_events.projections);
         self.world.tick();
         self.broadcast_tick();
     }
@@ -339,7 +344,8 @@ impl Server {
                 let reason = physics::validate_break(&self.world, pos, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_cell(pos, MaterialCell::EMPTY);
-                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    // 软材质：把编辑点邻域入队，下落在后续 tick 由 step_soft_grains 逐格模拟。
+                    physics::mark_edit_unstable(&mut self.world, pos);
                     let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -350,7 +356,6 @@ impl Server {
                         },
                     );
                     self.enqueue_field_delta(pos, MaterialCell::EMPTY);
-                    self.enqueue_field_deltas(relaxed);
                     self.enqueue_free_object_spawns(spawned);
                 } else {
                     self.enqueue(
@@ -375,7 +380,8 @@ impl Server {
                 let reason = physics::validate_place(&self.world, pos, block, player_feet);
                 if reason == voxweb_core::protocol::AckReason::Ok {
                     self.world.set_cell(pos, MaterialCell::from_block_id(block));
-                    let relaxed = physics::relax_after_edit(&mut self.world, pos);
+                    // 软材质：把编辑点邻域入队，下落在后续 tick 由 step_soft_grains 逐格模拟。
+                    physics::mark_edit_unstable(&mut self.world, pos);
                     let spawned = physics::resolve_floating_after_edit(&mut self.world, pos);
                     self.enqueue(
                         Recipient::One(entity_id),
@@ -386,7 +392,6 @@ impl Server {
                         },
                     );
                     self.enqueue_field_delta(pos, MaterialCell::from_block_id(block));
-                    self.enqueue_field_deltas(relaxed);
                     self.enqueue_free_object_spawns(spawned);
                 } else {
                     self.enqueue(
@@ -653,29 +658,51 @@ impl Server {
         }
     }
 
-    fn enqueue_free_object_states(&mut self, states: Vec<physics::FreeObjectStateUpdate>) {
-        for state in states {
-            self.enqueue(
-                Recipient::All,
-                ServerMessage::FreeObjectState {
-                    object_id: state.object_id,
-                    position: state.position,
-                    velocity: state.velocity,
-                },
-            );
+    /// 批量广播软材质颗粒提取。颗粒 cell 已从场移除，客户端 handler 会清 cell 并重网格化，
+    /// 因此这里不再逐 cell 发冗余 FieldDelta，压低坍塌期的协议量。
+    fn enqueue_free_object_spawn_batch(&mut self, spawns: Vec<physics::FreeObjectSpawn>) {
+        if spawns.is_empty() {
+            return;
         }
+        let spawns = spawns
+            .into_iter()
+            .map(|spawn| (spawn.object_id, spawn.cells))
+            .collect::<Vec<_>>();
+        self.enqueue(
+            Recipient::All,
+            ServerMessage::FreeObjectSpawnBatch { spawns },
+        );
     }
 
-    fn enqueue_free_object_projections(&mut self, projections: Vec<physics::FreeObjectProjection>) {
-        for projection in projections {
-            self.enqueue(
-                Recipient::All,
-                ServerMessage::FreeObjectProject {
-                    object_id: projection.object_id,
-                    deltas: projection.deltas,
-                },
-            );
+    fn enqueue_free_object_state_batch(&mut self, states: Vec<physics::FreeObjectStateUpdate>) {
+        if states.is_empty() {
+            return;
         }
+        let states = states
+            .into_iter()
+            .map(|state| (state.object_id, state.position, state.velocity))
+            .collect::<Vec<_>>();
+        self.enqueue(
+            Recipient::All,
+            ServerMessage::FreeObjectStateBatch { states },
+        );
+    }
+
+    fn enqueue_free_object_project_batch(
+        &mut self,
+        projections: Vec<physics::FreeObjectProjection>,
+    ) {
+        if projections.is_empty() {
+            return;
+        }
+        let projections = projections
+            .into_iter()
+            .map(|projection| (projection.object_id, projection.deltas))
+            .collect::<Vec<_>>();
+        self.enqueue(
+            Recipient::All,
+            ServerMessage::FreeObjectProjectBatch { projections },
+        );
     }
 
     /// 内部：聊天速率限制滑窗判定。

@@ -29,6 +29,7 @@ pub const PROTOCOL_VERSION: u32 = 9; // FreeObject 动态生命周期
 
 | 版本 | 变化 |
 |---|---|
+| v10 | 新增 `FreeObjectSpawnBatch` / `FreeObjectStateBatch` / `FreeObjectProjectBatch`；软材质颗粒（沙/土/草）改为批量 active FreeObject 下落动画，tick 内多个 grain 的 spawn/state/project 各合并成一条消息；硬材质 tick 状态/投影也走 batch |
 | v9 | `FreeObjectProject` 不再承担下落动画；新增 `FreeObjectSpawn` 和 `FreeObjectState`，active FreeObject 由 Host 按 tick 推进，Remote 跟随权威状态，静止后再 `FreeObjectProject` |
 | v8 | 新增 `FreeObjectProject { object_id, deltas }`；`FloatingOnly` 硬材质小连通块坍落以 FreeObject 投影事件同步 |
 | v7 | `ChunkRequest` 改为 `FieldRequest`；`ChunkSnapshot` 改为 `FieldSnapshot`，payload 使用 `field::encode(FieldChunk)`；`BlockUpdate` 改为 `FieldDelta { pos, cell: MaterialCell }` |
@@ -62,9 +63,12 @@ pub const PROTOCOL_VERSION: u32 = 9; // FreeObject 动态生命周期
 | `Welcome` | reliable | 一次 | `entity_id: u32, server_tick: u32, world_seed: u64, host_entity_id: u32, host_render_distance: u32, players: Vec<PlayerEntry>` | 单一 | 加入握手响应（v2 起含全员名单；v6 起含 Host 视距上限） |
 | `FieldSnapshot` | reliable | 一次（按 chunk） | `pos: ChunkPos, frag_index: u16, frag_total: u16, payload: Vec<u8>` | 单一 | 全量 FieldChunk 数据，分片 |
 | `FieldDelta` | reliable | 按需 | `pos: Position, cell: MaterialCell` | 广播 | 单 cell 变更 |
-| `FreeObjectSpawn` | reliable | 按需 | `object_id: ObjectID, cells: Vec<(Position, MaterialCell)>` | 广播 | 从静态场提取 active FreeObject；对应 cell 已从 Field 移除 |
-| `FreeObjectState` | unreliable | 最高 60Hz | `object_id: ObjectID, position: Vec3, velocity: Vec3` | 广播 | active FreeObject 的权威动态状态；丢旧包不影响最终结果 |
+| `FreeObjectSpawn` | reliable | 按需 | `object_id: ObjectID, cells: Vec<(Position, MaterialCell)>` | 广播 | 从静态场提取 active FreeObject；对应 cell 已从 Field 移除（硬材质挖放即时提取用） |
+| `FreeObjectState` | unreliable | 最高 60Hz | `object_id: ObjectID, position: Vec3, velocity: Vec3` | 广播 | active FreeObject 的权威动态状态；丢旧包不影响最终结果（join 快照单发用） |
 | `FreeObjectProject` | reliable | 按需 | `object_id: ObjectID, deltas: Vec<(Position, MaterialCell)>` | 广播 | FreeObject 静止后投影回静态场，并结束 active 生命周期 |
+| `FreeObjectSpawnBatch` | reliable | 按需 | `spawns: Vec<(ObjectID, Vec<(Position, MaterialCell)>)>` | 广播 | 批量提取（软材质颗粒级联）；一帧多个 grain 合一条，语义等价多条 `FreeObjectSpawn` |
+| `FreeObjectStateBatch` | unreliable | 最高 60Hz | `states: Vec<(ObjectID, Vec3, Vec3)>` | 广播 | 每 tick 把所有活跃对象（含 grain）状态合一条；语义等价多条 `FreeObjectState` |
+| `FreeObjectProjectBatch` | reliable | 按需 | `projections: Vec<(ObjectID, Vec<(Position, MaterialCell)>)>` | 广播 | 同帧落定的多个对象合一条；语义等价多条 `FreeObjectProject` |
 | `ActionAck` | reliable | 应答 | `request_id: u32, accepted: bool, reason: AckReason` | 单一 | 挖放应答 |
 | `PlayerTick` | unreliable | 60Hz | `tick: u32, players: Vec<PlayerSnapshot>, server_time_ms: u64` | 广播 | 全员位置广播 |
 | `PeerJoined` | reliable | 按需 | `entity_id: u32, display_name: String` | 广播（除新加入者） | 新玩家加入通告 |

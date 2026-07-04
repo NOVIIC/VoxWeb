@@ -220,8 +220,8 @@ pub enum ChannelKind { Reliable, Unreliable }
 
 | 通道 | 配置 | 用途 |
 |---|---|---|
-| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | FieldRequest, FieldSnapshot, HostSettings, FieldDelta, FreeObjectSpawn, FreeObjectProject, Chat, Hello/Welcome, ActionAck, Join/Leave |
-| `unreliable` | `ordered: false, maxRetransmits: 0, maxPacketLifeTime: null` | PlayerInput, PlayerTick, FreeObjectState, Ping/Pong |
+| `reliable` | `ordered: true, maxRetransmits: null, maxPacketLifeTime: null` | FieldRequest, FieldSnapshot, HostSettings, FieldDelta, FreeObjectSpawn(Batch), FreeObjectProject(Batch), Chat, Hello/Welcome, ActionAck, Join/Leave |
+| `unreliable` | `ordered: false, maxRetransmits: 0, maxPacketLifeTime: null` | PlayerInput, PlayerTick, FreeObjectState(Batch), Ping/Pong |
 
 `maxRetransmits: 0` 实现"发出去就完事"，丢失不重传，适合频繁的位置广播。
 

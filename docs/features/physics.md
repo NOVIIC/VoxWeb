@@ -356,9 +356,18 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 
 服务端仲裁按材质属性执行额外规则：y=0 永远视为世界底部边界；`properties(block).breakable == false` 的材质不可挖（当前为 BEDROCK）；放置请求只能使用 `appears_in_hotbar == true` 的材质，防止客户端通过协议放置 AIR / BEDROCK 等非创造模式材料。
 
-`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做局部松弛：挖放成功后从编辑点附近入队，优先竖直下落，受阻后按确定性方向尝试斜下滑落。单次操作有移动与访问预算，结果通过多条 `FieldDelta` 同步给 Remote；移动和广播都保留完整 `MaterialCell`，不会把 occupancy / secondary 退化成单纯 `BlockID`。
+`ImmediateRelaxation` 材质（当前沙、泥土、草）在 Host / Local-Only 权威侧做**真实颗粒下落动画**（复用 FreeObject 权威路径）：
 
-`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就从静态场提取为 active `FreeObject` 并广播 `FreeObjectSpawn`。Host / Local-Only 在 60Hz tick 中按重力推进 AABB 动态体，通过 `FreeObjectState` 同步当前位置和速度；客户端渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验。对象静止后再通过 `FreeObjectProject` 投影回 `MaterialField`。`FreeObject` sample、Spawn 和 Project 都携带完整 `MaterialCell`。当前不做旋转、碰撞反弹或碎裂。
+- **播种**：挖放成功后把编辑点邻域的软材质 cell 入 `world.unstable_soft` 队列（`physics::mark_edit_unstable`），不再在编辑帧瞬间落定。
+- **提取**：每 tick `physics::step_soft_grains` 从队列取候选，凡是能下落/斜滑的软材质 cell 就从静态场移除、提取成一个**单格 active `FreeObject`（grain，`granular = true`）**，合并进一条 `FreeObjectSpawnBatch` 广播。
+- **下落**：`tick_free_objects` 对 grain 走专门分支——竖直方向真实自由落体；落到边缘（直下受阻但斜下方有空格）时朝确定性下坡方向给一个水平初速，颗粒沿顶面爬到边缘后在重力下**抛物线滑入低处**，从而"斜滑摊平成堆"。为避免相邻 cell 间方向翻转导致抖动，滑动会保持当前方向直到不再是有效下坡。
+- **级联**：grain 离开源格或落定时唤醒上方/斜上方邻居重新入队，形成可见的**逐帧塔塌**；1 宽沙柱会按 1:1 休止角摊平，而不是保持单柱。
+- **落定**：颗粒静止后 `find_projectable_position` 找到空格，单格投影回 `MaterialField` 并合并进 `FreeObjectProjectBatch`。同一列多个颗粒靠场占用自然堆叠。
+- **限流/兜底**：活跃 grain 有上限（`MAX_ACTIVE_GRAINS`）、每 tick 提取有预算（`GRAIN_SPAWN_BUDGET_PER_TICK`）；超出的不稳定 cell 回退到瞬间松弛 `relax_after_edit` 单步并发 `FieldDelta`，保证收敛、状态有界。
+- 提取、下落状态和投影都保留完整 `MaterialCell`，不会把 occupancy / secondary 退化成单纯 `BlockID`。
+- 已知视觉取舍：飞行中的 grain 渲染成 sample cube（方块感），落定后并回 `SmoothGranular` 高度场平滑外观。
+
+`FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就从静态场提取为 active `FreeObject`（`granular = false`）并广播 `FreeObjectSpawn`。Host / Local-Only 在 60Hz tick 中按重力**刚性**推进 AABB 动态体（不斜滑），通过批量 `FreeObjectStateBatch` 同步当前位置和速度；客户端渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验。对象静止后再通过 `FreeObjectProjectBatch` 整体投影回 `MaterialField`。`FreeObject` sample、Spawn 和 Project 都携带完整 `MaterialCell`。当前不做旋转、碰撞反弹或碎裂。
 
 Host / Local-Only 保存世界时会把 active `FreeObject` 列表写入 `world.json.active_free_objects`，并把已从静态场移除的 cell 留在 chunk 文件中。重进存档后，服务端恢复 active object 表并重建 `FieldChunk.free_object_refs`，避免正在下落的硬材质对象丢失或被提前投影。
 

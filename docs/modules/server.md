@@ -28,9 +28,9 @@
 - `World::ensure_chunk_generated` / `get_block_world` / `unload_chunk` 管理 chunk 生命周期
 - `World::get_cell_world` / `set_cell` 是运行时 MaterialCell 读写入口；`get_block_world` / `set_block` 是当前渲染、碰撞和旧调用方的 `BlockID` 适配包装
 - `World::field_chunks` 维护 `FieldChunk` MaterialField；当前渲染/碰撞仍从同步更新的 dense `chunks` 镜像读取，网络快照直接发送 FieldChunk
-- `World::free_objects` 记录第一版 active FreeObject 生命周期：小型 `FloatingOnly` 连通块会被提取、整体下落、按 `FieldChunk.free_object_refs` 建立运行时引用，静止后投影回静态场；FreeObject sample 保留完整 `MaterialCell`，Host / Local-Only 的 OPFS 加载会从 `world.json.active_free_objects` 恢复这些对象
+- `World::free_objects` 记录 active FreeObject 生命周期：小型 `FloatingOnly` 连通块（`granular=false`）整体刚性下落，软材质单格颗粒（`granular=true`）自由落体 + 抛物线斜滑；均按 `FieldChunk.free_object_refs` 建立运行时引用，静止后投影回静态场；FreeObject sample 保留完整 `MaterialCell`，Host / Local-Only 的 OPFS 加载会从 `world.json.active_free_objects` 恢复这些对象（含正在下落的颗粒）
 - `TerrainGenerator` 负责确定性 Perlin 高度图地形
-- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`relax_after_edit` 对 `ImmediateRelaxation` 材质做局部下落/滑落
+- `physics::validate_break/place` 校验射程、AABB overlap 和方块合法性；`ImmediateRelaxation` 软材质挖放后由 `mark_edit_unstable` 入 `World::unstable_soft` 队列，`step_soft_grains` 每 tick 限额提取为下落颗粒（超预算回退 `relax_after_edit` 瞬间松弛），`tick_free_objects` 推进颗粒与硬材质刚体
 - `PlayerEntity` 表维护玩家位置、朝向、输入 tick 和显示名
 - `Server` 通过 `handle_message` 消费 Local / Host / Remote 输入，向 outbox 写入点对点或广播消息
 - `send_initial_snapshot` 与 `FieldRequest` 负责 Remote 初始和运行时 FieldChunk 同步

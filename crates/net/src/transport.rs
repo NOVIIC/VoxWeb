@@ -34,6 +34,7 @@ pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
     match msg {
         ServerMessage::PlayerTick { .. }
         | ServerMessage::FreeObjectState { .. }
+        | ServerMessage::FreeObjectStateBatch { .. }
         | ServerMessage::Pong { .. } => ChannelKind::Unreliable,
         ServerMessage::Welcome { .. }
         | ServerMessage::HostSettings { .. }
@@ -41,6 +42,8 @@ pub fn channel_for_server_message(msg: &ServerMessage) -> ChannelKind {
         | ServerMessage::FieldDelta { .. }
         | ServerMessage::FreeObjectSpawn { .. }
         | ServerMessage::FreeObjectProject { .. }
+        | ServerMessage::FreeObjectSpawnBatch { .. }
+        | ServerMessage::FreeObjectProjectBatch { .. }
         | ServerMessage::ActionAck { .. }
         | ServerMessage::PeerJoined { .. }
         | ServerMessage::PeerLeft { .. }
