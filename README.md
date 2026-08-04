@@ -46,8 +46,8 @@ VoxWeb 是一款基于 **Rust + WebAssembly** 的浏览器内体素沙盒游戏�
 - `FloatingOnly` 硬材质已有第一版动态稳定性：完全浮空的小连通块会提取为 active FreeObject，由 Host / Local-Only 按 tick 下落，客户端按 `FreeObjectState` 渲染并把 active AABB 纳入玩家碰撞和 raycast，静止后通过 `FreeObjectProject` 投影回静态场
 - OPFS 会随 chunk 保存 active FreeObject 状态；FreeObject sample 保留完整 `MaterialCell`，重进存档时正在下落的硬材质对象会从 `world.json` 恢复，并重建 `FieldChunk.free_object_refs`
 - 渲染主路径为 Skybox → Depth Pre-Pass（可关）→ Opaque → Player → Transparent → Selection → UI
-- 网格化使用跨区块面剔除、硬材质贪婪合并、SmoothGranular 扩邻域高度场平滑提面、AO、index buffer、视锥剔除和分帧任务队列
-- `SmoothGranular` 高度场查询已被渲染、raycast、选中框和客户端玩家碰撞共用，减少视觉与交互不一致
+- 网格化使用跨区块面剔除、硬材质贪婪合并、SmoothGranular 列顶连续高度场 + skirt、AO、index buffer、视锥剔除和分帧任务队列
+- `SmoothGranular` 列顶高度场查询已被渲染、raycast、选中框和客户端玩家碰撞共用，减少视觉与交互不一致
 - OPFS Variant A：主线程 async 存取、周期 flush、手动保存、删档、配额 UI 和严格版本校验
 
 仍需关注：

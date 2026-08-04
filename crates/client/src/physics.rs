@@ -381,7 +381,9 @@ fn block_intersects_aabb(
             return false;
         }
         let top = smooth_cell_top_height(get_block, x, y, z, block);
-        return aabb.min.y < top && aabb.max.y > y as f32;
+        // 露出表面可能缩到 cell_y 以下（斜坡），用较小底边避免脚下漏碰。
+        let bottom = y as f32;
+        return aabb.min.y < top && aabb.max.y > bottom.min(top - 0.05);
     }
     aabb.intersects(&Aabb::new(
         Vec3::new(x as f32, y as f32, z as f32),

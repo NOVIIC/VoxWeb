@@ -219,13 +219,14 @@ mod tests {
     fn interp_lerps_between_two_samples() {
         let mut interp = PlayerInterp::new();
         interp.delay_ms = 0.0; // 方便测试：render_time 直接等于 server_time
+        // 距离须小于 TELEPORT_SNAP_DISTANCE_M，否则会当作传送直接贴到最新点。
         interp.ingest_tick(1, 1000, Vec3::new(0.0, 64.0, 0.0), 0.0, 0.0);
-        interp.ingest_tick(1, 2000, Vec3::new(10.0, 64.0, 10.0), 0.0, 0.0);
+        interp.ingest_tick(1, 2000, Vec3::new(4.0, 64.0, 4.0), 0.0, 0.0);
 
-        // render @ 1500ms → 50% lerp → (5, 64, 5)
+        // render @ 1500ms → 50% lerp → (2, 64, 2)
         let (pos, _, _) = interp.advance(1, 1500.0).expect("should have pose");
-        let dist = (pos - Vec3::new(5.0, 64.0, 5.0)).length();
-        assert!(dist < 0.01);
+        let dist = (pos - Vec3::new(2.0, 64.0, 2.0)).length();
+        assert!(dist < 0.01, "got pos={pos:?} dist={dist}");
     }
 
     #[test]
@@ -271,11 +272,14 @@ mod tests {
     fn interp_short_extrapolates_when_render_time_after_latest() {
         let mut interp = PlayerInterp::new();
         interp.delay_ms = 0.0;
+        // 1 秒内移动 4m（< 传送阈值），速度 4 m/s；短外推 50ms → +0.2m
         interp.ingest_tick(1, 1000, Vec3::new(0.0, 64.0, 0.0), 0.5, 0.0);
-        interp.ingest_tick(1, 2000, Vec3::new(10.0, 64.0, 10.0), 1.0, 0.0);
-        // render 3000 > 最新 2000 → 只短外推 50ms，速度为 10m/s
+        interp.ingest_tick(1, 2000, Vec3::new(4.0, 64.0, 4.0), 1.0, 0.0);
         let (pos, yaw, _) = interp.advance(1, 3000.0).expect("should return latest");
-        assert!((pos - Vec3::new(10.5, 64.0, 10.5)).length() < 0.01);
+        assert!(
+            (pos - Vec3::new(4.2, 64.0, 4.2)).length() < 0.01,
+            "got pos={pos:?}"
+        );
         assert!((yaw - 1.0).abs() < 0.01);
     }
 

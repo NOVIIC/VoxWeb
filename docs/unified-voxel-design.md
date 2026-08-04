@@ -551,7 +551,7 @@ struct StabilityComponent {
 | 材质视觉类 | Extractor | 说明 |
 |---|---|---|
 | HardBlocky | blocky greedy / face meshing | 保留笔直方块、锐边、低成本 |
-| SmoothGranular | 当前共享高度场平滑提面 / raycast / 选中 / 客户端碰撞；后续 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
+| SmoothGranular | 列顶连续高度场 + skirt（渲染 / raycast / 选中 / 客户端碰撞共用）；后续可评估 Surface Nets / Marching Cubes | 沙、土、雪等平滑坡面 |
 | RigidBreakable FreeObject | 当前 active AABB sample cube 渲染；后续 local mesh cache + transform | 动态岩块、碎块 |
 | Fluid | future fluid surface extractor + transparent pass | 水面、透明排序、波动；第一版水只做静态透明占位 |
 | Mixed boundary | priority / blend / seam resolver | 处理硬软交界 |
@@ -616,7 +616,7 @@ enum QueryHit {
 草、土、沙看起来不够平滑有两个不同原因：
 
 1. **自然地形高度仍偏格状**：当前地形已从单通道 Perlin 升级为多倍频叠加（continent / hills / detail 三段 Perlin）+ 3×3 邻域距离加权平滑，相邻列高度差大多已落在 0..1m；但仍缺坡度限制、侵蚀感和平原/丘陵/山地分区。残留台阶感更多来自**连续 1m 单位阶梯 + 满格立方体渲染**，而非高度突变——因此地形调参需与提面/occupancy 升级配套。
-2. **当前 SmoothGranular 仍以满格 cell 为输入**：高度场只在可见顶部做插值，底层质量仍是 1m 整格；没有半格 occupancy、column mass 或真正的 Surface Nets，因此在侧面、硬软交界和悬崖处仍会暴露格子结构。
+2. **SmoothGranular 已改为列顶连续高度场**：角点跨列自由插值 + 邻空/硬处 skirt；仍以满格 cell 列为输入，没有半格 occupancy、column mass 或真正的 Surface Nets，极端悬崖与硬软贴合处仍可能露少量格子结构。
 
 地形生成应先降低“格子台阶”的输入压力：
 

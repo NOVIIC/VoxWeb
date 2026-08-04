@@ -324,7 +324,19 @@ impl World {
         id: ObjectID,
         cells: &[(Position, MaterialCell)],
     ) -> Option<()> {
-        let object = FreeObject::dynamic_from_cells(id, cells)?;
+        // Remote 收到 Spawn/SpawnBatch 时走这里。软材质颗粒必须保留 granular，
+        // 否则客户端会把沙/土/草画成硬立方体。
+        let granular = !cells.is_empty()
+            && cells.iter().all(|(_, cell)| {
+                !cell.is_empty()
+                    && voxweb_core::properties(cell.primary).stability
+                        == voxweb_core::StabilityPolicy::ImmediateRelaxation
+            });
+        let object = if granular {
+            FreeObject::dynamic_grain_from_cells(id, cells)?
+        } else {
+            FreeObject::dynamic_from_cells(id, cells)?
+        };
         self.free_objects.insert(id, object);
         if self.next_object_id <= id {
             self.next_object_id = id.saturating_add(1).max(1);
