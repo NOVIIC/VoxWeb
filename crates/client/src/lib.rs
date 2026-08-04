@@ -2409,6 +2409,8 @@ fn render_game_frame(
         {
             let now = now_ms();
             let mut instances: Vec<voxweb_render::passes::player::PlayerInstance> = Vec::new();
+            let mut grain_instances: Vec<voxweb_render::passes::player::PlayerInstance> =
+                Vec::new();
             if let Some(ref mut game) = a.game {
                 let render_server_time = now + game.server_clock_offset_ms - game.interp.delay_ms;
                 let eids: Vec<voxweb_core::protocol::EntityId> = game.interp.ids().collect();
@@ -2426,30 +2428,68 @@ fn render_game_frame(
                         });
                     }
                 }
+                // Local/Host：用固定步长剩余时间外推；Remote：用距上次 State 的时长外推。
+                let local_extrapolate = game.frame_clock.remainder_secs();
+                let is_remote = game.mode == GameMode::Remote;
+                let state_times = game.free_object_state_at_ms.clone();
                 let server = game.server.borrow();
                 for object in server.world.free_objects.values() {
                     if object.state != FreeObjectState::Dynamic {
                         continue;
                     }
-                    for sample in &object.samples {
-                        let p = object.transform.position
-                            + glam::Vec3::new(
-                                sample.local_pos[0] as f32,
-                                sample.local_pos[1] as f32,
-                                sample.local_pos[2] as f32,
-                            );
-                        instances.push(voxweb_render::passes::player::PlayerInstance {
-                            position: p.to_array(),
-                            _pad0: 0.0,
-                            size: [1.0, 1.0, 1.0],
-                            _pad_size: 0.0,
-                            color: block_animation_color(sample.material),
-                            _pad1: 0.0,
-                        });
+                    let age_secs = if is_remote {
+                        state_times
+                            .get(&object.id)
+                            .map(|t| ((now - *t) / 1000.0) as f32)
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 0.08)
+                    } else {
+                        local_extrapolate
+                    };
+                    let motion = object.velocity * age_secs;
+                    if object.granular {
+                        // 球心在 sample cell 中心；直径略小于 1m，看起来像颗粒团。
+                        const GRAIN_DIAMETER: f32 = 0.55;
+                        for sample in &object.samples {
+                            let p = object.transform.position
+                                + motion
+                                + glam::Vec3::new(
+                                    sample.local_pos[0] as f32 + 0.5,
+                                    sample.local_pos[1] as f32 + 0.5,
+                                    sample.local_pos[2] as f32 + 0.5,
+                                );
+                            grain_instances.push(voxweb_render::passes::player::PlayerInstance {
+                                position: p.to_array(),
+                                _pad0: 0.0,
+                                size: [GRAIN_DIAMETER, GRAIN_DIAMETER, GRAIN_DIAMETER],
+                                _pad_size: 0.0,
+                                color: block_animation_color(sample.material),
+                                _pad1: 0.0,
+                            });
+                        }
+                    } else {
+                        for sample in &object.samples {
+                            let p = object.transform.position
+                                + motion
+                                + glam::Vec3::new(
+                                    sample.local_pos[0] as f32,
+                                    sample.local_pos[1] as f32,
+                                    sample.local_pos[2] as f32,
+                                );
+                            instances.push(voxweb_render::passes::player::PlayerInstance {
+                                position: p.to_array(),
+                                _pad0: 0.0,
+                                size: [1.0, 1.0, 1.0],
+                                _pad_size: 0.0,
+                                color: block_animation_color(sample.material),
+                                _pad1: 0.0,
+                            });
+                        }
                     }
                 }
             }
-            a.renderer.upload_player_instances(&instances);
+            a.renderer
+                .upload_player_instances(&instances, &grain_instances);
             a.renderer.render_players(&mut encoder, &view, view_proj);
         }
         let player_pass_ms = (now_ms() - player_start) as f32;
@@ -2997,6 +3037,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
             {
                 object.transform.position = position;
                 object.velocity = velocity;
+                game.free_object_state_at_ms.insert(object_id, now_ms());
             }
         }
         ServerMessage::FreeObjectProject { object_id, deltas } => {
@@ -3006,6 +3047,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                     .world
                     .free_objects
                     .remove(&object_id);
+                game.free_object_state_at_ms.remove(&object_id);
             }
             for (pos, cell) in deltas {
                 if game.mode == GameMode::Remote {
@@ -3039,11 +3081,13 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
         }
         ServerMessage::FreeObjectStateBatch { states } => {
             if game.mode == GameMode::Remote {
+                let now = now_ms();
                 let mut server = game.server.borrow_mut();
                 for (object_id, position, velocity) in states {
                     if let Some(object) = server.world.free_objects.get_mut(&object_id) {
                         object.transform.position = position;
                         object.velocity = velocity;
+                        game.free_object_state_at_ms.insert(object_id, now);
                     }
                 }
             }
@@ -3056,6 +3100,7 @@ fn apply_server_message(game: &mut Game, msg: ServerMessage) {
                         .world
                         .free_objects
                         .remove(&object_id);
+                    game.free_object_state_at_ms.remove(&object_id);
                 }
                 for (pos, cell) in deltas {
                     if game.mode == GameMode::Remote {

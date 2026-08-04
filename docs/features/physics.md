@@ -365,7 +365,7 @@ pub fn raycast(world: &WorldView, origin: Vec3, dir: Vec3, max_distance: f32) ->
 - **落定**：颗粒静止后 `find_projectable_position` 找到空格，单格投影回 `MaterialField` 并合并进 `FreeObjectProjectBatch`。同一列多个颗粒靠场占用自然堆叠。
 - **限流/兜底**：活跃 grain 有上限（`MAX_ACTIVE_GRAINS`）、每 tick 提取有预算（`GRAIN_SPAWN_BUDGET_PER_TICK`）；超出的不稳定 cell 回退到瞬间松弛 `try_relax_one` 单步并发 `FieldDelta`，保证收敛、状态有界。
 - 提取、下落状态和投影都保留完整 `MaterialCell`，不会把 occupancy / secondary 退化成单纯 `BlockID`。
-- 已知视觉取舍：飞行中的 grain 渲染成 sample cube（方块感），落定后并回 `SmoothGranular` 高度场平滑外观。
+- 已知视觉取舍：飞行中的 soft grain 渲染成球体实例（直径约 0.55m）并按速度外推；落定后并回 `SmoothGranular` 高度场平滑外观；硬材质 FreeObject 仍为 1×1×1 方块。
 
 `FloatingOnly` 硬材质（石头、木头、玻璃、石砖）在同一权威侧做第一版稳定性检查：挖放成功后从编辑点附近收集小型硬材质连通块；若连通块没有接触任何稳定 solid 支撑，就从静态场提取为 active `FreeObject`（`granular = false`）并广播 `FreeObjectSpawn`。Host / Local-Only 在 60Hz tick 中按重力**刚性**推进 AABB 动态体（不斜滑），通过批量 `FreeObjectStateBatch` 同步当前位置和速度；客户端渲染 active sample cube，并把 active AABB 纳入玩家碰撞、raycast 和放置校验。对象静止后再通过 `FreeObjectProjectBatch` 整体投影回 `MaterialField`。`FreeObject` sample、Spawn 和 Project 都携带完整 `MaterialCell`。当前不做旋转、碰撞反弹或碎裂。
 

@@ -25,7 +25,9 @@ pub use protocol::{
     PROTOCOL_VERSION, PlayerEntry, PlayerSnapshot, Recipient, RoomEvent, ServerMessage, encode,
 };
 pub use surface::{
-    SmoothCellRef, is_open_for_surface, is_smooth_granular, nearby_smooth_column_height,
-    ray_intersect_smooth_cell, smooth_cell_top_height, smooth_corner_height, smooth_height_at,
-    smooth_height_normal,
+    SmoothCellRef, SmoothColumnSurface, column_hard_ceiling, column_has_hard_over_smooth,
+    find_smooth_column_surface, is_open_for_surface, is_smooth_granular,
+    nearby_smooth_column_height, normal_from_corners, ray_intersect_smooth_cell,
+    smooth_cell_top_height, smooth_corner_height, smooth_height_at, smooth_height_normal,
+    smooth_stack_bottom, solid_column_top_y,
 };

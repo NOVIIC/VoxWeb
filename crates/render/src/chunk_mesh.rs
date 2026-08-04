@@ -6,8 +6,10 @@
 
 use glam::Vec3;
 use voxweb_core::{
-    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, is_open_for_surface,
-    is_smooth_granular, properties, smooth_corner_height, smooth_height_normal,
+    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, SmoothColumnSurface,
+    column_hard_ceiling, column_has_hard_over_smooth, find_smooth_column_surface,
+    is_smooth_granular, normal_from_corners, properties, smooth_corner_height, smooth_stack_bottom,
+    solid_column_top_y,
 };
 
 use crate::vertex::{Face, PackedVertex, SmoothVertex};
@@ -169,15 +171,6 @@ struct MeshContext<'a> {
     get_block_world: &'a dyn Fn(i32, i32, i32) -> BlockID,
 }
 
-#[derive(Copy, Clone)]
-struct SmoothFaceInfo {
-    face_idx: usize,
-    lx: usize,
-    ly: usize,
-    lz: usize,
-    block: BlockID,
-}
-
 /// 生成一个 Chunk 的不透明网格顶点。
 ///
 /// 仅渲染非 AIR、且 `BlockProperties::transparent == false` 的方块。
@@ -224,115 +217,248 @@ pub fn generate_with_neighbors(
     mesh
 }
 
+/// SmoothGranular：连续列顶高度场 + 硬/空交界 skirt。
+///
+/// 不再按每个软材质 cell 发射立方体面。每个 (x,z) 只取露出表面，角点在邻域
+/// 列顶之间共享插值，高低列自动连成斜坡；只有贴着非软材质或虚空时才补侧面裙边。
 fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
-    for ly in 0..CHUNK_Y {
-        for lz in 0..CHUNK_Z {
-            for lx in 0..CHUNK_X {
-                let block = ctx.chunk.get(lx, ly, lz);
-                if !is_smooth_granular(block) {
+    // 边框需覆盖角点加权半径，否则 chunk 边界坡面会突然变尖。
+    const PAD: i32 = 2;
+    let min_lx = -PAD;
+    let max_lx = CHUNK_X as i32 + PAD;
+    let min_lz = -PAD;
+    let max_lz = CHUNK_Z as i32 + PAD;
+    let stride_x = (max_lx - min_lx) as usize;
+    let stride_z = (max_lz - min_lz) as usize;
+
+    // 本 chunk 内部以 `chunk` 为准，邻居才走 `get_block_world`。避免测试/边界
+    // 回调把本 chunk 列误判成空气，导致软表面整片丢失。
+    let get_column_block = |wx: i32, wy: i32, wz: i32| -> BlockID {
+        let lx = wx - ctx.origin_x;
+        let lz = wz - ctx.origin_z;
+        if (0..CHUNK_X as i32).contains(&lx)
+            && (0..CHUNK_Z as i32).contains(&lz)
+            && (0..CHUNK_Y as i32).contains(&wy)
+        {
+            ctx.chunk.get(lx as usize, wy as usize, lz as usize)
+        } else {
+            (ctx.get_block_world)(wx, wy, wz)
+        }
+    };
+
+    let mut columns: Vec<Option<SmoothColumnSurface>> = vec![None; stride_x * stride_z];
+    for lz in min_lz..max_lz {
+        for lx in min_lx..max_lx {
+            let wx = ctx.origin_x + lx;
+            let wz = ctx.origin_z + lz;
+            let idx = ((lz - min_lz) as usize) * stride_x + (lx - min_lx) as usize;
+            columns[idx] = find_smooth_column_surface(&get_column_block, wx, wz);
+        }
+    }
+
+    let col = |columns: &[Option<SmoothColumnSurface>],
+               lx: i32,
+               lz: i32|
+     -> Option<SmoothColumnSurface> {
+        if lx < min_lx || lx >= max_lx || lz < min_lz || lz >= max_lz {
+            return None;
+        }
+        columns[((lz - min_lz) as usize) * stride_x + (lx - min_lx) as usize]
+    };
+
+    // 角点缓存：chunk 内 0..=16。高度直接从列缓存加权，避免每个角点重新扫世界。
+    let corner_min = 0i32;
+    let corner_max = CHUNK_X as i32; // inclusive
+    let corner_stride = (corner_max - corner_min + 1) as usize;
+    let mut corners = vec![0.0f32; corner_stride * corner_stride];
+    const CORNER_RADIUS: i32 = 2;
+    const MIXED_BIAS: f32 = -0.03;
+    for cz in corner_min..=corner_max {
+        for cx in corner_min..=corner_max {
+            let prefer = col(&columns, cx - 1, cz - 1)
+                .or_else(|| col(&columns, cx, cz - 1))
+                .or_else(|| col(&columns, cx - 1, cz))
+                .or_else(|| col(&columns, cx, cz))
+                .map(|s| s.block);
+            let mut total = 0.0f32;
+            let mut weight_sum = 0.0f32;
+            for sz in (cz - CORNER_RADIUS)..(cz + CORNER_RADIUS) {
+                for sx in (cx - CORNER_RADIUS)..(cx + CORNER_RADIUS) {
+                    let Some(surface) = col(&columns, sx, sz) else {
+                        continue;
+                    };
+                    let dx = (sx as f32 + 0.5) - cx as f32;
+                    let dz = (sz as f32 + 0.5) - cz as f32;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    let w = 1.0 / (1.0 + dist);
+                    let bias = match prefer {
+                        Some(block) if surface.block != block => MIXED_BIAS,
+                        _ => 0.0,
+                    };
+                    total += (surface.top_y + bias) * w;
+                    weight_sum += w;
+                }
+            }
+            let h = if weight_sum > 0.0 {
+                total / weight_sum
+            } else {
+                smooth_corner_height(
+                    &get_column_block,
+                    ctx.origin_x + cx,
+                    ctx.origin_z + cz,
+                    prefer,
+                )
+            };
+            // 角点不得穿进触碰列的硬方块底面，否则软坡会钻进石头里造成透视/破面。
+            let mut clamped = h;
+            let probe_y = ((h as i32) - 2).max(0);
+            for (dx, dz) in [(0, 0), (-1, 0), (0, -1), (-1, -1)] {
+                let sx = cx + dx;
+                let sz = cz + dz;
+                let wx = ctx.origin_x + sx;
+                let wz = ctx.origin_z + sz;
+                if let Some(ceil) = column_hard_ceiling(&get_column_block, wx, wz, probe_y) {
+                    clamped = clamped.min(ceil);
+                }
+            }
+            corners[((cz - corner_min) as usize) * corner_stride + (cx - corner_min) as usize] =
+                clamped;
+        }
+    }
+
+    let corner_h = |corners: &[f32], cx: i32, cz: i32| -> f32 {
+        corners[((cz - corner_min) as usize) * corner_stride + (cx - corner_min) as usize]
+    };
+
+    for lz in 0..CHUNK_Z as i32 {
+        for lx in 0..CHUNK_X as i32 {
+            let Some(surface) = col(&columns, lx, lz) else {
+                continue;
+            };
+            let h00 = corner_h(&corners, lx, lz);
+            let h10 = corner_h(&corners, lx + 1, lz);
+            let h01 = corner_h(&corners, lx, lz + 1);
+            let h11 = corner_h(&corners, lx + 1, lz + 1);
+
+            let top_corners = [
+                Vec3::new(lx as f32, h00, lz as f32),
+                Vec3::new(lx as f32 + 1.0, h10, lz as f32),
+                Vec3::new(lx as f32 + 1.0, h11, lz as f32 + 1.0),
+                Vec3::new(lx as f32, h01, lz as f32 + 1.0),
+            ];
+            // CCW from above: (0,1,2,3) with outward +Y → use (0,3,2,1) wait
+            // Local XZ: (lx,lz)=(0), (lx+1,lz)=(1), (lx+1,lz+1)=(2), (lx,lz+1)=(3)
+            // From above (+Y), CCW is 0 -> 3 -> 2 -> 1
+            let top_ccw = [
+                top_corners[0],
+                top_corners[3],
+                top_corners[2],
+                top_corners[1],
+            ];
+            let n = normal_from_corners(h00, h10, h01, h11);
+            push_smooth_quad_with_normal(
+                mesh,
+                top_ccw,
+                n,
+                properties(surface.block).texture_index,
+                2,
+            );
+
+            // 四条边：邻居没有软表面时补 skirt，接硬材质顶或本列堆底。
+            let edges = [
+                // -Z edge: corners (lx,lz)-(lx+1,lz), neighbor (lx, lz-1)
+                (0i32, -1i32, top_corners[0], top_corners[1]),
+                // +Z edge: corners (lx+1,lz+1)-(lx,lz+1), neighbor (lx, lz+1)
+                (0, 1, top_corners[2], top_corners[3]),
+                // -X edge: corners (lx,lz+1)-(lx,lz), neighbor (lx-1, lz)
+                (-1, 0, top_corners[3], top_corners[0]),
+                // +X edge: corners (lx+1,lz)-(lx+1,lz+1), neighbor (lx+1, lz)
+                (1, 0, top_corners[1], top_corners[2]),
+            ];
+            let wx = ctx.origin_x + lx;
+            let wz = ctx.origin_z + lz;
+            let stack_bottom =
+                smooth_stack_bottom(&get_column_block, wx, surface.cell_y, wz) as f32;
+            for (dx, dz, a, b) in edges {
+                let n_lx = lx + dx;
+                let n_lz = lz + dz;
+                if col(&columns, n_lx, n_lz).is_some() {
+                    // 邻列也是软表面：共享角点已形成连续坡，无需裙边。
                     continue;
                 }
-                let wx = ctx.origin_x + lx as i32;
-                let wy = ly as i32;
-                let wz = ctx.origin_z + lz as i32;
-                for (face_idx, &(dx, dy, dz)) in FACE_NEIGHBORS.iter().enumerate() {
-                    let neighbor = (ctx.get_block_world)(wx + dx, wy + dy, wz + dz);
-                    if neighbor != BlockID::AIR && !properties(neighbor).transparent {
-                        continue;
-                    }
-                    emit_smooth_face(ctx, mesh, lx, ly, lz, face_idx, block);
+                let n_wx = ctx.origin_x + n_lx;
+                let n_wz = ctx.origin_z + n_lz;
+                // 邻列若是「硬压软」，被压住的软材质不建顶面，必须把本列侧面补实，
+                // 否则从坡面边缘能透视进硬块下方空洞。
+                let floor = if column_has_hard_over_smooth(&get_column_block, n_wx, n_wz) {
+                    stack_bottom
+                } else {
+                    solid_column_top_y(&get_column_block, n_wx, n_wz, surface.cell_y + 2)
+                        .unwrap_or(stack_bottom)
+                        .min(a.y.min(b.y))
+                };
+                if a.y <= floor + 0.02 && b.y <= floor + 0.02 {
+                    continue;
                 }
+                let floor_a = Vec3::new(a.x, floor, a.z);
+                let floor_b = Vec3::new(b.x, floor, b.z);
+                // 外侧观察：从 edge a->b，裙边四边形 a, b, floor_b, floor_a
+                let skirt = [a, b, floor_b, floor_a];
+                let skirt_tex = skirt_texture(ctx, &get_column_block, wx, wz, surface, floor);
+                let sn = quad_normal(skirt);
+                push_smooth_quad_with_normal(mesh, skirt, sn, skirt_tex, skirt_uv_axis(dx, dz));
             }
         }
     }
 }
 
-fn emit_smooth_face(
-    ctx: &MeshContext<'_>,
-    mesh: &mut ChunkMeshCpu,
-    lx: usize,
-    ly: usize,
-    lz: usize,
-    face_idx: usize,
-    block: BlockID,
-) {
-    let tex = properties(block).texture_index;
-    let corners = smooth_face_corners(ctx, lx, ly, lz, face_idx, block);
-    push_smooth_quad(
-        ctx,
-        mesh,
-        corners,
-        tex,
-        SmoothFaceInfo {
-            face_idx,
-            lx,
-            ly,
-            lz,
-            block,
-        },
-    );
+fn skirt_texture(
+    _ctx: &MeshContext<'_>,
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    wx: i32,
+    wz: i32,
+    surface: SmoothColumnSurface,
+    floor_y: f32,
+) -> u8 {
+    let sample_y = ((floor_y + surface.top_y) * 0.5).floor() as i32;
+    let sample_y = sample_y.clamp(0, CHUNK_Y as i32 - 1);
+    let block = get_block(wx, sample_y, wz);
+    if is_smooth_granular(block) {
+        properties(block).texture_index
+    } else {
+        properties(surface.block).texture_index
+    }
 }
 
-fn push_smooth_quad(
-    ctx: &MeshContext<'_>,
+fn skirt_uv_axis(dx: i32, dz: i32) -> usize {
+    if dx != 0 {
+        0 // 用 ZY
+    } else if dz != 0 {
+        4 // 用 XY
+    } else {
+        2
+    }
+}
+
+fn push_smooth_quad_with_normal(
     mesh: &mut ChunkMeshCpu,
     corners: [Vec3; 4],
+    normal: Vec3,
     tex: u8,
-    info: SmoothFaceInfo,
+    uv_face: usize,
 ) {
     let base = mesh.smooth_vertices.len() as u32;
-    let normal = if info.face_idx == Face::PosY as usize {
-        let wx = ctx.origin_x + info.lx as i32;
-        let wy = info.ly as i32;
-        let wz = ctx.origin_z + info.lz as i32;
-        smooth_height_normal(ctx.get_block_world, wx, wy, wz, info.block)
-    } else {
-        quad_normal(corners)
-    };
     for p in corners {
         mesh.include_smooth_vertex(p);
         mesh.smooth_vertices.push(SmoothVertex::new(
             [p.x, p.y, p.z],
             [normal.x, normal.y, normal.z],
-            smooth_raw_uv(info.face_idx, p),
+            smooth_raw_uv(uv_face, p),
             tex,
         ));
     }
     mesh.smooth_indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-}
-
-fn smooth_face_corners(
-    ctx: &MeshContext<'_>,
-    lx: usize,
-    ly: usize,
-    lz: usize,
-    face_idx: usize,
-    block: BlockID,
-) -> [Vec3; 4] {
-    let wx = ctx.origin_x + lx as i32;
-    let wy = ly as i32;
-    let wz = ctx.origin_z + lz as i32;
-    let top_is_open = {
-        let above = (ctx.get_block_world)(wx, wy + 1, wz);
-        is_open_for_surface(above)
-    };
-
-    FACE_CORNERS[face_idx].map(|(cx, cy, cz)| {
-        let x = lx as f32 + cx as f32;
-        let z = lz as f32 + cz as f32;
-        let mut y = ly as f32 + cy as f32;
-        if cy == 1 && top_is_open {
-            y = smooth_corner_height(
-                ctx.get_block_world,
-                wx + cx as i32,
-                wz + cz as i32,
-                wy,
-                block,
-            );
-        }
-        Vec3::new(x, y, z)
-    })
 }
 
 fn quad_normal(corners: [Vec3; 4]) -> Vec3 {
@@ -765,22 +891,77 @@ mod tests {
         let mesh = generate_opaque_mesh(&chunk);
         assert_eq!(mesh.vertices.len(), 0);
         assert_eq!(mesh.indices.len(), 0);
-        assert_eq!(mesh.smooth_vertices.len(), 24);
-        assert_eq!(mesh.smooth_indices.len(), 36);
+        // 连续高度场：1 个顶面 + 4 条 skirt，不再发射 6 个立方体面。
+        assert_eq!(mesh.smooth_vertices.len(), 20);
+        assert_eq!(mesh.smooth_indices.len(), 30);
     }
 
     #[test]
-    fn smooth_granular_interpolates_top_heights() {
+    fn smooth_granular_blends_adjacent_column_heights() {
         let mut chunk = Chunk::empty();
         chunk.set(5, 64, 5, BlockID::SAND);
-        chunk.set(6, 63, 5, BlockID::SAND);
+        chunk.set(6, 62, 5, BlockID::SAND);
         let mesh = generate_opaque_mesh(&chunk);
+        let shared_edge_y: Vec<f32> = mesh
+            .smooth_vertices
+            .iter()
+            .filter(|v| (v.position[0] - 6.0).abs() < 1e-3)
+            .map(|v| v.position[1])
+            .collect();
         assert!(
-            mesh.smooth_vertices
-                .iter()
-                .any(|v| v.position[1] > 64.35 && v.position[1] < 65.0),
-            "expected at least one interpolated corner height"
+            !shared_edge_y.is_empty(),
+            "expected vertices on the shared x=6 edge"
         );
+        // 列顶 65 与 63 应在共享边融合，而不是各自锁在整数格顶。
+        assert!(
+            shared_edge_y.iter().any(|y| *y > 63.2 && *y < 64.8),
+            "expected blended edge heights, got {shared_edge_y:?}"
+        );
+        // 邻列都是软表面时不应再在共享边补直立裙边（连续顶面已覆盖）。
+        let shared_skirt = mesh.smooth_indices.chunks(3).any(|tri| {
+            let verts: Vec<&SmoothVertex> = tri
+                .iter()
+                .map(|&i| &mesh.smooth_vertices[i as usize])
+                .collect();
+            let on_edge = verts.iter().all(|v| (v.position[0] - 6.0).abs() < 1e-3);
+            if !on_edge {
+                return false;
+            }
+            let span = verts
+                .iter()
+                .map(|v| v.position[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                - verts
+                    .iter()
+                    .map(|v| v.position[1])
+                    .fold(f32::INFINITY, f32::min);
+            span > 1.5
+        });
+        assert!(
+            !shared_skirt,
+            "shared smooth edge should not emit a tall vertical skirt"
+        );
+    }
+
+    #[test]
+    fn smooth_field_stays_continuous_across_many_columns() {
+        let mut chunk = Chunk::empty();
+        for x in 0..8 {
+            chunk.set(x, 60 + (x / 2), 4, BlockID::DIRT);
+        }
+        let mesh = generate_opaque_mesh(&chunk);
+        assert!(mesh.smooth_vertices.len() >= 8 * 4);
+        let max_y = mesh
+            .smooth_vertices
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = mesh
+            .smooth_vertices
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::INFINITY, f32::min);
+        assert!(max_y - min_y > 2.0, "expected a sloping surface");
     }
 
     #[test]
@@ -817,10 +998,41 @@ mod tests {
     }
 
     #[test]
+    fn hard_on_sand_gets_sealing_skirt_from_neighbor() {
+        let mut chunk = Chunk::empty();
+        // 露出的沙 + 邻列硬压沙：邻列不建软顶面，必须有 skirt 封住侧面空洞。
+        chunk.set(5, 64, 5, BlockID::SAND);
+        chunk.set(6, 64, 5, BlockID::SAND);
+        chunk.set(6, 65, 5, BlockID::STONE);
+        let mesh = generate_opaque_mesh(&chunk);
+        assert!(!mesh.smooth_vertices.is_empty());
+        // skirt 顶点会落到堆底附近（y≈64），而不仅是顶面 ~65。
+        let has_low_skirt = mesh
+            .smooth_vertices
+            .iter()
+            .any(|v| v.position[1] < 64.15 && (v.position[0] - 6.0).abs() < 1e-3);
+        assert!(
+            has_low_skirt,
+            "expected a sealing skirt against hard-over-smooth neighbor"
+        );
+        // 角点不得高于石头底面 65。
+        let shared_edge_max = mesh
+            .smooth_vertices
+            .iter()
+            .filter(|v| (v.position[0] - 6.0).abs() < 1e-3)
+            .map(|v| v.position[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            shared_edge_max <= 65.0 + 1e-3,
+            "smooth surface must not pierce hard ceiling, max={shared_edge_max}"
+        );
+    }
+
+    #[test]
     fn neighbor_callback_air_equivalent_to_naive() {
         let mut chunk = Chunk::empty();
         chunk.set(0, 64, 0, BlockID::STONE);
-        chunk.set(15, 64, 15, BlockID::DIRT);
+        chunk.set(15, 64, 15, BlockID::STONE_BRICKS);
 
         let naive = generate_opaque_mesh(&chunk);
         let with_n = generate_with_neighbors(&chunk, ChunkPos::new(0, 0), &|_, _, _| BlockID::AIR);

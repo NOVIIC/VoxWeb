@@ -30,7 +30,7 @@ crates/core/
     ├── chunk.rs        Chunk + Position + ChunkPos
     ├── field.rs        FieldChunk + Column + Span 原型
     ├── object.rs       FreeObject + ObjectSample + CollisionProxy
-    ├── surface.rs      SmoothGranular 高度场查询（渲染 / raycast / 客户端碰撞共用）
+    ├── surface.rs      SmoothGranular 列顶高度场查询（渲染 / raycast / 客户端碰撞共用）
     └── protocol.rs     ClientMessage / ServerMessage / RoomEvent
 ```
 
@@ -101,7 +101,7 @@ pub struct MaterialCell {
 }
 ```
 
-当前 `server::World` 已提供 `get_cell_world` / `set_cell` 运行时读写入口；dense `Chunk<Vec<BlockID>>` 仍同步维护为渲染/碰撞适配视图。`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta`、OPFS 存档和 FreeObject 迁移。`surface.rs` 提供 `SmoothGranular` 高度场查询，确保渲染提面、DDA raycast、选中框和客户端玩家碰撞使用同一套软材质表面规则。
+当前 `server::World` 已提供 `get_cell_world` / `set_cell` 运行时读写入口；dense `Chunk<Vec<BlockID>>` 仍同步维护为渲染/碰撞适配视图。`MaterialCell` 已用于 `FieldChunk`、网络 `FieldDelta`、OPFS 存档和 FreeObject 迁移。`surface.rs` 提供 `SmoothGranular` 列顶连续高度场查询，确保渲染提面、DDA raycast、选中框和客户端玩家碰撞使用同一套软材质表面规则。
 
 ### `object.rs` — FreeObject
 

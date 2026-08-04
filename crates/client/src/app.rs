@@ -253,6 +253,11 @@ impl FrameClock {
             false
         }
     }
+
+    /// 本帧尚未消耗的逻辑时间（秒），用于把权威状态外推到渲染时刻。
+    pub fn remainder_secs(&self) -> f32 {
+        self.accumulator.clamp(0.0, self.step)
+    }
 }
 
 impl Default for FrameClock {
@@ -335,6 +340,8 @@ pub struct Game {
     pub last_persist_ms: f64,
     pub quota: Option<QuotaInfo>,
     pub storage_error: Option<String>,
+    /// Remote：最近一次收到 FreeObjectState 的本地时刻（ms），用于渲染外推。
+    pub free_object_state_at_ms: HashMap<voxweb_core::ObjectID, f64>,
 }
 
 impl Game {
@@ -496,6 +503,7 @@ impl Game {
             last_persist_ms: 0.0,
             quota: None,
             storage_error: None,
+            free_object_state_at_ms: HashMap::new(),
         }
     }
 

@@ -737,12 +737,14 @@ impl Renderer {
         pass.draw(0..SelectionPass::VERTEX_COUNT, 0..1);
     }
 
-    /// 上传远端玩家实例缓冲（Phase 5）。无远端玩家时传空 slice 即可。
-    pub fn upload_player_instances(&mut self, instances: &[PlayerInstance]) {
-        self.player_pass.upload_instances(&self.queue, instances);
+    /// 上传远端玩家立方体实例与软材质颗粒球体实例。
+    pub fn upload_player_instances(&mut self, boxes: &[PlayerInstance], grains: &[PlayerInstance]) {
+        self.player_pass.upload_box_instances(&self.queue, boxes);
+        self.player_pass
+            .upload_sphere_instances(&self.queue, grains);
     }
 
-    /// 渲染所有远端玩家实体（Phase 5）。
+    /// 渲染所有远端玩家实体与动态 FreeObject。
     /// 必须在 `render_world` 之后、`render_selection` 之前调用；LoadOp=Load。
     pub fn render_players(
         &self,

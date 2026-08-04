@@ -75,7 +75,7 @@ VoxWeb 已经具备完整的浏览器内体素沙盒闭环：
 
 - [ ] **材质属性驱动颗粒松弛**（large）：把 `angle_of_repose` / `cohesion` 接进 solver，让沙 / 土 / 草表现分化。当前这些属性**运行时零读取**，堆积角恒为硬编码 1:1（≈45°）、滑速恒为常量，三种软材质行为完全一致——这是「统一体素」立论的根基却尚未通电。落点 `crates/server/src/physics.rs`（`is_downhill_dir` / `try_relax_one` / `ordered_slide_dirs`）。对应设计 §5.4、§17.Q7。
 - [ ] **地形自然度**（low → medium）：低频主导 fBm 振幅重排 + 坡度限制 / 轻量 thermal erosion + 平原 / 丘陵 / 山地 biome + 出生点平缓区。落点 `crates/server/src/terrain.rs`。⚠️ 残留台阶感的根因是「连续 1m 单位阶梯 + 满格立方体渲染」，需与下一项配套才有完整视觉收益。对应设计 §9.5、§17.Q7。
-- [ ] **硬软交界 seam / skirt + occupancy 驱动提面**（large）：软表面采样硬 cell 作边界、侧面补 skirt 几何、`SmoothGranular` 改用 column top height / occupancy 输入而非满格 `BlockID`（现平滑面只抬顶角、侧面仍是 1m 竖直 quad、交界露格、AO 恒定无遮蔽）。落点 `crates/render/src/chunk_mesh.rs`、`crates/core/src/surface.rs`。对应设计 §9.2、§9.5、§17.Q2/Q8。
+- [ ] **硬软交界 seam 深化 + occupancy 驱动提面**（medium）：软表面已改为列顶连续高度场 + skirt；后续再采样硬 cell 作更细边界、引入半格 occupancy / column mass，并评估是否仍需 Surface Nets。落点 `crates/render/src/chunk_mesh.rs`、`crates/core/src/surface.rs`。对应设计 §9.2、§9.5、§17.Q2/Q8。
 
 ### 🟡 中优先级
 
