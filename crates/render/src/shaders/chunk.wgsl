@@ -10,7 +10,7 @@ struct Globals {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
 
 struct VsIn {
@@ -77,7 +77,16 @@ fn vs_smooth(in: SmoothVsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let face = u32(in.face_f + 0.5);
     let tex = u32(in.tex_f + 0.5);
-    let sample = textureSample(atlas_tex, atlas_sampler, atlas_uv(tex, in.raw_uv)).rgb;
+    // 显式使用连续 raw_uv 的导数：fract 在 tile 重复边界的导数不连续，
+    // 若让硬件默认推导 mip，会在每一米边缘错误选择最粗一级。
+    let sample = textureSampleGrad(
+        atlas_tex,
+        atlas_sampler,
+        fract(in.raw_uv),
+        i32(tex),
+        dpdx(in.raw_uv),
+        dpdy(in.raw_uv),
+    ).rgb;
     let normal = normalize(in.normal);
     let sun = normalize(g.sun_dir.xyz);
     let direct = max(dot(normal, sun), 0.0);
@@ -102,16 +111,6 @@ fn face_uv(face: u32, world_pos: vec3<f32>) -> vec2<f32> {
         case 2u, 3u: { return vec2<f32>(world_pos.x, world_pos.z); }
         default: { return vec2<f32>(world_pos.x, world_pos.y); }
     }
-}
-
-fn atlas_uv(tex: u32, raw_uv: vec2<f32>) -> vec2<f32> {
-    let columns = 4u;
-    let tile_px = 32.0;
-    let atlas_px = vec2<f32>(128.0, 128.0);
-    let col = f32(tex % columns);
-    let row = f32(tex / columns);
-    let local = fract(raw_uv) * 30.0 + vec2<f32>(1.0, 1.0);
-    return (vec2<f32>(col, row) * tile_px + local) / atlas_px;
 }
 
 fn face_normal(face: u32) -> vec3<f32> {

@@ -12,10 +12,8 @@ use glam::{Vec2, Vec3};
 use crate::block::{BlockID, VisualClass, properties};
 use crate::chunk::CHUNK_Y;
 
-/// 角点邻域半径（列坐标）。更大更圆润，但过大会抹平小沙堆。
-const CORNER_RADIUS: i32 = 2;
-/// 混合材质时略压低列顶，减少草/土交界硬折。
-const MIXED_MATERIAL_BIAS: f32 = -0.03;
+/// 角点邻域半径（列坐标）。3×3 邻域足以连接相邻列，避免把单个沙堆抹成大范围波浪。
+pub const SMOOTH_CORNER_RADIUS: i32 = 1;
 /// 表面相对列顶 cell 上沿的最小厚度，避免退化成零面积三角形。
 pub const SMOOTH_MIN_FILL: f32 = 0.05;
 
@@ -161,54 +159,64 @@ pub fn smooth_cell_top_height(
     wx: i32,
     wy: i32,
     wz: i32,
-    block: BlockID,
+    _block: BlockID,
 ) -> f32 {
     let above = get_block(wx, wy + 1, wz);
     if !is_open_for_surface(above) {
         return wy as f32 + 1.0;
     }
-    let h00 = smooth_corner_height(get_block, wx, wz, Some(block));
-    let h10 = smooth_corner_height(get_block, wx + 1, wz, Some(block));
-    let h01 = smooth_corner_height(get_block, wx, wz + 1, Some(block));
-    let h11 = smooth_corner_height(get_block, wx + 1, wz + 1, Some(block));
+    let h00 = smooth_corner_height(get_block, wx, wz);
+    let h10 = smooth_corner_height(get_block, wx + 1, wz);
+    let h01 = smooth_corner_height(get_block, wx, wz + 1);
+    let h11 = smooth_corner_height(get_block, wx + 1, wz + 1);
     let avg = (h00 + h10 + h01 + h11) * 0.25;
     avg.max(wy as f32 + SMOOTH_MIN_FILL)
 }
 
 /// 世界角点 `(corner_wx, corner_wz)` 的高度场采样。
 ///
-/// 对邻域列顶做距离加权；**不再**把结果夹进某个 `base_y` 的单格范围内。
-/// `prefer` 只用于同材质微调，不影响几何连续性。
+/// 几何高度只由列顶决定，与草/土/沙的材质编号无关。渲染、碰撞和 raycast 必须走
+/// 同一条规则，不能在交界处按各自命中的材质产生不同高度。
 pub fn smooth_corner_height(
     get_block: &dyn Fn(i32, i32, i32) -> BlockID,
     corner_wx: i32,
     corner_wz: i32,
-    prefer: Option<BlockID>,
+) -> f32 {
+    smooth_corner_height_from_columns(
+        get_block,
+        &|wx, wz| find_smooth_column_surface(get_block, wx, wz),
+        corner_wx,
+        corner_wz,
+    )
+}
+
+/// 从预取列缓存计算角点高度。渲染器用它在 chunk 邻域内复用列扫描结果；
+/// 运行时查询则通过 [`smooth_corner_height`] 使用完全相同的公式。
+pub fn smooth_corner_height_from_columns(
+    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
+    get_surface: &dyn Fn(i32, i32) -> Option<SmoothColumnSurface>,
+    corner_wx: i32,
+    corner_wz: i32,
 ) -> f32 {
     let mut total = 0.0f32;
-    let mut count = 0.0f32;
-    for sx in (corner_wx - CORNER_RADIUS)..(corner_wx + CORNER_RADIUS) {
-        for sz in (corner_wz - CORNER_RADIUS)..(corner_wz + CORNER_RADIUS) {
-            let Some(surface) = find_smooth_column_surface(get_block, sx, sz) else {
+    let mut weight_sum = 0.0f32;
+    for sz in (corner_wz - SMOOTH_CORNER_RADIUS)..(corner_wz + SMOOTH_CORNER_RADIUS) {
+        for sx in (corner_wx - SMOOTH_CORNER_RADIUS)..(corner_wx + SMOOTH_CORNER_RADIUS) {
+            let Some(surface) = get_surface(sx, sz) else {
                 continue;
             };
             let dx = (sx as f32 + 0.5) - corner_wx as f32;
             let dz = (sz as f32 + 0.5) - corner_wz as f32;
-            let dist = (dx * dx + dz * dz).sqrt();
-            let weight = 1.0 / (1.0 + dist);
-            let material_bias = match prefer {
-                Some(block) if surface.block != block => MIXED_MATERIAL_BIAS,
-                _ => 0.0,
-            };
-            total += (surface.top_y + material_bias) * weight;
-            count += weight;
+            let weight = 1.0 / (1.0 + (dx * dx + dz * dz).sqrt());
+            total += surface.top_y * weight;
+            weight_sum += weight;
         }
     }
-    if count == 0.0 {
-        // 无邻域表面时给一个中性回退，避免 NaN；调用方通常不会对空角点建面。
+    if weight_sum == 0.0 {
         return 0.0;
     }
-    let mut height = total / count;
+
+    let mut height = total / weight_sum;
     // 与渲染一致：角点不得高于触碰列的硬方块底面。
     let probe_y = ((height as i32) - 2).max(0);
     for (dx, dz) in [(0, 0), (-1, 0), (0, -1), (-1, -1)] {
@@ -220,21 +228,11 @@ pub fn smooth_corner_height(
     height
 }
 
-/// 旧签名兼容：忽略 `base_y`，改走自由角点高度。
-pub fn nearby_smooth_column_height(
-    get_block: &dyn Fn(i32, i32, i32) -> BlockID,
-    wx: i32,
-    wz: i32,
-    _base_y: i32,
-    block: BlockID,
-) -> Option<f32> {
-    let surface = find_smooth_column_surface(get_block, wx, wz)?;
-    let bias = if surface.block == block {
-        0.0
-    } else {
-        MIXED_MATERIAL_BIAS
-    };
-    Some(surface.top_y + bias)
+/// 由角点上下左右样本计算连续法线，供共享网格顶点使用。
+pub fn normal_from_neighbor_heights(left: f32, right: f32, down: f32, up: f32) -> Vec3 {
+    Vec3::new((left - right) * 0.5, 1.0, (down - up) * 0.5)
+        .try_normalize()
+        .unwrap_or(Vec3::Y)
 }
 
 pub fn smooth_height_at(
@@ -244,12 +242,12 @@ pub fn smooth_height_at(
     wz: i32,
     local_x: f32,
     local_z: f32,
-    block: BlockID,
+    _block: BlockID,
 ) -> f32 {
-    let h00 = smooth_corner_height(get_block, wx, wz, Some(block));
-    let h10 = smooth_corner_height(get_block, wx + 1, wz, Some(block));
-    let h01 = smooth_corner_height(get_block, wx, wz + 1, Some(block));
-    let h11 = smooth_corner_height(get_block, wx + 1, wz + 1, Some(block));
+    let h00 = smooth_corner_height(get_block, wx, wz);
+    let h10 = smooth_corner_height(get_block, wx + 1, wz);
+    let h01 = smooth_corner_height(get_block, wx, wz + 1);
+    let h11 = smooth_corner_height(get_block, wx + 1, wz + 1);
     let x = local_x.clamp(0.0, 1.0);
     let z = local_z.clamp(0.0, 1.0);
     let hx0 = h00 + (h10 - h00) * x;
@@ -262,14 +260,14 @@ pub fn smooth_height_normal(
     wx: i32,
     wy: i32,
     wz: i32,
-    block: BlockID,
+    _block: BlockID,
 ) -> Vec3 {
     let center = Vec2::splat(0.5);
     let e = 0.2;
-    let hx0 = smooth_height_at(get_block, wx, wy, wz, center.x - e, center.y, block);
-    let hx1 = smooth_height_at(get_block, wx, wy, wz, center.x + e, center.y, block);
-    let hz0 = smooth_height_at(get_block, wx, wy, wz, center.x, center.y - e, block);
-    let hz1 = smooth_height_at(get_block, wx, wy, wz, center.x, center.y + e, block);
+    let hx0 = smooth_height_at(get_block, wx, wy, wz, center.x - e, center.y, _block);
+    let hx1 = smooth_height_at(get_block, wx, wy, wz, center.x + e, center.y, _block);
+    let hz0 = smooth_height_at(get_block, wx, wy, wz, center.x, center.y - e, _block);
+    let hz1 = smooth_height_at(get_block, wx, wy, wz, center.x, center.y + e, _block);
     Vec3::new(-(hx1 - hx0), e * 2.0, -(hz1 - hz0))
         .try_normalize()
         .unwrap_or(Vec3::Y)
@@ -295,10 +293,10 @@ pub fn ray_intersect_smooth_cell(
     if !is_open_for_surface(above) {
         return None;
     }
-    let h00 = smooth_corner_height(get_block, cell.wx, cell.wz, Some(cell.block));
-    let h10 = smooth_corner_height(get_block, cell.wx + 1, cell.wz, Some(cell.block));
-    let h01 = smooth_corner_height(get_block, cell.wx, cell.wz + 1, Some(cell.block));
-    let h11 = smooth_corner_height(get_block, cell.wx + 1, cell.wz + 1, Some(cell.block));
+    let h00 = smooth_corner_height(get_block, cell.wx, cell.wz);
+    let h10 = smooth_corner_height(get_block, cell.wx + 1, cell.wz);
+    let h01 = smooth_corner_height(get_block, cell.wx, cell.wz + 1);
+    let h11 = smooth_corner_height(get_block, cell.wx + 1, cell.wz + 1);
     let top = h00
         .max(h10)
         .max(h01)
@@ -387,7 +385,7 @@ mod tests {
     #[test]
     fn corner_height_blends_across_column_steps() {
         let get = world(&[((0, 10, 0), BlockID::SAND), ((1, 8, 0), BlockID::SAND)]);
-        let h = smooth_corner_height(&get, 1, 0, Some(BlockID::SAND));
+        let h = smooth_corner_height(&get, 1, 0);
         // 列顶分别是 11 与 9，角点应落在中间而不是锁在某一格。
         assert!(h > 9.3 && h < 10.8, "h={h}");
     }
@@ -414,7 +412,35 @@ mod tests {
             ((1, 12, 0), BlockID::SAND),
         ]);
         // 邻列更高沙会把角点往上拉，但 (0,0) 上有石头底面 y=11，必须夹住。
-        let h = smooth_corner_height(&get, 1, 0, Some(BlockID::SAND));
+        let h = smooth_corner_height(&get, 1, 0);
         assert!(h <= 11.0 + 1e-3, "h={h}");
+    }
+
+    #[test]
+    fn material_id_does_not_change_shared_geometry() {
+        let sand = world(&[((0, 10, 0), BlockID::SAND), ((1, 10, 0), BlockID::SAND)]);
+        let mixed = world(&[((0, 10, 0), BlockID::GRASS), ((1, 10, 0), BlockID::DIRT)]);
+        for corner_x in 0..=2 {
+            let a = smooth_corner_height(&sand, corner_x, 0);
+            let b = smooth_corner_height(&mixed, corner_x, 0);
+            assert!((a - b).abs() < 1e-5, "x={corner_x}: {a} != {b}");
+        }
+    }
+
+    #[test]
+    fn prefetched_columns_match_direct_world_query() {
+        let get = world(&[
+            ((0, 10, 0), BlockID::GRASS),
+            ((1, 9, 0), BlockID::DIRT),
+            ((0, 8, 1), BlockID::SAND),
+        ]);
+        let direct = smooth_corner_height(&get, 1, 1);
+        let cached = smooth_corner_height_from_columns(
+            &get,
+            &|x, z| find_smooth_column_surface(&get, x, z),
+            1,
+            1,
+        );
+        assert!((direct - cached).abs() < 1e-5);
     }
 }

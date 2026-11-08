@@ -24,7 +24,7 @@
 
 - 先用 `get_block_world` 做跨区块面剔除
 - `HardBlocky` / `Foliage` 等不透明硬表面按方向构造 mask，用贪婪网格化合并同材质且 AO 一致的可见单位面
-- `SmoothGranular` 不进入硬方块 mask，而是按**列顶高度场**生成 `smooth_vertices + smooth_indices`：每个 `(x,z)` 只取露出表面，邻域列顶加权得到共享角点，跨列连成连续顶面；仅在邻列无软表面时补 skirt 接硬顶或堆底。真实法线交给 shader 光照
+- `SmoothGranular` 不进入硬方块 mask，而是按**列顶高度场**生成 `smooth_vertices + smooth_indices`：每个 `(x,z)` 只取露出表面，3×3 邻域列顶加权得到共享角点，跨列连成连续顶面；顶面按 `(角点, 材质)` 复用顶点，并用角点四邻高度计算连续法线。仅在邻列无软表面时补 skirt 接硬顶或堆底
 - 透明材质仍输出 `transparent_vertices + transparent_indices`，交给 Transparent Pass
 - `visible_faces` 记录硬方块逐面基线的可见单位面数量，供 HUD 展示贪婪合并优化比例
 
@@ -122,14 +122,14 @@ UV 计算：贪婪合并后的大矩形，UV 从 (0,0) 一直平铺到 (w, h) �
 ```rust
 pub struct SmoothVertex {
     pub position: [f32; 3], // chunk local，允许非整数 y
-    pub normal: [f32; 3],   // 三角面法线
+    pub normal: [f32; 3],   // 共享角点的连续表面法线
     pub raw_uv: [f32; 2],
     pub tex_index: f32,
     pub ao: f32,
 }
 ```
 
-当前实现是**列顶连续高度场**提面，不是完整 Surface Nets / Marching Cubes。高度查询放在 `core::surface`（`find_smooth_column_surface` / `smooth_corner_height`），渲染、raycast、选中框和客户端玩家碰撞共用同一规则；角点在邻域列顶之间自由插值，**不再**锁进单格 `[y, y+1]`，因此高低列会连成斜坡而不是一格一格台阶。权威世界和网络仍然按当前 `Chunk`/`BlockID` 适配视图工作；半格 occupancy 驱动仍属后续项。
+当前实现是**列顶连续高度场**提面，不是完整 Surface Nets / Marching Cubes。高度查询放在 `core::surface`（`find_smooth_column_surface` / `smooth_corner_height` / `smooth_corner_height_from_columns`），渲染、raycast、选中框和客户端玩家碰撞共用同一规则；角点在 3×3 邻域列顶之间自由插值，**不再**锁进单格 `[y, y+1]`，也不按材质施加高度偏置。渲染器预取 chunk 邻域列缓存，顶面按 `(角点, 材质)` 复用顶点，法线由角点四邻高度中心差分得到；无样本角点与真实的零高度分开记录，避免孤立小堆边缘法线突变。软材质 UV 使用世界坐标，跨 chunk 不重置。权威世界和网络仍然按当前 `Chunk`/`BlockID` 适配视图工作；半格 occupancy 驱动仍属后续项。
 
 ---
 
