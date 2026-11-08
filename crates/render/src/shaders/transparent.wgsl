@@ -10,7 +10,7 @@ struct Globals {
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
-@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
 
 struct VsIn {
@@ -54,7 +54,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         uv = uv + vec2<f32>(0.05 * sin(t * 0.7 + in.raw_uv.y), 0.04 * cos(t * 0.6 + in.raw_uv.x));
     }
 
-    let sample = textureSample(atlas_tex, atlas_sampler, atlas_uv(tex, uv)).rgb;
+    let sample = textureSampleGrad(
+        atlas_tex,
+        atlas_sampler,
+        fract(uv),
+        i32(tex),
+        dpdx(uv),
+        dpdy(uv),
+    ).rgb;
     let normal = face_normal(face);
     let sun = max(dot(normal, normalize(g.sun_dir.xyz)), 0.0);
     var color = sample * face_brightness(face) * (0.86 + 0.14 * sun);
@@ -81,16 +88,6 @@ fn face_uv(face: u32, world_pos: vec3<f32>) -> vec2<f32> {
         case 2u, 3u: { return vec2<f32>(world_pos.x, world_pos.z); }
         default: { return vec2<f32>(world_pos.x, world_pos.y); }
     }
-}
-
-fn atlas_uv(tex: u32, raw_uv: vec2<f32>) -> vec2<f32> {
-    let columns = 4u;
-    let tile_px = 32.0;
-    let atlas_px = vec2<f32>(128.0, 128.0);
-    let col = f32(tex % columns);
-    let row = f32(tex / columns);
-    let local = fract(raw_uv) * 30.0 + vec2<f32>(1.0, 1.0);
-    return (vec2<f32>(col, row) * tile_px + local) / atlas_px;
 }
 
 fn block_alpha(tex: u32) -> f32 {

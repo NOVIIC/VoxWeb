@@ -16,6 +16,9 @@ pub mod passes;
 pub mod texture;
 pub mod vertex;
 
+#[cfg(test)]
+mod shader_tests;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -1,13 +1,15 @@
-//! 程序化纹理图集。
+//! 程序化材质纹理与 mipmap 纹理数组。
 //!
-//! 当前没有外部美术资源，图集在启动时由 Rust 生成 RGBA8 像素并上传到 GPU。
-//! shader 通过方块属性里的 `texture_index` 选择对应 32x32 tile。
+//! 当前没有外部美术资源，启动时由 Rust 生成 16 张 32×32 RGBA8 tile。
+//! 每种材质占一个 array layer，避免图集采样串色；CPU 生成完整 mip 链。
 
 pub const TILE_SIZE: u32 = 32;
 pub const ATLAS_COLUMNS: u32 = 4;
 pub const ATLAS_ROWS: u32 = 4;
 pub const ATLAS_WIDTH: u32 = TILE_SIZE * ATLAS_COLUMNS;
 pub const ATLAS_HEIGHT: u32 = TILE_SIZE * ATLAS_ROWS;
+pub const TILE_COUNT: u32 = ATLAS_COLUMNS * ATLAS_ROWS;
+pub const MIP_LEVEL_COUNT: u32 = TILE_SIZE.ilog2() + 1;
 
 /// 纹理图集 GPU 资源。
 pub struct TextureAtlas {
@@ -23,46 +25,68 @@ impl TextureAtlas {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("texture_atlas.texture"),
             size: wgpu::Extent3d {
-                width: ATLAS_WIDTH,
-                height: ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
+                width: TILE_SIZE,
+                height: TILE_SIZE,
+                depth_or_array_layers: TILE_COUNT,
             },
-            mip_level_count: 1,
+            mip_level_count: MIP_LEVEL_COUNT,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let pixels = generate_atlas_rgba();
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(ATLAS_WIDTH * 4),
-                rows_per_image: Some(ATLAS_HEIGHT),
-            },
-            wgpu::Extent3d {
-                width: ATLAS_WIDTH,
-                height: ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let atlas = generate_atlas_rgba();
+        // 每种材质是独立 array layer；mipmap 只在同一 tile 内生成，不会把相邻
+        // 材质平均进去，也不需要 shader 为图集边缘预留像素。
+        for layer in 0..TILE_COUNT {
+            let mut tile = extract_tile(&atlas, layer);
+            for mip in 0..MIP_LEVEL_COUNT {
+                let size = (TILE_SIZE >> mip).max(1);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: mip,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: layer,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &tile,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size * 4),
+                        rows_per_image: Some(size),
+                    },
+                    wgpu::Extent3d {
+                        width: size,
+                        height: size,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                if mip + 1 < MIP_LEVEL_COUNT {
+                    tile = downsample_rgba(&tile, size, size);
+                }
+            }
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("texture_atlas.array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            mip_level_count: Some(MIP_LEVEL_COUNT),
+            array_layer_count: Some(TILE_COUNT),
+            ..Default::default()
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("texture_atlas.sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
+            // 近处保留像素材质轮廓，远处用 mipmap 抑制高频噪点闪烁。
             mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -73,7 +97,7 @@ impl TextureAtlas {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -109,6 +133,45 @@ impl TextureAtlas {
             bind_group,
         }
     }
+}
+
+fn extract_tile(atlas: &[u8], slot: u32) -> Vec<u8> {
+    let col = slot % ATLAS_COLUMNS;
+    let row = slot / ATLAS_COLUMNS;
+    let mut tile = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+    for y in 0..TILE_SIZE {
+        let start = (((row * TILE_SIZE + y) * ATLAS_WIDTH + col * TILE_SIZE) * 4) as usize;
+        let end = start + (TILE_SIZE * 4) as usize;
+        tile.extend_from_slice(&atlas[start..end]);
+    }
+    tile
+}
+
+/// CPU box filter：每个低级 mip texel 是上一级 2×2 区域的平均值。
+fn downsample_rgba(previous: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let next_width = (width / 2).max(1);
+    let next_height = (height / 2).max(1);
+    let mut next = vec![0; (next_width * next_height * 4) as usize];
+    for y in 0..next_height {
+        for x in 0..next_width {
+            let mut sum = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let sx = (x * 2 + dx).min(width - 1);
+                    let sy = (y * 2 + dy).min(height - 1);
+                    let src = ((sy * width + sx) * 4) as usize;
+                    for channel in 0..4 {
+                        sum[channel] += u32::from(previous[src + channel]);
+                    }
+                }
+            }
+            let dst = ((y * next_width + x) * 4) as usize;
+            for channel in 0..4 {
+                next[dst + channel] = ((sum[channel] + 2) / 4) as u8;
+            }
+        }
+    }
+    next
 }
 
 /// 生成完整 atlas 像素，供 GPU 上传和单元测试复用。
@@ -294,5 +357,27 @@ mod tests {
         let center = pixel(&data, 5, 12, 8);
         assert!(edge[0] > center[0]);
         assert_eq!(edge[3], 255);
+    }
+
+    #[test]
+    fn tile_extraction_does_not_include_atlas_neighbors() {
+        let atlas = generate_atlas_rgba();
+        let tile = extract_tile(&atlas, 5);
+        assert_eq!(tile.len(), (TILE_SIZE * TILE_SIZE * 4) as usize);
+        assert_eq!(&tile[0..4], &pixel(&atlas, 5, 0, 0));
+        let last = tile.len() - 4;
+        assert_eq!(&tile[last..], &pixel(&atlas, 5, 31, 31));
+    }
+
+    #[test]
+    fn mip_chain_has_power_of_two_levels() {
+        assert_eq!(MIP_LEVEL_COUNT, 6);
+        let source = [
+            0, 10, 20, 255, // (0,0)
+            10, 20, 30, 255, // (1,0)
+            20, 30, 40, 255, // (0,1)
+            30, 40, 50, 255, // (1,1)
+        ];
+        assert_eq!(downsample_rgba(&source, 2, 2), vec![15, 25, 35, 255]);
     }
 }

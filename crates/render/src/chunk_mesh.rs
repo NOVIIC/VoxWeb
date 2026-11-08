@@ -4,12 +4,14 @@
 //! Phase 7 起替换为贪婪网格化：同材质、同 AO 的相邻面合并为一个大四边形，
 //! CPU 侧输出 4 个压缩顶点 + 6 个索引，并记录本 chunk 的可见 bounds 供视锥剔除。
 
+use std::collections::HashMap;
+
 use glam::Vec3;
 use voxweb_core::{
-    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, SmoothColumnSurface,
-    column_hard_ceiling, column_has_hard_over_smooth, find_smooth_column_surface,
-    is_smooth_granular, normal_from_corners, properties, smooth_corner_height, smooth_stack_bottom,
-    solid_column_top_y,
+    Aabb, BlockID, CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk, ChunkPos, SMOOTH_CORNER_RADIUS,
+    SmoothColumnSurface, column_has_hard_over_smooth, find_smooth_column_surface,
+    is_smooth_granular, normal_from_neighbor_heights, properties,
+    smooth_corner_height_from_columns, smooth_stack_bottom, solid_column_top_y,
 };
 
 use crate::vertex::{Face, PackedVertex, SmoothVertex};
@@ -171,6 +173,41 @@ struct MeshContext<'a> {
     get_block_world: &'a dyn Fn(i32, i32, i32) -> BlockID,
 }
 
+struct SmoothCornerCache {
+    min: i32,
+    stride: usize,
+    heights: Vec<f32>,
+    has_samples: Vec<bool>,
+}
+
+impl SmoothCornerCache {
+    fn index(&self, cx: i32, cz: i32) -> usize {
+        ((cz - self.min) as usize) * self.stride + (cx - self.min) as usize
+    }
+
+    fn height(&self, cx: i32, cz: i32) -> f32 {
+        self.heights[self.index(cx, cz)]
+    }
+
+    fn normal(&self, cx: i32, cz: i32) -> Vec3 {
+        let center = self.height(cx, cz);
+        let sample = |x, z| {
+            let index = self.index(x, z);
+            if self.has_samples[index] {
+                self.heights[index]
+            } else {
+                center
+            }
+        };
+        normal_from_neighbor_heights(
+            sample(cx - 1, cz),
+            sample(cx + 1, cz),
+            sample(cx, cz - 1),
+            sample(cx, cz + 1),
+        )
+    }
+}
+
 /// 生成一个 Chunk 的不透明网格顶点。
 ///
 /// 仅渲染非 AIR、且 `BlockProperties::transparent == false` 的方块。
@@ -222,8 +259,8 @@ pub fn generate_with_neighbors(
 /// 不再按每个软材质 cell 发射立方体面。每个 (x,z) 只取露出表面，角点在邻域
 /// 列顶之间共享插值，高低列自动连成斜坡；只有贴着非软材质或虚空时才补侧面裙边。
 fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
-    // 边框需覆盖角点加权半径，否则 chunk 边界坡面会突然变尖。
-    const PAD: i32 = 2;
+    // 边框同时覆盖高度采样和法线中心差分所需的角点，避免 chunk 边缘折面。
+    const PAD: i32 = SMOOTH_CORNER_RADIUS + 2;
     let min_lx = -PAD;
     let max_lx = CHUNK_X as i32 + PAD;
     let min_lz = -PAD;
@@ -266,79 +303,46 @@ fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
         columns[((lz - min_lz) as usize) * stride_x + (lx - min_lx) as usize]
     };
 
-    // 角点缓存：chunk 内 0..=16。高度直接从列缓存加权，避免每个角点重新扫世界。
-    let corner_min = 0i32;
-    let corner_max = CHUNK_X as i32; // inclusive
+    // 角点缓存向外多一圈，供共享顶点的中心差分法线使用。高度公式直接复用
+    // core::surface，渲染、raycast 和碰撞不再各自维护一套材质偏置规则。
+    let corner_min = -1i32;
+    let corner_max = CHUNK_X as i32 + 1; // inclusive
     let corner_stride = (corner_max - corner_min + 1) as usize;
-    let mut corners = vec![0.0f32; corner_stride * corner_stride];
-    const CORNER_RADIUS: i32 = 2;
-    const MIXED_BIAS: f32 = -0.03;
+    let mut heights = vec![0.0f32; corner_stride * corner_stride];
+    let mut has_samples = vec![false; corner_stride * corner_stride];
+    let get_surface = |sx: i32, sz: i32| col(&columns, sx - ctx.origin_x, sz - ctx.origin_z);
     for cz in corner_min..=corner_max {
         for cx in corner_min..=corner_max {
-            let prefer = col(&columns, cx - 1, cz - 1)
-                .or_else(|| col(&columns, cx, cz - 1))
-                .or_else(|| col(&columns, cx - 1, cz))
-                .or_else(|| col(&columns, cx, cz))
-                .map(|s| s.block);
-            let mut total = 0.0f32;
-            let mut weight_sum = 0.0f32;
-            for sz in (cz - CORNER_RADIUS)..(cz + CORNER_RADIUS) {
-                for sx in (cx - CORNER_RADIUS)..(cx + CORNER_RADIUS) {
-                    let Some(surface) = col(&columns, sx, sz) else {
-                        continue;
-                    };
-                    let dx = (sx as f32 + 0.5) - cx as f32;
-                    let dz = (sz as f32 + 0.5) - cz as f32;
-                    let dist = (dx * dx + dz * dz).sqrt();
-                    let w = 1.0 / (1.0 + dist);
-                    let bias = match prefer {
-                        Some(block) if surface.block != block => MIXED_BIAS,
-                        _ => 0.0,
-                    };
-                    total += (surface.top_y + bias) * w;
-                    weight_sum += w;
-                }
-            }
-            let h = if weight_sum > 0.0 {
-                total / weight_sum
-            } else {
-                smooth_corner_height(
-                    &get_column_block,
-                    ctx.origin_x + cx,
-                    ctx.origin_z + cz,
-                    prefer,
-                )
-            };
-            // 角点不得穿进触碰列的硬方块底面，否则软坡会钻进石头里造成透视/破面。
-            let mut clamped = h;
-            let probe_y = ((h as i32) - 2).max(0);
-            for (dx, dz) in [(0, 0), (-1, 0), (0, -1), (-1, -1)] {
-                let sx = cx + dx;
-                let sz = cz + dz;
-                let wx = ctx.origin_x + sx;
-                let wz = ctx.origin_z + sz;
-                if let Some(ceil) = column_hard_ceiling(&get_column_block, wx, wz, probe_y) {
-                    clamped = clamped.min(ceil);
-                }
-            }
-            corners[((cz - corner_min) as usize) * corner_stride + (cx - corner_min) as usize] =
-                clamped;
+            let index = ((cz - corner_min) as usize) * corner_stride + (cx - corner_min) as usize;
+            let wx = ctx.origin_x + cx;
+            let wz = ctx.origin_z + cz;
+            has_samples[index] =
+                ((wz - SMOOTH_CORNER_RADIUS)..(wz + SMOOTH_CORNER_RADIUS)).any(|sz| {
+                    ((wx - SMOOTH_CORNER_RADIUS)..(wx + SMOOTH_CORNER_RADIUS))
+                        .any(|sx| get_surface(sx, sz).is_some())
+                });
+            heights[index] =
+                smooth_corner_height_from_columns(&get_column_block, &get_surface, wx, wz);
         }
     }
-
-    let corner_h = |corners: &[f32], cx: i32, cz: i32| -> f32 {
-        corners[((cz - corner_min) as usize) * corner_stride + (cx - corner_min) as usize]
+    let corners = SmoothCornerCache {
+        min: corner_min,
+        stride: corner_stride,
+        heights,
+        has_samples,
     };
 
+    let mut top_vertices = HashMap::new();
+    let chunk_origin = Vec3::new(ctx.origin_x as f32, 0.0, ctx.origin_z as f32);
     for lz in 0..CHUNK_Z as i32 {
         for lx in 0..CHUNK_X as i32 {
             let Some(surface) = col(&columns, lx, lz) else {
                 continue;
             };
-            let h00 = corner_h(&corners, lx, lz);
-            let h10 = corner_h(&corners, lx + 1, lz);
-            let h01 = corner_h(&corners, lx, lz + 1);
-            let h11 = corner_h(&corners, lx + 1, lz + 1);
+            let h00 = corners.height(lx, lz);
+            let h10 = corners.height(lx + 1, lz);
+            let h01 = corners.height(lx, lz + 1);
+            let h11 = corners.height(lx + 1, lz + 1);
 
             let top_corners = [
                 Vec3::new(lx as f32, h00, lz as f32),
@@ -346,23 +350,41 @@ fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
                 Vec3::new(lx as f32 + 1.0, h11, lz as f32 + 1.0),
                 Vec3::new(lx as f32, h01, lz as f32 + 1.0),
             ];
-            // CCW from above: (0,1,2,3) with outward +Y → use (0,3,2,1) wait
-            // Local XZ: (lx,lz)=(0), (lx+1,lz)=(1), (lx+1,lz+1)=(2), (lx,lz+1)=(3)
-            // From above (+Y), CCW is 0 -> 3 -> 2 -> 1
-            let top_ccw = [
-                top_corners[0],
-                top_corners[3],
-                top_corners[2],
-                top_corners[1],
+            // 顶面按 (角点, 材质) 复用顶点。共享法线由角点四邻高度计算，
+            // 不会在每格边界重置为一张独立平面。
+            let tex = properties(surface.block).texture_index;
+            let ids = [
+                smooth_top_vertex(mesh, &mut top_vertices, &corners, chunk_origin, lx, lz, tex),
+                smooth_top_vertex(
+                    mesh,
+                    &mut top_vertices,
+                    &corners,
+                    chunk_origin,
+                    lx,
+                    lz + 1,
+                    tex,
+                ),
+                smooth_top_vertex(
+                    mesh,
+                    &mut top_vertices,
+                    &corners,
+                    chunk_origin,
+                    lx + 1,
+                    lz + 1,
+                    tex,
+                ),
+                smooth_top_vertex(
+                    mesh,
+                    &mut top_vertices,
+                    &corners,
+                    chunk_origin,
+                    lx + 1,
+                    lz,
+                    tex,
+                ),
             ];
-            let n = normal_from_corners(h00, h10, h01, h11);
-            push_smooth_quad_with_normal(
-                mesh,
-                top_ccw,
-                n,
-                properties(surface.block).texture_index,
-                2,
-            );
+            mesh.smooth_indices
+                .extend_from_slice(&[ids[0], ids[1], ids[2], ids[0], ids[2], ids[3]]);
 
             // 四条边：邻居没有软表面时补 skirt，接硬材质顶或本列堆底。
             let edges = [
@@ -406,10 +428,44 @@ fn emit_smooth_granular(ctx: &MeshContext<'_>, mesh: &mut ChunkMeshCpu) {
                 let skirt = [a, b, floor_b, floor_a];
                 let skirt_tex = skirt_texture(ctx, &get_column_block, wx, wz, surface, floor);
                 let sn = quad_normal(skirt);
-                push_smooth_quad_with_normal(mesh, skirt, sn, skirt_tex, skirt_uv_axis(dx, dz));
+                push_smooth_quad_with_normal(
+                    mesh,
+                    chunk_origin,
+                    skirt,
+                    sn,
+                    skirt_tex,
+                    skirt_uv_axis(dx, dz),
+                );
             }
         }
     }
+}
+
+fn smooth_top_vertex(
+    mesh: &mut ChunkMeshCpu,
+    cache: &mut HashMap<(i32, i32, u8), u32>,
+    corners: &SmoothCornerCache,
+    chunk_origin: Vec3,
+    cx: i32,
+    cz: i32,
+    tex: u8,
+) -> u32 {
+    if let Some(&index) = cache.get(&(cx, cz, tex)) {
+        return index;
+    }
+
+    let p = Vec3::new(cx as f32, corners.height(cx, cz), cz as f32);
+    let normal = corners.normal(cx, cz);
+    let index = mesh.smooth_vertices.len() as u32;
+    mesh.include_smooth_vertex(p);
+    mesh.smooth_vertices.push(SmoothVertex::new(
+        [p.x, p.y, p.z],
+        [normal.x, normal.y, normal.z],
+        smooth_raw_uv(2, p + chunk_origin),
+        tex,
+    ));
+    cache.insert((cx, cz, tex), index);
+    index
 }
 
 fn skirt_texture(
@@ -442,6 +498,7 @@ fn skirt_uv_axis(dx: i32, dz: i32) -> usize {
 
 fn push_smooth_quad_with_normal(
     mesh: &mut ChunkMeshCpu,
+    chunk_origin: Vec3,
     corners: [Vec3; 4],
     normal: Vec3,
     tex: u8,
@@ -453,7 +510,7 @@ fn push_smooth_quad_with_normal(
         mesh.smooth_vertices.push(SmoothVertex::new(
             [p.x, p.y, p.z],
             [normal.x, normal.y, normal.z],
-            smooth_raw_uv(uv_face, p),
+            smooth_raw_uv(uv_face, p + chunk_origin),
             tex,
         ));
     }
@@ -894,6 +951,65 @@ mod tests {
         // 连续高度场：1 个顶面 + 4 条 skirt，不再发射 6 个立方体面。
         assert_eq!(mesh.smooth_vertices.len(), 20);
         assert_eq!(mesh.smooth_indices.len(), 30);
+    }
+
+    #[test]
+    fn smooth_flat_region_shares_top_vertices() {
+        let mut chunk = Chunk::empty();
+        for x in 5..7 {
+            for z in 5..7 {
+                chunk.set(x, 64, z, BlockID::DIRT);
+            }
+        }
+        let mesh = generate_opaque_mesh(&chunk);
+        let top_vertices: Vec<&SmoothVertex> = mesh
+            .smooth_vertices
+            .iter()
+            .filter(|v| v.normal[1] > 0.999)
+            .collect();
+        // 2×2 cell 共享 3×3 个角点；旧实现会生成 16 个互不复用的顶面顶点。
+        assert_eq!(top_vertices.len(), 9);
+        assert!(
+            top_vertices
+                .iter()
+                .all(|v| (v.position[1] - 65.0).abs() < 1e-5)
+        );
+        assert!(
+            top_vertices
+                .iter()
+                .all(|v| v.normal[0].abs() < 1e-5 && v.normal[2].abs() < 1e-5)
+        );
+    }
+
+    #[test]
+    fn smooth_mesh_heights_match_shared_world_query_at_material_boundary() {
+        let mut chunk = Chunk::empty();
+        chunk.set(5, 64, 5, BlockID::GRASS);
+        chunk.set(6, 63, 5, BlockID::DIRT);
+        chunk.set(5, 64, 6, BlockID::SAND);
+        let get = |wx: i32, wy: i32, wz: i32| {
+            if !(0..CHUNK_X as i32).contains(&wx)
+                || !(0..CHUNK_Y as i32).contains(&wy)
+                || !(0..CHUNK_Z as i32).contains(&wz)
+            {
+                return BlockID::AIR;
+            }
+            chunk.get(wx as usize, wy as usize, wz as usize)
+        };
+        let mesh = generate_with_neighbors(&chunk, ChunkPos::new(0, 0), &get);
+        for vertex in mesh.smooth_vertices.iter().filter(|v| v.normal[1] > 0.5) {
+            let expected = voxweb_core::smooth_corner_height(
+                &get,
+                vertex.position[0] as i32,
+                vertex.position[2] as i32,
+            );
+            assert!(
+                (vertex.position[1] - expected).abs() < 1e-5,
+                "render={} query={expected} at {:?}",
+                vertex.position[1],
+                vertex.position
+            );
+        }
     }
 
     #[test]

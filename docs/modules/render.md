@@ -36,7 +36,7 @@ crates/render/src/
 │   └── selection.rs    选中方块线框 Pass
 ├── chunk_mesh.rs       硬方块贪婪网格化 + SmoothGranular 平滑提面 + 跨区块面剔除 + AO + bounds
 ├── vertex.rs           硬方块 u32 压缩格式 + 软表面 float 顶点格式
-├── texture.rs          纹理图集
+├── texture.rs          程序化材质纹理 + mipmap 纹理数组
 └── shaders/
     ├── chunk.wgsl      实体方块着色器
     └── selection.wgsl  选中线框着色器
@@ -97,7 +97,7 @@ pub enum Face { PosX = 0, NegX = 1, PosY = 2, NegY = 3, PosZ = 4, NegZ = 5 }
 pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static>;
 ```
 
-`SmoothGranular` 材质使用独立 float 顶点格式，允许非整数高度与真实三角面法线：
+`SmoothGranular` 材质使用独立 float 顶点格式，允许非整数高度与连续表面法线：
 
 ```rust
 #[repr(C)]
@@ -131,15 +131,17 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 ## 五、`texture.rs` — 纹理图集
 
 **设计**：
-- 单张 `Rgba8UnormSrgb` 图集：当前为 128×128、每格 32×32、4×4 槽位
-- 每方块的纹理由 `BlockProperties.texture_index: u8` 指定槽位
-- WGSL 中按 face + world position 生成可平铺 UV；fragment 内 `fract(raw_uv)` 后映射到图集 tile 内侧 30×30 像素，避开边界采样串色
+- 16 张独立 `Rgba8UnormSrgb` array layer，每格 32×32；逻辑图集仍为 4×4 槽位，便于程序化生成和测试
+- 每方块的纹理由 `BlockProperties.texture_index: u8` 指定 array layer
+- WGSL 中按 face + world position 生成可平铺 UV；片段内 `fract(raw_uv)` 后直接采样对应 layer，不再映射到一张拼接图集
+- CPU 为每种材质独立生成 32→1 的完整 mipmap 链，避免高 mip 把相邻材质平均在一起
+- 使用 `textureSampleGrad` 和连续 `raw_uv` 的导数，避免 `fract` 在重复边界造成错误 mip 跳变
 
 **纹理来源**：
 - 当前：启动时由 Rust 程序化生成，覆盖 stone/grass/dirt/sand/wood/leaves/water/glass；不依赖图片文件或解码库
 - 可选增强：后续可替换为提交的美术贴图或远程加载（fetch + Image bitmap）
 
-**Mipmap**：当前不开（避免远处纹理颜色混叠产生彩虹），用 `MagFilter::Nearest` + `MinFilter::Nearest` 保持像素风。
+**Mipmap / 过滤**：每 layer 6 级 mip；`MagFilter::Nearest` 保留近处像素感，`MinFilter::Linear` + `MipmapFilter::Linear` 减少远处高频噪点闪烁。硬方块几何仍保持锐利，软材质法线连续。
 
 ---
 
@@ -177,7 +179,7 @@ fn unpack_vertex(packed: u32, chunk_origin: vec3<f32>) -> UnpackedVertex { ... }
 
 **Draw 调用顺序**：先做视锥剔除，并在单个 render pass 内遍历可见 chunk 调用 `draw_indexed`；近远排序留作后续 profiling 项。
 
-**视觉处理**：`chunk.wgsl` 采样图集，叠加 face brightness / slope brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。硬材质保持锐利方块边；草、泥土、沙子等 `SmoothGranular` 走列顶连续高度场：共享角点跨列插值生成斜坡顶面，邻列无软表面时补 skirt；硬软交界以硬表面优先，硬方块邻接软材质时保留硬方块面，避免双方同时剔除造成漏面。
+**视觉处理**：`chunk.wgsl` 采样 mipmap 纹理数组，叠加 face brightness / slope brightness、顶点 AO、轻量 tone mapping 和距离雾；雾色与 Skybox 共享，避免远景断层。硬材质保持锐利方块边；草、泥土、沙子等 `SmoothGranular` 走列顶连续高度场：共享角点跨列插值生成斜坡顶面，共享顶点的法线由四邻高度中心差分得到，邻列无软表面时补 skirt；角点高度由 `core::surface` 统一计算，材质只选择纹理，不再影响几何高度。硬软交界以硬表面优先，硬方块邻接软材质时保留硬方块面，避免双方同时剔除造成漏面。
 
 ### 7.3 `passes/skybox.rs` — Skybox Pass
 

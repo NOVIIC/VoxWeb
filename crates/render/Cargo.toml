@@ -16,5 +16,8 @@ web-sys.workspace = true
 futures-channel.workspace = true
 log.workspace = true
 
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }
+
 [lints]
 workspace = true
